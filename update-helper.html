@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PWA Update Helper</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      padding: 20px;
+      max-width: 600px;
+      margin: 0 auto;
+    }
+    button {
+      padding: 12px 24px;
+      font-size: 16px;
+      background: #0077be;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      margin: 10px;
+      cursor: pointer;
+    }
+    button:active {
+      background: #005a8b;
+    }
+    .info {
+      background: #f0f8ff;
+      padding: 15px;
+      border-radius: 8px;
+      margin: 20px 0;
+    }
+    code {
+      background: #f5f5f5;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <h1>🔄 PWA Update Helper</h1>
+  
+  <div class="info">
+    <h2>Current Status:</h2>
+    <p>Service Worker: <span id="sw-status">Checking...</span></p>
+    <p>Cache Version: <span id="cache-version">Checking...</span></p>
+    <p>Last Update: <span id="last-update">Unknown</span></p>
+  </div>
+
+  <h2>Force Update Options:</h2>
+  
+  <button onclick="updateServiceWorker()">
+    🔄 Update Service Worker
+  </button>
+  
+  <button onclick="clearAllCaches()">
+    🗑️ Clear All Caches
+  </button>
+  
+  <button onclick="unregisterAndReload()">
+    ⚡ Full Reset (Unregister + Reload)
+  </button>
+  
+  <div class="info">
+    <h3>Add to Your App:</h3>
+    <p>Add this code to check for updates every 5 minutes:</p>
+    <pre><code>// Check for updates periodically
+setInterval(() => {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.ready.then(reg => {
+      reg.update();
+    });
+  }
+}, 5 * 60 * 1000); // Every 5 minutes</code></pre>
+  </div>
+
+  <div id="log" style="margin-top: 20px; padding: 10px; background: #f9f9f9; border-radius: 4px; min-height: 100px;">
+    <h3>Log:</h3>
+  </div>
+
+  <script>
+    function log(message) {
+      const logDiv = document.getElementById('log');
+      const time = new Date().toLocaleTimeString();
+      logDiv.innerHTML += `<div>${time}: ${message}</div>`;
+    }
+
+    // Check service worker status
+    function checkStatus() {
+      const swStatus = document.getElementById('sw-status');
+      const cacheVersion = document.getElementById('cache-version');
+      const lastUpdate = document.getElementById('last-update');
+      
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistration().then(reg => {
+          if (reg) {
+            swStatus.textContent = reg.active ? 'Active ✅' : 'Not Active ❌';
+            
+            // Check for waiting worker (update available)
+            if (reg.waiting) {
+              swStatus.textContent += ' (Update Available!)';
+              log('⚠️ Update is available and waiting to activate');
+            }
+            
+            // Get last update check time
+            if (reg.active) {
+              const updateTime = localStorage.getItem('sw-last-update');
+              lastUpdate.textContent = updateTime || 'Never';
+            }
+          } else {
+            swStatus.textContent = 'Not Registered ❌';
+          }
+        });
+        
+        // Check cache version
+        if ('caches' in window) {
+          caches.keys().then(names => {
+            cacheVersion.textContent = names.join(', ') || 'No caches';
+          });
+        }
+      } else {
+        swStatus.textContent = 'Not Supported';
+      }
+    }
+
+    // Update service worker
+    async function updateServiceWorker() {
+      log('🔄 Checking for updates...');
+      
+      if ('serviceWorker' in navigator) {
+        try {
+          const reg = await navigator.serviceWorker.getRegistration();
+          if (reg) {
+            await reg.update();
+            log('✅ Update check complete');
+            
+            // If there's a waiting worker, activate it
+            if (reg.waiting) {
+              log('📦 Installing update...');
+              reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+              window.location.reload();
+            } else {
+              log('ℹ️ No updates available');
+            }
+            
+            localStorage.setItem('sw-last-update', new Date().toLocaleString());
+          } else {
+            log('❌ No service worker registered');
+          }
+        } catch (error) {
+          log('❌ Error: ' + error.message);
+        }
+      }
+      
+      checkStatus();
+    }
+
+    // Clear all caches
+    async function clearAllCaches() {
+      log('🗑️ Clearing all caches...');
+      
+      if ('caches' in window) {
+        try {
+          const names = await caches.keys();
+          await Promise.all(names.map(name => caches.delete(name)));
+          log(`✅ Cleared ${names.length} cache(s)`);
+          
+          // Also clear localStorage
+          localStorage.clear();
+          log('✅ Cleared localStorage');
+          
+          setTimeout(() => {
+            window.location.reload();
+          }, 1000);
+        } catch (error) {
+          log('❌ Error: ' + error.message);
+        }
+      }
+    }
+
+    // Unregister service worker and reload
+    async function unregisterAndReload() {
+      log('⚡ Performing full reset...');
+      
+      if ('serviceWorker' in navigator) {
+        try {
+          const reg = await navigator.serviceWorker.getRegistration();
+          if (reg) {
+            await reg.unregister();
+            log('✅ Service worker unregistered');
+          }
+          
+          // Clear all caches
+          if ('caches' in window) {
+            const names = await caches.keys();
+            await Promise.all(names.map(name => caches.delete(name)));
+            log('✅ All caches cleared');
+          }
+          
+          // Clear localStorage
+          localStorage.clear();
+          log('✅ localStorage cleared');
+          
+          log('🔄 Reloading in 2 seconds...');
+          setTimeout(() => {
+            window.location.reload(true);
+          }, 2000);
+        } catch (error) {
+          log('❌ Error: ' + error.message);
+        }
+      }
+    }
+
+    // Initial check
+    checkStatus();
+    log('👋 Update helper loaded');
+  </script>
+</body>
+</html>
