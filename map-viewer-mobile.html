@@ -182,6 +182,18 @@
       border-radius: 2px;
     }
     
+    .version-label {
+      position: absolute;
+      top: 2px;
+      right: 48px; /* Position inside the next button */
+      font-size: 9px;
+      color: #999;
+      z-index: 3;
+      background: rgba(255, 255, 255, 0.9);
+      padding: 0 4px;
+      border-radius: 2px;
+    }
+    
     .time-slider {
       width: 100%;
       height: 35px;
@@ -435,6 +447,7 @@
     <div class="slider-container">
       <button class="hour-btn prev" id="hour-prev" aria-label="Previous hour">−1</button>
       <div class="slider-label" id="slider-label">Drag to change time</div>
+      <div class="version-label" id="version-label"></div>
       <input type="range" class="time-slider" id="time-slider" min="0" max="72" value="0" step="1">
       <button class="hour-btn next" id="hour-next" aria-label="Next hour">+1</button>
     </div>
@@ -469,6 +482,7 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
+      APP_VERSION: 'v1.3.0', // Update this when deploying changes
       PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
@@ -1290,8 +1304,12 @@
         const now = new Date();
         now.setMinutes(0, 0, 0);
         
-        logger.info('=== Model Initialization ===');
-        logger.info('Proxy URL:', CONFIG.PROXY_HOST);
+      logger.info('=== Model Initialization ===');
+      logger.info('App Version:', CONFIG.APP_VERSION);
+      logger.info('Proxy URL:', CONFIG.PROXY_HOST);
+      
+      // Display version in UI
+      document.getElementById('version-label').textContent = CONFIG.APP_VERSION;
         
         // Check if we're offline
         if (!navigator.onLine) {
