@@ -457,7 +457,7 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
-      APP_VERSION: 'v1.3.1', // Fixed iOS bottom bar spacing
+      APP_VERSION: 'v1.3.2', // Fixed tile caching per forecast hour
       PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
@@ -1034,8 +1034,9 @@
       } else {
         const source = map.getSource("currents");
         source.tiles = [tileUrl];
-        // Don't clear tiles - let browser/service worker cache work
-        // map.style.sourceCaches['currents'].clearTiles();
+        // Clear MapLibre's internal tile cache to force re-fetch
+        // (Service worker will still cache the HTTP responses)
+        map.style.sourceCaches['currents'].clearTiles();
         map.style.sourceCaches['currents'].update(map.transform);
         map.triggerRepaint();
       }

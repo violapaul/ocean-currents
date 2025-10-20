@@ -51,27 +51,34 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   
-  // Handle tile requests - cache for 7 days
+  // Handle tile requests - cache by exact URL (includes model time AND forecast hour)
+  // URL format: /tiles/salish-currents-vec/{startTime}/{endTime}/Surface/v2/ValueLocList/{z}/{y}/{x}.png
   if (url.pathname.includes('/tiles/')) {
     event.respondWith(
       caches.open(TILE_CACHE).then((cache) => {
+        // Use the exact URL as cache key - this includes both model time and forecast hour
         return cache.match(event.request).then((cachedResponse) => {
           if (cachedResponse) {
-            // Return cached tile
+            // Return cached tile for this specific model + forecast hour
+            console.log('Cache hit for tile:', url.pathname);
             return cachedResponse;
           }
           
-          // Fetch and cache new tile
+          // Not in cache - fetch it
+          console.log('Cache miss for tile:', url.pathname);
           return fetch(event.request).then((response) => {
             // Only cache successful responses
             if (response.ok) {
               // Clone BEFORE returning to avoid "body already used" error
               const responseToCache = response.clone();
+              // Cache with full URL including timestamps
               cache.put(event.request, responseToCache);
+              console.log('Cached new tile:', url.pathname);
             }
             return response;
           }).catch(() => {
             // Offline - return a transparent tile or error tile
+            console.log('Offline - no tile available for:', url.pathname);
             return new Response(null, {
               status: 204,
               statusText: 'No Content'
