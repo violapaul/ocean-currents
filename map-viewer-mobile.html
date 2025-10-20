@@ -24,6 +24,23 @@
   
   <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
   <style>
+    html, body, .app-wrapper {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      /* Dynamic viewport first, JS fallback second */
+      height: 100dvh;
+      height: var(--vhpx, 100vh);
+      overflow: hidden;
+      /* Prevent text selection and touch callouts */
+      -webkit-user-select: none;
+      -moz-user-select: none;
+      -ms-user-select: none;
+      user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
     html {
       height: 100%;
       /* This is critical for iOS PWA full screen */
@@ -34,12 +51,7 @@
       margin: 0;
       padding: 0;
       width: 100%;
-      height: 100%;
-      /* Use the full available height on iOS */
-      min-height: 100vh;
-      min-height: -webkit-fill-available;
       overflow: hidden;
-      position: fixed;
       font-family: system-ui, -apple-system, sans-serif;
       /* Prevent bounce scrolling on iOS */
       overscroll-behavior: none;
@@ -388,10 +400,8 @@
     /* iOS PWA standalone mode specific fixes */
     @media (display-mode: standalone) {
       /* Ensure we use full height in standalone mode */
-      html, body {
-        height: 100vh;
-        height: -webkit-fill-available;
-      }
+      html, body, .app-wrapper { height: 100dvh; }
+    }
       
       .app-wrapper {
         height: 100vh;
@@ -457,7 +467,7 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
-      APP_VERSION: 'v1.3.2', // Fixed tile caching per forecast hour
+      APP_VERSION: 'v1.3.3', // Attempting PWA Fix.
       PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
@@ -965,6 +975,20 @@
       zoom: CONFIG.ZOOM,
       attributionControl: false // Clean mobile view
     });
+
+// --- Visual viewport sync + MapLibre resize ---
+function applyViewportHeight() {
+  const h = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  document.documentElement.style.setProperty('--vhpx', `${h}px`);
+  try { map.resize(); } catch {}
+}
+window.addEventListener('load', applyViewportHeight);
+window.addEventListener('orientationchange', applyViewportHeight);
+window.addEventListener('resize', applyViewportHeight);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', applyViewportHeight);
+}
+
     
     function updateCurrentsLayer(hoursFromNow) {
       // Calculate target time based on hours from current time
