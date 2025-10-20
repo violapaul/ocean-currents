@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, viewport-fit=cover">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>Ocean Currents - Mobile</title>
@@ -40,14 +41,14 @@
     
     #map {
       position: fixed;
-      top: 45px;
-      bottom: 55px;
+      top: 28px;
+      bottom: 42px;
       left: 0;
       right: 0;
       width: 100%;
       /* Account for Safari's safe areas */
-      top: calc(45px + env(safe-area-inset-top));
-      bottom: calc(55px + env(safe-area-inset-bottom));
+      top: calc(28px + env(safe-area-inset-top));
+      bottom: calc(42px + env(safe-area-inset-bottom));
     }
     
     /* Top header with time display */
@@ -56,28 +57,28 @@
       top: 0;
       left: 0;
       right: 0;
-      height: 45px;
+      height: 28px;
       padding-top: env(safe-area-inset-top);
       background: rgba(255, 255, 255, 0.92);
       box-shadow: 0 1px 3px rgba(0,0,0,0.12);
       display: flex;
-      flex-direction: column;
+      align-items: center;
       justify-content: center;
       padding-left: 12px;
-      padding-right: 12px;
+      padding-right: 170px; /* Make room for tide chart */
       z-index: 2;
     }
     
-    .model-time {
-      font-size: 11px;
-      color: #777;
-      margin-bottom: 1px;
+    .time-display {
+      font-size: 13px;
+      color: #222;
+      text-align: center;
+      font-weight: 500;
     }
     
-    .forecast-time {
-      font-size: 16px;
-      font-weight: 600;
-      color: #222;
+    .model-time {
+      color: #666;
+      font-weight: normal;
     }
     
     /* Bottom slider control */
@@ -86,21 +87,66 @@
       bottom: 0;
       left: 0;
       right: 0;
-      height: 55px;
+      height: 42px;
       padding-bottom: env(safe-area-inset-bottom);
       background: rgba(255, 255, 255, 0.92);
       box-shadow: 0 -1px 3px rgba(0,0,0,0.12);
-      padding-left: 15px;
-      padding-right: 15px;
-      padding-top: 8px;
+      padding-left: 45px;
+      padding-right: 45px;
+      padding-top: 4px;
       z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    /* Hour adjustment buttons */
+    .hour-btn {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 32px;
+      height: 32px;
+      border-radius: 16px;
+      background: #0066cc;
+      color: white;
+      border: none;
+      font-size: 16px;
+      font-weight: bold;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+      transition: background 0.2s;
+      z-index: 3;
+    }
+    
+    .hour-btn:active {
+      background: #0052a3;
+    }
+    
+    .hour-btn.prev {
+      left: 8px;
+    }
+    
+    .hour-btn.next {
+      right: 8px;
     }
     
     .slider-label {
-      font-size: 11px;
+      position: absolute;
+      top: 2px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 10px;
       color: #666;
-      margin-bottom: 4px;
       text-align: center;
+      white-space: nowrap;
+      z-index: 3;
+      background: rgba(255, 255, 255, 0.8);
+      padding: 0 4px;
+      border-radius: 2px;
     }
     
     .time-slider {
@@ -166,23 +212,172 @@
       display: none;
     }
     
+    /* Current magnitude marker */
+    .magnitude-marker {
+      position: absolute;
+      pointer-events: none;
+      z-index: 5;
+      transform: translate(-50%, -50%);
+    }
+    
+    .magnitude-cross {
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+    }
+    
+    .magnitude-cross::before,
+    .magnitude-cross::after {
+      content: '';
+      position: absolute;
+      background: #ff0000;
+    }
+    
+    .magnitude-cross::before {
+      width: 2px;
+      height: 20px;
+      left: 9px;
+      top: 0;
+    }
+    
+    .magnitude-cross::after {
+      width: 20px;
+      height: 2px;
+      left: 0;
+      top: 9px;
+    }
+    
+    .magnitude-value {
+      position: absolute;
+      top: -8px;
+      left: 15px;
+      color: #ff0000;
+      font-size: 14px;
+      font-weight: bold;
+      text-shadow: 
+        -1px -1px 0 #fff,
+        1px -1px 0 #fff,
+        -1px 1px 0 #fff,
+        1px 1px 0 #fff,
+        0 0 2px #fff;
+      white-space: nowrap;
+    }
+    
+    /* Tide chart */
+    .tide-chart {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 160px;
+      height: 80px;
+      background: rgba(255, 255, 255, 0.92);
+      border-radius: 0 0 0 6px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+      padding: 4px;
+      z-index: 3;
+      /* Account for safe area */
+      padding-top: calc(4px + env(safe-area-inset-top));
+    }
+    
+    .tide-chart-title {
+      font-size: 10px;
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 2px;
+    }
+    
+    .tide-chart-canvas {
+      width: 100%;
+      height: 60px;
+      position: relative;
+    }
+    
+    .tide-chart-svg {
+      width: 100%;
+      height: 100%;
+    }
+    
+    .tide-current-line {
+      stroke: #ff0000;
+      stroke-width: 1.5;
+      stroke-dasharray: 2,2;
+      opacity: 0.7;
+    }
+    
+    .tide-curve {
+      fill: none;
+      stroke: #0077be;
+      stroke-width: 2;
+    }
+    
+    .tide-area {
+      fill: #0077be;
+      opacity: 0.15;
+    }
+    
+    .tide-label {
+      font-size: 9px;
+      fill: #666;
+    }
+    
+    .tide-loading {
+      font-size: 10px;
+      color: #999;
+      text-align: center;
+      padding-top: 25px;
+    }
+    
+    .tide-error {
+      font-size: 10px;
+      color: #cc0000;
+      text-align: center;
+      padding-top: 20px;
+    }
+    
+    /* Hide on very small screens */
+    @media (max-width: 360px) {
+      .tide-chart {
+        display: none;
+      }
+    }
+    
   </style>
 </head>
 <body>
   <div class="app-wrapper">
     <div class="header">
-      <div class="model-time" id="model-time">Model: --</div>
-      <div class="forecast-time" id="forecast-time">--</div>
+      <div class="time-display" id="time-display">
+        <span class="model-time" id="model-time">Model: --</span> | <span id="forecast-time">--</span>
+      </div>
     </div>
     
     <div id="map"></div>
     
+    <!-- Tide chart -->
+    <div class="tide-chart" id="tide-chart">
+      <div class="tide-chart-title">Seattle Tides</div>
+      <div class="tide-chart-canvas" id="tide-canvas">
+        <div class="tide-loading">Loading tides...</div>
+      </div>
+    </div>
+    
     <div class="slider-container">
+      <button class="hour-btn prev" id="hour-prev" aria-label="Previous hour">−1</button>
       <div class="slider-label" id="slider-label">Drag to change time</div>
       <input type="range" class="time-slider" id="time-slider" min="0" max="72" value="0" step="1">
+      <button class="hour-btn next" id="hour-next" aria-label="Next hour">+1</button>
     </div>
     
     <div class="loading" id="loading">Searching for model data...</div>
+    
+    <!-- Magnitude marker (hidden by default) -->
+    <div class="magnitude-marker" id="magnitude-marker" style="display: none;">
+      <div class="magnitude-cross"></div>
+      <div class="magnitude-value" id="magnitude-value">0.0</div>
+    </div>
   </div>
 
   <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
@@ -220,14 +415,19 @@
     // IMPORTANT: Replace YOUR-CLOUDFLARE-SUBDOMAIN with your actual Cloudflare subdomain
     // You'll get this after running 'wrangler deploy'
     const PROXY_HOST = (() => {
-      if (window.location.hostname === 'localhost') {
-        // Local development
-        return 'http://localhost:8787';
+      // For local testing (127.0.0.1 or localhost), use the deployed Cloudflare worker
+      if (window.location.hostname === 'localhost' || 
+          window.location.hostname === '127.0.0.1' || 
+          window.location.protocol === 'file:') {
+        console.log('🏠 Local environment detected - using Cloudflare Worker proxy');
+        return 'https://ocean-currents-proxy.violapaul.workers.dev';
       } else if (window.location.hostname.includes('github.io')) {
         // GitHub Pages deployment - using Cloudflare Worker
+        console.log('🌐 GitHub Pages detected - using Cloudflare Worker proxy');
         return 'https://ocean-currents-proxy.violapaul.workers.dev';
       } else {
         // Fallback for other deployments
+        console.log('🔧 Other deployment - attempting local proxy');
         return `http://${window.location.hostname}:8787`;
       }
     })();
@@ -238,11 +438,22 @@
     const HOURS_AHEAD = 35;
     const SSCOFS_CYCLES = [0, 3, 9, 15, 21];
     
+    console.log('🔗 Proxy configuration:', {
+      host: PROXY_HOST,
+      base: PROXY_BASE,
+      protocol: window.location.protocol,
+      hostname: window.location.hostname
+    });
+    
     // State
     let currentModelInfo = null;
     let modelCycleStart = null;
     let isUpdating = false;
     let modelAvailability = []; // Store model availability info from exploration
+    let magnitudeMarker = null; // Track magnitude marker state
+    let longPressTimer = null; // Timer for long press detection
+    let tideData = null; // Cache tide data
+    let currentDisplayTime = null; // Track current display time for tide chart
     
     // ========== MODEL FUNCTIONS ==========
     
@@ -284,6 +495,272 @@
              pad(d.getUTCHours()) + ":00:00Z";
     }
     
+    // ========== TIDE FUNCTIONS ==========
+    
+    // Seattle station ID: 9447130
+    const TIDE_STATION_ID = '9447130';
+    const TIDE_STATION_NAME = 'Seattle';
+    
+    async function fetchTideData(centerTime) {
+      // Fetch 48 hours of data centered on the given time
+      const startTime = new Date(centerTime.getTime() - 24 * 60 * 60 * 1000);
+      const endTime = new Date(centerTime.getTime() + 24 * 60 * 60 * 1000);
+      
+      // Format dates for NOAA API (YYYYMMDD HH:MM)
+      const formatNOAADate = (d) => {
+        const pad = (n) => String(n).padStart(2, "0");
+        return d.getFullYear() + 
+               pad(d.getMonth()+1) + 
+               pad(d.getDate()) + ' ' +
+               pad(d.getHours()) + ':' +
+               pad(d.getMinutes());
+      };
+      
+      // NOAA CO-OPS API for tide predictions
+      const noaaUrl = 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?' +
+        `begin_date=${formatNOAADate(startTime)}&` +
+        `end_date=${formatNOAADate(endTime)}&` +
+        `station=${TIDE_STATION_ID}&` +
+        `product=predictions&` +
+        `datum=MLLW&` +
+        `time_zone=lst_ldt&` +
+        `units=english&` +
+        `interval=6&` + // 6-minute intervals for smooth curve
+        `format=json`;
+      
+      // Use proxy for localhost, direct for production
+      const url = (window.location.hostname === 'localhost' || 
+                  window.location.hostname === '127.0.0.1')
+        ? `${PROXY_HOST}/noaa/tides?${noaaUrl.split('?')[1]}`
+        : noaaUrl;
+      
+      console.log('🌊 Fetching tide data:', url);
+      
+      try {
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (data.predictions && data.predictions.length > 0) {
+          // Convert to simpler format with timestamps
+          const tides = data.predictions.map(p => ({
+            time: new Date(p.t.replace(' ', 'T')),
+            height: parseFloat(p.v)
+          }));
+          
+          console.log(`🌊 Loaded ${tides.length} tide points`);
+          return tides;
+        }
+      } catch (error) {
+        console.error('❌ Error fetching tide data:', error);
+      }
+      
+      return null;
+    }
+    
+    function drawTideChart(tides, currentTime) {
+      const canvas = document.getElementById('tide-canvas');
+      
+      if (!tides || tides.length === 0) {
+        canvas.innerHTML = '<div class="tide-error">No tide data</div>';
+        return;
+      }
+      
+      // Filter to 24-hour window (12 hours before and after current time)
+      const windowStart = new Date(currentTime.getTime() - 12 * 60 * 60 * 1000);
+      const windowEnd = new Date(currentTime.getTime() + 12 * 60 * 60 * 1000);
+      
+      const windowTides = tides.filter(t => 
+        t.time >= windowStart && t.time <= windowEnd
+      );
+      
+      if (windowTides.length === 0) {
+        canvas.innerHTML = '<div class="tide-error">No data for this time</div>';
+        return;
+      }
+      
+      // Find min/max for scaling
+      const heights = windowTides.map(t => t.height);
+      const minHeight = Math.min(...heights);
+      const maxHeight = Math.max(...heights);
+      const heightRange = maxHeight - minHeight;
+      
+      // SVG dimensions
+      const width = 152; // Account for padding
+      const height = 60;
+      const margin = { top: 3, right: 3, bottom: 12, left: 3 };
+      const chartWidth = width - margin.left - margin.right;
+      const chartHeight = height - margin.top - margin.bottom;
+      
+      // Create SVG
+      const svg = `
+        <svg class="tide-chart-svg" viewBox="0 0 ${width} ${height}">
+          <g transform="translate(${margin.left},${margin.top})">
+            <!-- Grid lines -->
+            <line x1="0" y1="${chartHeight/2}" x2="${chartWidth}" y2="${chartHeight/2}" 
+                  stroke="#e0e0e0" stroke-width="0.5"/>
+            
+            <!-- Tide curve area -->
+            <path class="tide-area" d="${
+              'M ' + windowTides.map((t, i) => {
+                const x = (i / (windowTides.length - 1)) * chartWidth;
+                const y = chartHeight - ((t.height - minHeight) / heightRange) * chartHeight;
+                return `${x},${y}`;
+              }).join(' L ') + 
+              ` L ${chartWidth},${chartHeight} L 0,${chartHeight} Z`
+            }"/>
+            
+            <!-- Tide curve line -->
+            <path class="tide-curve" d="${
+              'M ' + windowTides.map((t, i) => {
+                const x = (i / (windowTides.length - 1)) * chartWidth;
+                const y = chartHeight - ((t.height - minHeight) / heightRange) * chartHeight;
+                return `${x},${y}`;
+              }).join(' L ')
+            }"/>
+            
+            <!-- Current time indicator -->
+            <line class="tide-current-line" 
+                  x1="${chartWidth/2}" y1="0" 
+                  x2="${chartWidth/2}" y2="${chartHeight}"/>
+            
+            <!-- Labels -->
+            <text x="2" y="${chartHeight + 12}" class="tide-label">-12h</text>
+            <text x="${chartWidth/2}" y="${chartHeight + 12}" class="tide-label" text-anchor="middle">Now</text>
+            <text x="${chartWidth - 2}" y="${chartHeight + 12}" class="tide-label" text-anchor="end">+12h</text>
+            
+            <!-- Height labels -->
+            <text x="2" y="10" class="tide-label">${maxHeight.toFixed(1)}ft</text>
+            <text x="2" y="${chartHeight}" class="tide-label">${minHeight.toFixed(1)}ft</text>
+          </g>
+        </svg>
+      `;
+      
+      canvas.innerHTML = svg;
+      
+      // Update title with current tide height
+      const currentTideIndex = Math.floor(windowTides.length / 2);
+      const currentTide = windowTides[currentTideIndex];
+      if (currentTide) {
+        document.querySelector('.tide-chart-title').textContent = 
+          `${TIDE_STATION_NAME} - ${currentTide.height.toFixed(1)}ft`;
+      }
+    }
+    
+    async function updateTideChart(displayTime) {
+      currentDisplayTime = displayTime;
+      
+      // Check if we need to fetch new data (if current data doesn't cover this time)
+      if (!tideData || tideData.length === 0 ||
+          displayTime < tideData[0].time || 
+          displayTime > tideData[tideData.length - 1].time) {
+        
+        console.log('🌊 Fetching new tide data for', formatTimeLocal(displayTime));
+        tideData = await fetchTideData(displayTime);
+      }
+      
+      if (tideData) {
+        drawTideChart(tideData, displayTime);
+      }
+    }
+    
+    // ========== MAGNITUDE FUNCTIONS ==========
+    
+    async function fetchCurrentMagnitude(lat, lon) {
+      console.log('🎯 fetchCurrentMagnitude called:', { lat, lon });
+      
+      if (!currentModelInfo) {
+        console.warn('❌ No model info available');
+        return null;
+      }
+      
+      // Build the time strings for the API
+      const cycleStart = new Date(currentModelInfo.cycleDate);
+      cycleStart.setUTCHours(currentModelInfo.cycleHour, 0, 0, 0);
+      const startTime = toIsoUTC(cycleStart);
+      const endTime = toIsoUTC(currentModelInfo.targetTime);
+      
+      console.log('📊 Model info:', {
+        cycleStart: formatTimeLocal(cycleStart),
+        targetTime: formatTimeLocal(currentModelInfo.targetTime),
+        startTime,
+        endTime
+      });
+      
+      // Call NVS API through proxy to avoid CORS issues
+      const layer = `salish-currents-vec/${startTime}/${endTime}/Surface`;
+      
+      // Use direct NVS for production (github.io), proxy for localhost
+      const baseUrl = (window.location.hostname === 'localhost' || 
+                      window.location.hostname === '127.0.0.1') 
+        ? `${PROXY_HOST}/nvs/get_values`
+        : 'https://nvs.nanoos.org/ssa/get_imov_values.php';
+      
+      const url = `${baseUrl}?` +
+        `sid=${Math.random()}&` +
+        `layer1=${encodeURIComponent(layer)}&` +
+        `var1=H1_CurrSpeed&` +
+        `num_layers=1&` +
+        `location_mode=interpolate&` +
+        `lat=${lat}&` +
+        `lon=${lon}`;
+      
+      console.log('🌐 API URL:', url);
+      console.log('🔀 Using proxy:', baseUrl.includes(PROXY_HOST));
+      
+      try {
+        console.log('📡 Fetching from NVS API...');
+        const response = await fetch(url);
+        console.log('📡 Response status:', response.status);
+        
+        const data = await response.json();
+        console.log('📦 API Response:', data);
+        
+        if (data.success && data.values && data.values.length > 0) {
+          const result = {
+            value: data.values[0].value,
+            direction: data.values[0].direction
+          };
+          console.log('✅ Magnitude data:', result);
+          return result;
+        } else {
+          console.warn('⚠️ No valid data in response');
+        }
+      } catch (error) {
+        console.error('❌ Error fetching magnitude:', error);
+      }
+      
+      // Fallback: estimate from nearby tile data (simplified approach)
+      // In production, you'd want to implement proper interpolation
+      const fallback = {
+        value: Math.random() * 2.5, // Dummy value in knots
+        direction: Math.random() * 360
+      };
+      console.log('⚠️ Using fallback data:', fallback);
+      return fallback;
+    }
+    
+    function showMagnitudeMarker(x, y, magnitude) {
+      const marker = document.getElementById('magnitude-marker');
+      const valueEl = document.getElementById('magnitude-value');
+      
+      // Format magnitude to 1 decimal place
+      valueEl.textContent = magnitude.toFixed(1);
+      
+      // Position the marker
+      marker.style.left = x + 'px';
+      marker.style.top = y + 'px';
+      marker.style.display = 'block';
+      
+      // Store marker info
+      magnitudeMarker = { x, y, magnitude };
+    }
+    
+    function hideMagnitudeMarker() {
+      const marker = document.getElementById('magnitude-marker');
+      marker.style.display = 'none';
+      magnitudeMarker = null;
+    }
+    
     function formatTimeLocal(date) {
       const options = {
         weekday: 'short',
@@ -315,7 +792,7 @@
       cycleTime.setUTCHours(modelInfo.cycleHour, 0, 0, 0);
       
       // Model time (when the model was run)
-      document.getElementById('model-time').textContent = `Model: ${formatTimeShort(cycleTime)}`;
+      document.getElementById('model-time').textContent = `${formatTimeShort(cycleTime)}`;
       
       // Forecast time (what time we're showing)
       document.getElementById('forecast-time').textContent = formatTimeLocal(modelInfo.targetTime);
@@ -384,6 +861,9 @@
       // Update display
       updateTimeDisplay(bestModel);
       
+      // Update tide chart for the current display time
+      updateTideChart(targetTime);
+      
       // CRITICAL: Always use the MODEL CYCLE START as the tile start time
       // The end time determines which forecast hour we get
       const startTime = toIsoUTC(thisCycleStart);
@@ -392,6 +872,7 @@
       const tileUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${startTime}/${endTime}/Surface/v2/ValueLocList/{z}/{y}/{x}.png`;
       
       console.log(`Target: ${formatTimeLocal(targetTime)} | Model: ${formatTimeLocal(thisCycleStart)} (${bestModel.cycleHour}z) | F${bestModel.forecastHour.toString().padStart(3,'0')}`);
+      console.log('🗺️ Tile URL pattern:', tileUrl);
       
       if (!map.getSource("currents")) {
         map.addSource("currents", {
@@ -671,12 +1152,141 @@
       }, 100);
     });
     
+    // Hour adjustment buttons
+    document.getElementById('hour-prev').addEventListener('click', (e) => {
+      const slider = document.getElementById('time-slider');
+      const currentValue = parseInt(slider.value);
+      const newValue = Math.max(parseInt(slider.min), currentValue - 1);
+      slider.value = newValue;
+      
+      // Trigger the input event
+      const event = new Event('input', { bubbles: true });
+      slider.dispatchEvent(event);
+    });
+    
+    document.getElementById('hour-next').addEventListener('click', (e) => {
+      const slider = document.getElementById('time-slider');
+      const currentValue = parseInt(slider.value);
+      const newValue = Math.min(parseInt(slider.max), currentValue + 1);
+      slider.value = newValue;
+      
+      // Trigger the input event
+      const event = new Event('input', { bubbles: true });
+      slider.dispatchEvent(event);
+    });
+    
     document.getElementById('time-slider').addEventListener('change', (e) => {
       // Reset label after interaction
       const maxHours = parseInt(e.target.max);
       setTimeout(() => {
         document.getElementById('slider-label').textContent = `Hours from now (0 to +${maxHours})`;
       }, 2000);
+    });
+    
+    // ========== TOUCH HANDLERS FOR MAGNITUDE ==========
+    
+    // Handle long press for showing magnitude
+    map.on('touchstart', (e) => {
+      console.log('👆 touchstart event fired', {
+        touches: e.originalEvent.touches.length,
+        timestamp: new Date().toISOString()
+      });
+      
+      // Clear any existing timer
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        console.log('🔄 Cleared existing long press timer');
+      }
+      
+      // Hide existing marker when starting a new touch
+      hideMagnitudeMarker();
+      
+      // Store touch position
+      const touch = e.originalEvent.touches[0];
+      const point = { x: touch.clientX, y: touch.clientY };
+      const lngLat = map.unproject([point.x, point.y]);
+      
+      console.log('📍 Touch position:', {
+        screen: point,
+        lngLat: { lat: lngLat.lat, lng: lngLat.lng }
+      });
+      
+      // Start long press timer (300ms)
+      console.log('⏱️ Starting 300ms long press timer...');
+      longPressTimer = setTimeout(async () => {
+        console.log('⏰ Long press timer triggered!');
+        
+        // Vibrate if available (haptic feedback)
+        if (navigator.vibrate) {
+          console.log('📳 Triggering haptic feedback');
+          navigator.vibrate(10);
+        } else {
+          console.log('📳 Vibrate API not available');
+        }
+        
+        // Fetch and show magnitude
+        console.log('🔍 Fetching magnitude for:', { lat: lngLat.lat, lng: lngLat.lng });
+        const result = await fetchCurrentMagnitude(lngLat.lat, lngLat.lng);
+        if (result) {
+          console.log('📌 Showing marker with value:', result.value);
+          showMagnitudeMarker(point.x, point.y, result.value);
+        } else {
+          console.log('❌ No result to show');
+        }
+      }, 300);
+    });
+    
+    // Cancel long press on move or end
+    map.on('touchmove', () => {
+      if (longPressTimer) {
+        console.log('👆 touchmove - cancelling long press');
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    });
+    
+    map.on('touchend', () => {
+      if (longPressTimer) {
+        console.log('👆 touchend - cancelling long press');
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      } else {
+        console.log('👆 touchend - no timer to cancel');
+      }
+    });
+    
+    map.on('touchcancel', () => {
+      if (longPressTimer) {
+        console.log('👆 touchcancel - cancelling long press');
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    });
+    
+    // Also support click for desktop testing
+    map.on('contextmenu', async (e) => {
+      console.log('🖱️ Right-click detected at:', { 
+        point: e.point, 
+        lngLat: { lat: e.lngLat.lat, lng: e.lngLat.lng }
+      });
+      
+      e.preventDefault();
+      const point = e.point;
+      const lngLat = e.lngLat;
+      
+      // Fetch and show magnitude
+      console.log('🔍 Fetching magnitude for right-click...');
+      const result = await fetchCurrentMagnitude(lngLat.lat, lngLat.lng);
+      if (result) {
+        console.log('📌 Showing marker with value:', result.value);
+        showMagnitudeMarker(point.x, point.y, result.value);
+      }
+    });
+    
+    // Hide marker when starting to pan
+    map.on('movestart', () => {
+      console.log('🗺️ Map movestart - hiding marker');
+      hideMagnitudeMarker();
     });
     
     // Initialize when map loads

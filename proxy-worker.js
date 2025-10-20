@@ -37,9 +37,102 @@ async function handleRequest(request) {
     })
   }
   
+  // Handle NVS API proxy for magnitude values
+  if (url.pathname === '/nvs/get_values') {
+    const params = url.searchParams
+    
+    // Build the NVS API URL with all parameters
+    const nvsUrl = new URL('https://nvs.nanoos.org/ssa/get_imov_values.php')
+    
+    // Copy all query parameters to the NVS URL
+    for (const [key, value] of params) {
+      nvsUrl.searchParams.append(key, value)
+    }
+    
+    console.log(`Proxying NVS API request to: ${nvsUrl.toString()}`)
+    
+    try {
+      const response = await fetch(nvsUrl.toString(), {
+        headers: {
+          'Referer': 'https://nvs.nanoos.org/',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        }
+      })
+      
+      const data = await response.text()
+      
+      return new Response(data, {
+        status: response.status,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+          'Cache-Control': 'public, max-age=60',
+        }
+      })
+    } catch (error) {
+      console.error('NVS proxy error:', error)
+      return new Response(JSON.stringify({
+        success: false,
+        error: error.message
+      }), {
+        status: 500,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+        }
+      })
+    }
+  }
+  
+  // Handle NOAA tide API proxy
+  if (url.pathname === '/noaa/tides') {
+    const params = url.searchParams
+    
+    // Build the NOAA API URL with all parameters
+    const noaaUrl = new URL('https://api.tidesandcurrents.noaa.gov/api/prod/datagetter')
+    
+    // Copy all query parameters to the NOAA URL
+    for (const [key, value] of params) {
+      noaaUrl.searchParams.append(key, value)
+    }
+    
+    console.log(`Proxying NOAA API request to: ${noaaUrl.toString()}`)
+    
+    try {
+      const response = await fetch(noaaUrl.toString(), {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+          'Accept': 'application/json',
+        }
+      })
+      
+      const data = await response.text()
+      
+      return new Response(data, {
+        status: response.status,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+          'Cache-Control': 'public, max-age=3600', // Cache tide data for 1 hour
+        }
+      })
+    } catch (error) {
+      console.error('NOAA proxy error:', error)
+      return new Response(JSON.stringify({
+        error: error.message
+      }), {
+        status: 500,
+        headers: {
+          ...corsHeaders,
+          'Content-Type': 'application/json',
+        }
+      })
+    }
+  }
+  
   // Extract path after /tiles
   if (!url.pathname.startsWith('/tiles')) {
-    return new Response('Not Found - use /tiles/* path', { 
+    return new Response('Not Found - use /tiles/*, /nvs/*, or /noaa/* path', { 
       status: 404,
       headers: {
         ...corsHeaders,
