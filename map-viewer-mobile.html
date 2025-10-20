@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  
+  <!-- PWA meta tags for full screen -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -22,11 +24,20 @@
   
   <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
   <style>
-    html, body {
+    html {
+      height: 100%;
+      /* This is critical for iOS PWA full screen */
+      height: -webkit-fill-available;
+    }
+    
+    body {
       margin: 0;
       padding: 0;
       width: 100%;
       height: 100%;
+      /* Use the full available height on iOS */
+      min-height: 100vh;
+      min-height: -webkit-fill-available;
       overflow: hidden;
       position: fixed;
       font-family: system-ui, -apple-system, sans-serif;
@@ -44,6 +55,9 @@
       bottom: 0;
       width: 100%;
       height: 100%;
+      /* Use full available height */
+      height: 100vh;
+      height: -webkit-fill-available;
       overflow: hidden;
       /* Prevent text selection and touch callouts */
       -webkit-user-select: none;
@@ -56,14 +70,14 @@
     
     #map {
       position: fixed;
-      top: 28px;
-      bottom: 42px;
       left: 0;
       right: 0;
       width: 100%;
-      /* Account for Safari's safe areas */
-      top: calc(28px + env(safe-area-inset-top));
-      bottom: calc(42px + env(safe-area-inset-bottom));
+      /* Account for Safari's safe areas - using constant for older iOS */
+      top: calc(28px + env(safe-area-inset-top, 0px));
+      top: calc(28px + constant(safe-area-inset-top, 0px));
+      bottom: calc(42px + env(safe-area-inset-bottom, 0px));
+      bottom: calc(42px + constant(safe-area-inset-bottom, 0px));
     }
     
     /* Top header with time display */
@@ -73,7 +87,9 @@
       left: 0;
       right: 0;
       height: 28px;
-      padding-top: env(safe-area-inset-top);
+      /* Support both old and new iOS syntax */
+      padding-top: env(safe-area-inset-top, 0px);
+      padding-top: constant(safe-area-inset-top, 0px);
       background: rgba(255, 255, 255, 0.92);
       box-shadow: 0 1px 3px rgba(0,0,0,0.12);
       display: flex;
@@ -103,7 +119,9 @@
       left: 0;
       right: 0;
       height: 42px;
-      padding-bottom: env(safe-area-inset-bottom);
+      /* Support both old and new iOS syntax */
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+      padding-bottom: constant(safe-area-inset-bottom, 0px);
       background: rgba(255, 255, 255, 0.92);
       box-shadow: 0 -1px 3px rgba(0,0,0,0.12);
       padding-left: 45px;
@@ -293,8 +311,9 @@
       box-shadow: 0 2px 8px rgba(0,0,0,0.15);
       padding: 4px;
       z-index: 3;
-      /* Account for safe area */
-      padding-top: calc(4px + env(safe-area-inset-top));
+      /* Account for safe area - support both syntaxes */
+      padding-top: calc(4px + env(safe-area-inset-top, 0px));
+      padding-top: calc(4px + constant(safe-area-inset-top, 0px));
     }
     
     .tide-chart-title {
@@ -356,6 +375,40 @@
     @media (max-width: 360px) {
       .tide-chart {
         display: none;
+      }
+    }
+    
+    /* iOS PWA standalone mode specific fixes */
+    @media (display-mode: standalone) {
+      /* Ensure we use full height in standalone mode */
+      html, body {
+        height: 100vh;
+        height: -webkit-fill-available;
+      }
+      
+      .app-wrapper {
+        height: 100vh;
+        height: -webkit-fill-available;
+      }
+      
+      /* Extra padding for iPhone X and later models with notch */
+      @supports (padding-top: constant(safe-area-inset-top)) or (padding-top: env(safe-area-inset-top)) {
+        .header {
+          padding-top: constant(safe-area-inset-top);
+          padding-top: env(safe-area-inset-top);
+        }
+        
+        .slider-container {
+          padding-bottom: constant(safe-area-inset-bottom);
+          padding-bottom: env(safe-area-inset-bottom);
+        }
+        
+        #map {
+          top: calc(28px + constant(safe-area-inset-top));
+          top: calc(28px + env(safe-area-inset-top));
+          bottom: calc(42px + constant(safe-area-inset-bottom));
+          bottom: calc(42px + env(safe-area-inset-bottom));
+        }
       }
     }
     
