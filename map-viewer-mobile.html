@@ -397,34 +397,32 @@
 
   <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
   <script>
-    // Test scroll function for debugging
-    function testScroll() {
-      console.log('=== Testing Scroll ===');
-      console.log('Before scroll - pageYOffset:', window.pageYOffset);
-      console.log('Document height:', document.documentElement.scrollHeight);
-      console.log('Window height:', window.innerHeight);
-      
-      // Try different scroll methods
-      window.scrollTo(0, 1);
-      console.log('After scrollTo(0,1) - pageYOffset:', window.pageYOffset);
-      
-      // Try scrollBy
-      window.scrollBy(0, 1);
-      console.log('After scrollBy(0,1) - pageYOffset:', window.pageYOffset);
-      
-      // Check if we can scroll
-      const canScroll = document.documentElement.scrollHeight > window.innerHeight;
-      console.log('Page is scrollable:', canScroll);
-      
-      // Try to force height
-      document.body.style.height = (window.innerHeight + 100) + 'px';
-      console.log('Set body height to:', document.body.style.height);
-      
-      setTimeout(() => {
-        window.scrollTo(0, 50);
-        console.log('After forcing scroll to 50:', window.pageYOffset);
-      }, 100);
-    }
+    // Logging system - levels: 0=off, 1=error, 2=warn, 3=info, 4=debug
+    const LOG_LEVELS = { off: 0, error: 1, warn: 2, info: 3, debug: 4 };
+    let LOG_LEVEL = LOG_LEVELS.warn; // Default to warnings and errors only
+    
+    // Allow runtime override via ?log=debug or localStorage
+    (function initLogLevel() {
+      const qs = new URLSearchParams(location.search).get('log');
+      const stored = localStorage.getItem('logLevel');
+      const v = qs || stored;
+      if (v && v in LOG_LEVELS) {
+        LOG_LEVEL = LOG_LEVELS[v];
+        console.log(`📊 Log level set to: ${v} (${LOG_LEVEL})`);
+      }
+    })();
+    
+    const logger = {
+      error: (...a) => LOG_LEVEL >= LOG_LEVELS.error && console.error(...a),
+      warn:  (...a) => LOG_LEVEL >= LOG_LEVELS.warn  && console.warn(...a),
+      info:  (...a) => LOG_LEVEL >= LOG_LEVELS.info  && console.info(...a),
+      debug: (...a) => LOG_LEVEL >= LOG_LEVELS.debug && console.log(...a),
+      group: (...a) => LOG_LEVEL >= LOG_LEVELS.info  && console.group(...a),
+      groupEnd: () => LOG_LEVEL >= LOG_LEVELS.info   && console.groupEnd(),
+    };
+    
+    // Compatibility flag for old DEBUG_MODE references
+    const DEBUG_MODE = LOG_LEVEL >= LOG_LEVELS.debug;
     
     // Configuration
     // IMPORTANT: Replace YOUR-CLOUDFLARE-SUBDOMAIN with your actual Cloudflare subdomain
@@ -434,15 +432,15 @@
       if (window.location.hostname === 'localhost' || 
           window.location.hostname === '127.0.0.1' || 
           window.location.protocol === 'file:') {
-        console.log('🏠 Local environment detected - using Cloudflare Worker proxy');
+        logger.info('🏠 Local environment detected - using Cloudflare Worker proxy');
         return 'https://ocean-currents-proxy.violapaul.workers.dev';
       } else if (window.location.hostname.includes('github.io')) {
         // GitHub Pages deployment - using Cloudflare Worker
-        console.log('🌐 GitHub Pages detected - using Cloudflare Worker proxy');
+        logger.info('🌐 GitHub Pages detected - using Cloudflare Worker proxy');
         return 'https://ocean-currents-proxy.violapaul.workers.dev';
       } else {
         // Fallback for other deployments
-        console.log('🔧 Other deployment - attempting local proxy');
+        logger.info('🔧 Other deployment - attempting local proxy');
         return `http://${window.location.hostname}:8787`;
       }
     })();
@@ -453,7 +451,7 @@
     const HOURS_AHEAD = 35;
     const SSCOFS_CYCLES = [0, 3, 9, 15, 21];
     
-    console.log('🔗 Proxy configuration:', {
+    logger.info('🔗 Proxy configuration:', {
       host: PROXY_HOST,
       base: PROXY_BASE,
       protocol: window.location.protocol,
@@ -469,9 +467,6 @@
     let magnitudeMarker = null; // Track magnitude marker state with lat/lng
     let tideData = null; // Cache tide data
     let currentDisplayTime = null; // Track current display time for tide chart
-    
-    // Debug flag - set to true to enable verbose logging
-    const DEBUG_MODE = false; // Change to true for debugging
     
     // ========== MODEL FUNCTIONS ==========
     
@@ -555,7 +550,7 @@
       // Always use proxy - NOAA doesn't provide CORS headers either
       const url = `${PROXY_HOST}/noaa/tides?${noaaUrl.split('?')[1]}`;
       
-      console.log('🌊 Fetching tide data:', url);
+      logger.debug('🌊 Fetching tide data:', url);
       
       try {
         const response = await fetch(url);
@@ -568,11 +563,11 @@
             height: parseFloat(p.v)
           }));
           
-          console.log(`🌊 Loaded ${tides.length} tide points`);
+          logger.info(`🌊 Loaded ${tides.length} tide points`);
           return tides;
         }
       } catch (error) {
-        console.error('❌ Error fetching tide data:', error);
+        logger.error('❌ Error fetching tide data:', error);
       }
       
       return null;
@@ -703,7 +698,7 @@
                           tideData[tideData.length - 1].time < dayEnd;
       
       if (needNewData) {
-        console.log('🌊 Fetching new tide data for day:', dayStart.toLocaleDateString());
+        logger.info('🌊 Fetching new tide data for day:', dayStart.toLocaleDateString());
         tideData = await fetchTideData(displayTime);
       }
       
@@ -715,10 +710,10 @@
     // ========== MAGNITUDE FUNCTIONS ==========
     
     async function fetchCurrentMagnitude(lat, lon) {
-      console.log('🎯 fetchCurrentMagnitude called:', { lat, lon });
+      if (DEBUG_MODE) console.log('🎯 fetchCurrentMagnitude called:', { lat, lon });
       
       if (!currentModelInfo) {
-        console.warn('❌ No model info available');
+        if (DEBUG_MODE) console.warn('❌ No model info available');
         return null;
       }
       
@@ -728,12 +723,14 @@
       const startTime = toIsoUTC(cycleStart);
       const endTime = toIsoUTC(currentModelInfo.targetTime);
       
-      console.log('📊 Model info:', {
-        cycleStart: formatTimeLocal(cycleStart),
-        targetTime: formatTimeLocal(currentModelInfo.targetTime),
-        startTime,
-        endTime
-      });
+      if (DEBUG_MODE) {
+        console.log('📊 Model info:', {
+          cycleStart: formatTimeLocal(cycleStart),
+          targetTime: formatTimeLocal(currentModelInfo.targetTime),
+          startTime,
+          endTime
+        });
+      }
       
       // Call NVS API through proxy to avoid CORS issues
       const layer = `salish-currents-vec/${startTime}/${endTime}/Surface`;
@@ -750,16 +747,16 @@
         `lat=${lat}&` +
         `lon=${lon}`;
       
-      console.log('🌐 API URL:', url);
-      console.log('🔀 Using proxy:', baseUrl.includes(PROXY_HOST));
+      logger.debug('🌐 API URL:', url);
+      logger.debug('🔀 Using proxy:', baseUrl.includes(PROXY_HOST));
       
       try {
-        console.log('📡 Fetching from NVS API...');
+        logger.debug('📡 Fetching from NVS API...');
         const response = await fetch(url);
-        console.log('📡 Response status:', response.status);
+        logger.debug('📡 Response status:', response.status);
         
         const data = await response.json();
-        console.log('📦 API Response:', data);
+        logger.debug('📦 API Response:', data);
         
         if (data.success && data.values && data.values.length > 0) {
           // Convert from m/s to knots (1 m/s = 1.94384 knots)
@@ -767,13 +764,13 @@
             value: data.values[0].value * 1.94384,
             direction: data.values[0].direction
           };
-          console.log('✅ Magnitude data (converted to knots):', result);
+          logger.debug('✅ Magnitude data (converted to knots):', result);
           return result;
         } else {
-          console.warn('⚠️ No valid data in response');
+          logger.warn('⚠️ No valid data in response');
         }
       } catch (error) {
-        console.error('❌ Error fetching magnitude:', error);
+        logger.error('❌ Error fetching magnitude:', error);
       }
       
       // Fallback: estimate from nearby tile data (simplified approach)
@@ -782,7 +779,7 @@
         value: Math.random() * 2.0, // Dummy value in knots (typical range 0-2 knots)
         direction: Math.random() * 360
       };
-      console.log('⚠️ Using fallback data:', fallback);
+      logger.warn('⚠️ Using fallback data:', fallback);
       return fallback;
     }
     
@@ -1337,22 +1334,6 @@
     // Initialize when map loads
     map.on('load', async () => {
       await initialize();
-      
-      // Debug info for Safari UI hiding
-      console.log('Window height:', window.innerHeight);
-      console.log('Document height:', document.documentElement.scrollHeight);
-      console.log('Body height:', document.body.scrollHeight);
-      console.log('Screen height:', screen.height);
-      console.log('Can scroll:', document.documentElement.scrollHeight > window.innerHeight);
-      
-      // Try to hide Safari UI by scrolling slightly
-      setTimeout(() => {
-        console.log('Attempting to scroll to hide UI...');
-        window.scrollTo(0, 1);
-        setTimeout(() => {
-          console.log('Scroll position:', window.pageYOffset);
-        }, 500);
-      }, 100);
     });
     
     // Handle errors gracefully
