@@ -394,10 +394,36 @@
       padding-top: 20px;
     }
     
-    /* Hide on very small screens */
+    /* Adjust tide chart for very small screens */
     @media (max-width: 360px) {
       .tide-chart {
-        display: none;
+        width: 160px;  /* Slightly smaller but still visible */
+        height: 90px;
+        font-size: 9px;  /* Slightly smaller text */
+      }
+      .tide-chart-title {
+        font-size: 9px;
+      }
+      .tide-chart-canvas {
+        height: 70px;
+      }
+      .header {
+        padding-right: 170px;  /* Make room for smaller tide chart */
+      }
+    }
+    
+    /* Ultra-compact for extremely narrow viewports (< 320px) */
+    @media (max-width: 320px) {
+      .tide-chart {
+        width: 140px;  /* Even smaller but always visible */
+        height: 80px;
+      }
+      .tide-chart-canvas {
+        height: 60px;
+      }
+      .header {
+        padding-right: 150px;
+        font-size: 12px;
       }
     }
     
@@ -459,7 +485,7 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
-      APP_VERSION: 'v1.4.2', // Fixed label positioning for non-PWA mode
+      APP_VERSION: 'v1.4.3', // Tide chart always visible, scales for small screens
       PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
