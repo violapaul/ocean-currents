@@ -1,0 +1,17 @@
+{
+  "name": "ocean-currents-proxy",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker proxy for Ocean Currents viewer",
+  "main": "proxy-worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail"
+  },
+  "keywords": ["cloudflare-worker", "proxy", "ocean-currents"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

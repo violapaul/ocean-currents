@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Test - Ocean Currents</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 800px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      line-height: 1.6;
+    }
+    h1 { color: #0077be; }
+    .test { 
+      background: #f5f5f5; 
+      padding: 1rem; 
+      margin: 1rem 0;
+      border-radius: 8px;
+    }
+    .success { background: #d4edda; color: #155724; }
+    .error { background: #f8d7da; color: #721c24; }
+    .pending { background: #fff3cd; color: #856404; }
+    pre { 
+      background: #282c34; 
+      color: #abb2bf;
+      padding: 1rem;
+      border-radius: 4px;
+      overflow-x: auto;
+    }
+    button {
+      background: #0077be;
+      color: white;
+      border: none;
+      padding: 0.5rem 1rem;
+      border-radius: 4px;
+      cursor: pointer;
+      margin: 0.25rem;
+    }
+    button:hover { background: #005a8b; }
+  </style>
+</head>
+<body>
+  <h1>🧪 Ocean Currents Deployment Test</h1>
+  
+  <div class="test pending" id="status">
+    <h2>Test Status</h2>
+    <p>Click "Run Tests" to verify your deployment configuration.</p>
+  </div>
+
+  <button onclick="runTests()">Run Tests</button>
+  <button onclick="clearResults()">Clear Results</button>
+
+  <div id="results"></div>
+
+  <script>
+    const tests = [];
+    const resultsDiv = document.getElementById('results');
+    const statusDiv = document.getElementById('status');
+
+    function addTest(name, fn) {
+      tests.push({ name, fn });
+    }
+
+    function showResult(name, success, message, details = null) {
+      const div = document.createElement('div');
+      div.className = `test ${success ? 'success' : 'error'}`;
+      div.innerHTML = `
+        <h3>${success ? '✅' : '❌'} ${name}</h3>
+        <p>${message}</p>
+        ${details ? `<pre>${details}</pre>` : ''}
+      `;
+      resultsDiv.appendChild(div);
+    }
+
+    function clearResults() {
+      resultsDiv.innerHTML = '';
+      statusDiv.className = 'test pending';
+      statusDiv.innerHTML = `
+        <h2>Test Status</h2>
+        <p>Click "Run Tests" to verify your deployment configuration.</p>
+      `;
+    }
+
+    // Test 1: Check if running locally
+    addTest('Local Server Check', async () => {
+      const isLocal = window.location.hostname === 'localhost' || 
+                     window.location.hostname === '127.0.0.1' ||
+                     window.location.hostname.startsWith('192.168.');
+      
+      if (isLocal) {
+        // Check if local proxy is running
+        try {
+          const response = await fetch('http://localhost:8787/healthz');
+          const text = await response.text();
+          if (text === 'ok') {
+            return { 
+              success: true, 
+              message: 'Local proxy server is running on port 8787',
+              details: `Response: ${text}`
+            };
+          }
+        } catch (e) {
+          return { 
+            success: false, 
+            message: 'Local proxy server not responding. Start it with: node server.js',
+            details: e.message
+          };
+        }
+      }
+      
+      return { 
+        success: true, 
+        message: 'Not running locally - skipping local server check'
+      };
+    });
+
+    // Test 2: Check Cloudflare Worker URL in HTML
+    addTest('Cloudflare Worker Configuration', async () => {
+      try {
+        const response = await fetch('map-viewer-mobile.html');
+        const html = await response.text();
+        
+        if (html.includes('YOUR-CLOUDFLARE-SUBDOMAIN')) {
+          return {
+            success: false,
+            message: 'Cloudflare Worker URL not configured',
+            details: 'Edit map-viewer-mobile.html and replace YOUR-CLOUDFLARE-SUBDOMAIN with your actual subdomain'
+          };
+        }
+        
+        // Extract the actual URL
+        const match = html.match(/https:\/\/ocean-currents-proxy\.([\w-]+)\.workers\.dev/);
+        if (match) {
+          return {
+            success: true,
+            message: 'Cloudflare Worker URL is configured',
+            details: `URL: ${match[0]}`
+          };
+        }
+        
+        return {
+          success: false,
+          message: 'Could not find Cloudflare Worker URL in configuration'
+        };
+      } catch (e) {
+        return {
+          success: false,
+          message: 'Could not read map-viewer-mobile.html',
+          details: e.message
+        };
+      }
+    });
+
+    // Test 3: Check for required files
+    addTest('Required Files', async () => {
+      const files = [
+        'index.html',
+        'map-viewer-mobile.html',
+        'manifest.json',
+        'app-icon.svg',
+        'app-icon-192.png',
+        'app-icon-512.png',
+        'apple-touch-icon.png'
+      ];
+      
+      const missing = [];
+      for (const file of files) {
+        try {
+          const response = await fetch(file, { method: 'HEAD' });
+          if (!response.ok) missing.push(file);
+        } catch (e) {
+          missing.push(file);
+        }
+      }
+      
+      if (missing.length === 0) {
+        return {
+          success: true,
+          message: 'All required files present',
+          details: files.join('\n')
+        };
+      } else {
+        return {
+          success: false,
+          message: `Missing files: ${missing.length}`,
+          details: `Missing:\n${missing.join('\n')}`
+        };
+      }
+    });
+
+    // Test 4: Validate manifest.json
+    addTest('PWA Manifest', async () => {
+      try {
+        const response = await fetch('manifest.json');
+        const manifest = await response.json();
+        
+        const required = ['name', 'short_name', 'start_url', 'display', 'icons'];
+        const missing = required.filter(key => !manifest[key]);
+        
+        if (missing.length === 0) {
+          return {
+            success: true,
+            message: 'Manifest is valid',
+            details: JSON.stringify(manifest, null, 2)
+          };
+        } else {
+          return {
+            success: false,
+            message: 'Manifest missing required fields',
+            details: `Missing: ${missing.join(', ')}`
+          };
+        }
+      } catch (e) {
+        return {
+          success: false,
+          message: 'Could not parse manifest.json',
+          details: e.message
+        };
+      }
+    });
+
+    // Test 5: Check GitHub repository name
+    addTest('GitHub Configuration', () => {
+      const info = `
+To deploy to GitHub Pages:
+1. Create a new repository at https://github.com/new
+2. Initialize git in this directory: git init
+3. Add remote: git remote add origin https://github.com/YOUR-USERNAME/REPO-NAME.git
+4. Push files: git add . && git commit -m "Initial" && git push -u origin main
+5. Enable Pages in repository Settings
+
+Your site will be available at:
+https://YOUR-USERNAME.github.io/REPO-NAME/
+      `.trim();
+      
+      return {
+        success: true,
+        message: 'GitHub deployment instructions',
+        details: info
+      };
+    });
+
+    async function runTests() {
+      clearResults();
+      statusDiv.className = 'test pending';
+      statusDiv.innerHTML = `
+        <h2>Running Tests...</h2>
+        <p>Please wait while tests complete.</p>
+      `;
+      
+      let passed = 0;
+      let failed = 0;
+      
+      for (const test of tests) {
+        try {
+          const result = await test.fn();
+          showResult(test.name, result.success, result.message, result.details);
+          if (result.success) passed++;
+          else failed++;
+        } catch (e) {
+          showResult(test.name, false, 'Test failed', e.message);
+          failed++;
+        }
+      }
+      
+      statusDiv.className = failed === 0 ? 'test success' : 'test error';
+      statusDiv.innerHTML = `
+        <h2>Test Results</h2>
+        <p>✅ Passed: ${passed} | ❌ Failed: ${failed}</p>
+        ${failed === 0 ? '<p>Ready for deployment! 🚀</p>' : '<p>Fix the issues above before deploying.</p>'}
+      `;
+    }
+
+    // Auto-run tests if opened directly
+    if (window.location.protocol === 'file:') {
+      window.addEventListener('load', () => {
+        setTimeout(runTests, 500);
+      });
+    }
+  </script>
+</body>
+</html>

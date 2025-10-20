@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Ocean gradient background -->
+  <defs>
+    <linearGradient id="oceanGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#0077be;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#005a9c;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#003d7a;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="waveGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#ffffff;stop-opacity:0.3" />
+      <stop offset="50%" style="stop-color:#ffffff;stop-opacity:0.8" />
+      <stop offset="100%" style="stop-color:#ffffff;stop-opacity:0.3" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background circle -->
+  <rect width="512" height="512" rx="100" fill="url(#oceanGradient)"/>
+  
+  <!-- Wave/current lines -->
+  <g transform="translate(256, 256)">
+    <!-- Large flowing current -->
+    <path d="M -180,0 Q -90,-60 0,0 T 180,0" 
+          stroke="url(#waveGradient)" 
+          stroke-width="20" 
+          fill="none" 
+          stroke-linecap="round"
+          opacity="0.9"/>
+    
+    <!-- Medium current above -->
+    <path d="M -150,-80 Q -75,-120 0,-80 T 150,-80" 
+          stroke="white" 
+          stroke-width="16" 
+          fill="none" 
+          stroke-linecap="round"
+          opacity="0.6"/>
+    
+    <!-- Medium current below -->
+    <path d="M -150,80 Q -75,120 0,80 T 150,80" 
+          stroke="white" 
+          stroke-width="16" 
+          fill="none" 
+          stroke-linecap="round"
+          opacity="0.6"/>
+    
+    <!-- Small current arrows -->
+    <g opacity="0.7">
+      <!-- Arrow 1 -->
+      <path d="M -100,-40 l 40,0 m -10,-10 l 10,10 l -10,10" 
+            stroke="white" 
+            stroke-width="8" 
+            fill="none" 
+            stroke-linecap="round"
+            stroke-linejoin="round"/>
+      
+      <!-- Arrow 2 -->
+      <path d="M 60,40 l 40,0 m -10,-10 l 10,10 l -10,10" 
+            stroke="white" 
+            stroke-width="8" 
+            fill="none" 
+            stroke-linecap="round"
+            stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

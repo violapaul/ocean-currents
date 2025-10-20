@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Ocean Currents - Mobile</title>
+  
+  <!-- PWA Manifest -->
+  <link rel="manifest" href="manifest.json">
+  
+  <!-- Favicon for browser tab -->
+  <link rel="icon" type="image/svg+xml" href="app-icon.svg">
+  
+  <!-- Apple Touch Icon (must be PNG for iOS) -->
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  
+  <!-- Theme color for browser chrome -->
+  <meta name="theme-color" content="#0077be">
+  
+  <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      overflow-x: hidden;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    
+    /* Wrapper that's slightly taller than viewport to enable scroll */
+    .app-wrapper {
+      position: relative;
+      width: 100%;
+      height: 100vh;
+      /* Make it 1px taller to enable minimal scroll */
+      min-height: calc(100vh + 1px);
+    }
+    
+    #map {
+      position: fixed;
+      top: 45px;
+      bottom: 55px;
+      left: 0;
+      right: 0;
+      width: 100%;
+      /* Account for Safari's safe areas */
+      top: calc(45px + env(safe-area-inset-top));
+      bottom: calc(55px + env(safe-area-inset-bottom));
+    }
+    
+    /* Top header with time display */
+    .header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 45px;
+      padding-top: env(safe-area-inset-top);
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding-left: 12px;
+      padding-right: 12px;
+      z-index: 2;
+    }
+    
+    .model-time {
+      font-size: 11px;
+      color: #777;
+      margin-bottom: 1px;
+    }
+    
+    .forecast-time {
+      font-size: 16px;
+      font-weight: 600;
+      color: #222;
+    }
+    
+    /* Bottom slider control */
+    .slider-container {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 55px;
+      padding-bottom: env(safe-area-inset-bottom);
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: 0 -1px 3px rgba(0,0,0,0.12);
+      padding-left: 15px;
+      padding-right: 15px;
+      padding-top: 8px;
+      z-index: 2;
+    }
+    
+    .slider-label {
+      font-size: 11px;
+      color: #666;
+      margin-bottom: 4px;
+      text-align: center;
+    }
+    
+    .time-slider {
+      width: 100%;
+      height: 35px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: transparent;
+      outline: none;
+    }
+    
+    .time-slider::-webkit-slider-track {
+      width: 100%;
+      height: 6px;
+      background: #e0e0e0;
+      border-radius: 3px;
+    }
+    
+    .time-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 24px;
+      height: 24px;
+      background: #0066cc;
+      border-radius: 50%;
+      cursor: pointer;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    }
+    
+    .time-slider::-moz-range-track {
+      width: 100%;
+      height: 6px;
+      background: #e0e0e0;
+      border-radius: 3px;
+    }
+    
+    .time-slider::-moz-range-thumb {
+      width: 24px;
+      height: 24px;
+      background: #0066cc;
+      border-radius: 50%;
+      border: none;
+      cursor: pointer;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    }
+    
+    /* Loading indicator */
+    .loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(255, 255, 255, 0.9);
+      padding: 15px 25px;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      z-index: 10;
+      font-size: 14px;
+      color: #666;
+    }
+    
+    .loading.hidden {
+      display: none;
+    }
+    
+  </style>
+</head>
+<body>
+  <div class="app-wrapper">
+    <div class="header">
+      <div class="model-time" id="model-time">Model: --</div>
+      <div class="forecast-time" id="forecast-time">--</div>
+    </div>
+    
+    <div id="map"></div>
+    
+    <div class="slider-container">
+      <div class="slider-label" id="slider-label">Drag to change time</div>
+      <input type="range" class="time-slider" id="time-slider" min="0" max="72" value="0" step="1">
+    </div>
+    
+    <div class="loading" id="loading">Searching for model data...</div>
+  </div>
+
+  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+  <script>
+    // Test scroll function for debugging
+    function testScroll() {
+      console.log('=== Testing Scroll ===');
+      console.log('Before scroll - pageYOffset:', window.pageYOffset);
+      console.log('Document height:', document.documentElement.scrollHeight);
+      console.log('Window height:', window.innerHeight);
+      
+      // Try different scroll methods
+      window.scrollTo(0, 1);
+      console.log('After scrollTo(0,1) - pageYOffset:', window.pageYOffset);
+      
+      // Try scrollBy
+      window.scrollBy(0, 1);
+      console.log('After scrollBy(0,1) - pageYOffset:', window.pageYOffset);
+      
+      // Check if we can scroll
+      const canScroll = document.documentElement.scrollHeight > window.innerHeight;
+      console.log('Page is scrollable:', canScroll);
+      
+      // Try to force height
+      document.body.style.height = (window.innerHeight + 100) + 'px';
+      console.log('Set body height to:', document.body.style.height);
+      
+      setTimeout(() => {
+        window.scrollTo(0, 50);
+        console.log('After forcing scroll to 50:', window.pageYOffset);
+      }, 100);
+    }
+    
+    // Configuration
+    // IMPORTANT: Replace YOUR-CLOUDFLARE-SUBDOMAIN with your actual Cloudflare subdomain
+    // You'll get this after running 'wrangler deploy'
+    const PROXY_HOST = (() => {
+      if (window.location.hostname === 'localhost') {
+        // Local development
+        return 'http://localhost:8787';
+      } else if (window.location.hostname.includes('github.io')) {
+        // GitHub Pages deployment - using Cloudflare Worker
+        return 'https://ocean-currents-proxy.violapaul.workers.dev';
+      } else {
+        // Fallback for other deployments
+        return `http://${window.location.hostname}:8787`;
+      }
+    })();
+    
+    const PROXY_BASE = `${PROXY_HOST}/tiles/eis-live`;
+    const CENTER = [-122.3321, 47.6062]; // Seattle
+    const ZOOM = 10; // Slightly zoomed out for mobile
+    const HOURS_AHEAD = 35;
+    const SSCOFS_CYCLES = [0, 3, 9, 15, 21];
+    
+    // State
+    let currentModelInfo = null;
+    let modelCycleStart = null;
+    let isUpdating = false;
+    let modelAvailability = []; // Store model availability info from exploration
+    
+    // ========== MODEL FUNCTIONS ==========
+    
+    function getLatestCycle(utcDate) {
+      const date = new Date(utcDate);
+      const hour = date.getUTCHours();
+      
+      for (let i = SSCOFS_CYCLES.length - 1; i >= 0; i--) {
+        if (hour >= SSCOFS_CYCLES[i]) {
+          return {
+            date: new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())),
+            cycle: SSCOFS_CYCLES[i]
+          };
+        }
+      }
+      
+      const prevDate = new Date(date);
+      prevDate.setUTCDate(prevDate.getUTCDate() - 1);
+      return {
+        date: new Date(Date.UTC(prevDate.getUTCFullYear(), prevDate.getUTCMonth(), prevDate.getUTCDate())),
+        cycle: SSCOFS_CYCLES[SSCOFS_CYCLES.length - 1]
+      };
+    }
+    
+    function calculateForecastHour(cycleDate, cycleHour, targetDate) {
+      const cycleStart = new Date(cycleDate);
+      cycleStart.setUTCHours(cycleHour, 0, 0, 0);
+      const hoursDiff = (targetDate - cycleStart) / (1000 * 60 * 60);
+      return Math.max(0, Math.min(72, Math.round(hoursDiff)));
+    }
+    
+    // ========== UTILITY FUNCTIONS ==========
+    
+    function toIsoUTC(d) {
+      const pad = (n) => String(n).padStart(2, "0");
+      return d.getUTCFullYear() + "-" + 
+             pad(d.getUTCMonth()+1) + "-" + 
+             pad(d.getUTCDate()) + "T" + 
+             pad(d.getUTCHours()) + ":00:00Z";
+    }
+    
+    function formatTimeLocal(date) {
+      const options = {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+      };
+      return date.toLocaleString('en-US', options);
+    }
+    
+    function formatTimeShort(date) {
+      const options = {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        hour12: true
+      };
+      return date.toLocaleString('en-US', options);
+    }
+    
+    function showLoading(show = true) {
+      document.getElementById('loading').className = show ? 'loading' : 'loading hidden';
+    }
+    
+    function updateTimeDisplay(modelInfo) {
+      const cycleTime = new Date(modelInfo.cycleDate);
+      cycleTime.setUTCHours(modelInfo.cycleHour, 0, 0, 0);
+      
+      // Model time (when the model was run)
+      document.getElementById('model-time').textContent = `Model: ${formatTimeShort(cycleTime)}`;
+      
+      // Forecast time (what time we're showing)
+      document.getElementById('forecast-time').textContent = formatTimeLocal(modelInfo.targetTime);
+    }
+    
+    // ========== MAP FUNCTIONS ==========
+    
+    const map = new maplibregl.Map({
+      container: "map",
+      style: {
+        version: 8,
+        sources: {
+          basemap: {
+            type: "raster",
+            tiles: ["https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}"],
+            tileSize: 256,
+            attribution: "© Esri"
+          },
+          shoreline: {
+            type: "raster",
+            tiles: [`${PROXY_BASE}/tiles/us_west_shoreline/v2/ValueLocList/{z}/{y}/{x}.png`],
+            tileSize: 256,
+            maxzoom: 18
+          }
+        },
+        layers: [
+          {
+            id: "basemap",
+            type: "raster",
+            source: "basemap"
+          },
+          {
+            id: "shoreline",
+            type: "raster",
+            source: "shoreline",
+            paint: { "raster-opacity": 1.0 }
+          }
+        ]
+      },
+      center: CENTER,
+      zoom: ZOOM,
+      attributionControl: false // Clean mobile view
+    });
+    
+    function updateCurrentsLayer(hoursFromNow) {
+      // Calculate target time based on hours from current time
+      const now = new Date();
+      now.setMinutes(0, 0, 0);
+      const targetTime = new Date(now.getTime() + hoursFromNow * 60 * 60 * 1000); // Hours into the future
+      
+      // Find the best model for this target time
+      const bestModel = getBestModelForForecast(targetTime);
+      
+      if (!bestModel) {
+        console.warn('No model available for forecast hour', hoursFromNow);
+        return;
+      }
+      
+      // Update current model info
+      currentModelInfo = bestModel;
+      
+      // Get the model cycle start time for this specific model
+      const thisCycleStart = new Date(bestModel.cycleDate);
+      thisCycleStart.setUTCHours(bestModel.cycleHour, 0, 0, 0);
+      
+      // Update display
+      updateTimeDisplay(bestModel);
+      
+      // CRITICAL: Always use the MODEL CYCLE START as the tile start time
+      // The end time determines which forecast hour we get
+      const startTime = toIsoUTC(thisCycleStart);
+      const endTime = toIsoUTC(targetTime);
+      
+      const tileUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${startTime}/${endTime}/Surface/v2/ValueLocList/{z}/{y}/{x}.png`;
+      
+      console.log(`Target: ${formatTimeLocal(targetTime)} | Model: ${formatTimeLocal(thisCycleStart)} (${bestModel.cycleHour}z) | F${bestModel.forecastHour.toString().padStart(3,'0')}`);
+      
+      if (!map.getSource("currents")) {
+        map.addSource("currents", {
+          type: "raster",
+          tiles: [tileUrl],
+          tileSize: 256,
+          maxzoom: 18
+        });
+        map.addLayer({
+          id: "currents",
+          type: "raster",
+          source: "currents",
+          paint: { "raster-opacity": 1.0 }
+        }, "shoreline");
+      } else {
+        const source = map.getSource("currents");
+        source.tiles = [tileUrl];
+        map.style.sourceCaches['currents'].clearTiles();
+        map.style.sourceCaches['currents'].update(map.transform);
+        map.triggerRepaint();
+      }
+    }
+    
+    // ========== MODEL EXPLORATION ==========
+    
+    // Binary search to find the maximum available forecast hour for a model
+    async function findMaxForecastHour(cycleTime) {
+      const testStartTime = toIsoUTC(cycleTime);
+      let low = 0;
+      let high = 72;
+      let maxAvailable = -1;
+      
+      // Helper to test if a specific forecast hour is available
+      async function testHour(hour) {
+        const endTime = new Date(cycleTime.getTime() + hour * 60 * 60 * 1000);
+        const testEndTime = toIsoUTC(endTime);
+        const testUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${testStartTime}/${testEndTime}/Surface/v2/ValueLocList/8/90/39.png`;
+        
+        try {
+          const response = await fetch(testUrl);
+          if (response.ok) {
+            const blob = await response.blob();
+            return blob.size >= 5000; // Real data vs placeholder
+          }
+        } catch (err) {
+          // Ignore errors
+        }
+        return false;
+      }
+      
+      // Binary search for the maximum available hour
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        const isAvailable = await testHour(mid);
+        
+        if (isAvailable) {
+          maxAvailable = mid;
+          low = mid + 1; // Look for higher hours
+        } else {
+          high = mid - 1; // Look for lower hours
+        }
+      }
+      
+      return maxAvailable;
+    }
+    
+    async function exploreRecentModels(count = 10) {
+      console.log('📊 Exploring recent model cycles (stopping at first full 72h model)...');
+      console.log('================================================');
+      
+      const now = new Date();
+      const results = [];
+      let foundFull72 = false;
+      
+      // Get the latest theoretical cycle
+      const latestCycle = getLatestCycle(now);
+      let searchDate = new Date(latestCycle.date);
+      let cycleIndex = SSCOFS_CYCLES.indexOf(latestCycle.cycle);
+      let modelsChecked = 0;
+      
+      // Check the last N model cycles, but stop once we find a full 72h model
+      for (let daysBack = 0; daysBack <= 7 && modelsChecked < count && !foundFull72; daysBack++) {
+        for (let i = cycleIndex; i >= 0 && modelsChecked < count && !foundFull72; i--) {
+          const testCycle = SSCOFS_CYCLES[i];
+          const cycleTime = new Date(searchDate);
+          cycleTime.setUTCHours(testCycle, 0, 0, 0);
+          
+          const hoursOld = (now - cycleTime) / (1000 * 60 * 60);
+          
+          // Use binary search to find max available forecast hour
+          const maxHour = await findMaxForecastHour(cycleTime);
+          
+          // Calculate the future coverage (hours from now that this model covers)
+          const futureStart = Math.max(0, -hoursOld); // When this model starts covering the future
+          const futureEnd = maxHour - hoursOld; // How far into the future this model reaches
+          
+          // Determine status
+          let status, details;
+          if (maxHour >= 72) {
+            status = '✅ FULL';
+            details = `F000-F072`;
+            foundFull72 = true; // Found a full model, will stop after this
+          } else if (maxHour >= 0) {
+            status = '⚠️  PARTIAL';
+            details = `F000-F${String(maxHour).padStart(3,'0')}`;
+          } else {
+            status = '❌ NOT FOUND';
+            details = '';
+          }
+          
+          // Add future coverage info
+          if (futureEnd > 0) {
+            details += ` | Future: +${Math.round(futureEnd)}h`;
+          } else {
+            details += ' | Past only';
+          }
+          
+          console.log(`${status} | ${formatTimeLocal(cycleTime)} (${String(testCycle).padStart(2,'0')}z) | ${hoursOld.toFixed(1)}h old | ${details}`);
+          
+          results.push({
+            time: cycleTime,
+            cycle: testCycle,
+            hoursOld: hoursOld,
+            maxHour: maxHour,
+            futureEnd: futureEnd,
+            available: maxHour >= 72,
+            partial: maxHour >= 0 && maxHour < 72
+          });
+          
+          modelsChecked++;
+          
+          if (foundFull72) {
+            console.log('🛑 Stopping exploration - found full 72h model');
+          }
+        }
+        
+        searchDate.setUTCDate(searchDate.getUTCDate() - 1);
+        cycleIndex = SSCOFS_CYCLES.length - 1;
+      }
+      
+      // Analyze which models are actually needed for future coverage
+      console.log('================================================');
+      console.log('=== Future Coverage Analysis ===');
+      
+      // Sort by how far into the future they reach
+      const futureModels = results
+        .filter(r => r.futureEnd > 0)
+        .sort((a, b) => b.futureEnd - a.futureEnd);
+      
+      let maxCoverage = 0;
+      const neededModels = [];
+      const redundantModels = [];
+      
+      for (const model of futureModels) {
+        if (model.futureEnd > maxCoverage) {
+          // This model extends our coverage
+          neededModels.push(model);
+          console.log(`✅ NEEDED: ${formatTimeLocal(model.time)} (${model.cycle}z) extends coverage to +${Math.round(model.futureEnd)}h`);
+          maxCoverage = model.futureEnd;
+        } else {
+          // This model is redundant
+          redundantModels.push(model);
+          console.log(`⏭️  REDUNDANT: ${formatTimeLocal(model.time)} (${model.cycle}z) only reaches +${Math.round(model.futureEnd)}h`);
+        }
+      }
+      
+      // Summary
+      console.log('================================================');
+      console.log(`Models needed for future coverage: ${neededModels.length}`);
+      console.log(`Redundant models: ${redundantModels.length}`);
+      console.log(`Maximum future coverage: +${Math.round(maxCoverage)} hours`);
+      
+      // Store only the needed models for future coverage
+      modelAvailability = neededModels;
+      
+      return results;
+    }
+    
+    // Find the best (newest) model that has data for a specific forecast hour
+    function getBestModelForForecast(targetDate) {
+      if (!modelAvailability || modelAvailability.length === 0) {
+        return null;
+      }
+      
+      const now = new Date();
+      
+      // Find the newest model that can provide this forecast
+      for (const model of modelAvailability) {
+        if (model.maxHour < 0) continue; // Skip models with no data
+        
+        // Calculate what forecast hour this would be for this model
+        const modelTime = new Date(model.time);
+        const hoursSinceModel = (targetDate - modelTime) / (1000 * 60 * 60);
+        
+        // Check if this model covers the requested time
+        if (hoursSinceModel >= 0 && hoursSinceModel <= model.maxHour) {
+          console.log(`Using model from ${formatTimeLocal(modelTime)} (${model.cycle}z) for F${Math.round(hoursSinceModel).toString().padStart(3,'0')}`);
+          return {
+            cycleDate: model.time,
+            cycleHour: model.cycle,
+            forecastHour: Math.round(hoursSinceModel),
+            maxHour: model.maxHour,
+            targetTime: targetDate
+          };
+        }
+      }
+      
+      console.warn('No model available for requested time:', formatTimeLocal(targetDate));
+      return null;
+    }
+    
+    // ========== INITIALIZATION ==========
+    
+    async function initialize() {
+      showLoading(true);
+      
+      const now = new Date();
+      now.setMinutes(0, 0, 0);
+      
+      console.log('=== Model Initialization ===');
+      console.log('Proxy URL:', PROXY_HOST);
+      
+      // First explore recent models to show what's available
+      // This populates the global modelAvailability array
+      await exploreRecentModels(10);
+      
+      if (!modelAvailability || modelAvailability.length === 0 || modelAvailability.every(m => m.maxHour < 0)) {
+        console.error('❌ No available models found!');
+        showLoading(false);
+        document.getElementById('loading').textContent = 'No model data available';
+        return;
+      }
+      
+      // Find the maximum future coverage available
+      const maxFutureCoverage = Math.max(...modelAvailability.map(m => m.futureEnd));
+      
+      console.log('');
+      console.log('=== Model Selection Strategy ===');
+      console.log('Will use the newest model available for each forecast time');
+      console.log(`Future coverage: 0 to +${Math.round(maxFutureCoverage)} hours`);
+      console.log('===========================');
+      
+      // Update slider to match available future coverage
+      const slider = document.getElementById('time-slider');
+      slider.min = 0;
+      slider.max = Math.round(maxFutureCoverage);
+      slider.value = 0; // Start at current time
+      
+      // Update slider label
+      document.getElementById('slider-label').textContent = `Hours from now (0 to +${Math.round(maxFutureCoverage)})`;
+      
+      // Update display with initial position (current time)
+      updateCurrentsLayer(0);
+      
+      showLoading(false);
+    }
+    
+    // ========== EVENT HANDLERS ==========
+    
+    document.getElementById('time-slider').addEventListener('input', (e) => {
+      if (isUpdating) return;
+      
+      const hoursFromNow = parseInt(e.target.value);
+      
+      // Update label to show what time this represents
+      const targetTime = new Date();
+      targetTime.setMinutes(0, 0, 0);
+      targetTime.setHours(targetTime.getHours() + hoursFromNow);
+      
+      const timeStr = hoursFromNow === 0 ? 'Now' : `+${hoursFromNow}h (${formatTimeShort(targetTime)})`;
+      document.getElementById('slider-label').textContent = timeStr;
+      
+      // Debounce the actual update
+      clearTimeout(window.updateTimer);
+      window.updateTimer = setTimeout(() => {
+        updateCurrentsLayer(hoursFromNow);
+      }, 100);
+    });
+    
+    document.getElementById('time-slider').addEventListener('change', (e) => {
+      // Reset label after interaction
+      const maxHours = parseInt(e.target.max);
+      setTimeout(() => {
+        document.getElementById('slider-label').textContent = `Hours from now (0 to +${maxHours})`;
+      }, 2000);
+    });
+    
+    // Initialize when map loads
+    map.on('load', async () => {
+      await initialize();
+      
+      // Debug info for Safari UI hiding
+      console.log('Window height:', window.innerHeight);
+      console.log('Document height:', document.documentElement.scrollHeight);
+      console.log('Body height:', document.body.scrollHeight);
+      console.log('Screen height:', screen.height);
+      console.log('Can scroll:', document.documentElement.scrollHeight > window.innerHeight);
+      
+      // Try to hide Safari UI by scrolling slightly
+      setTimeout(() => {
+        console.log('Attempting to scroll to hide UI...');
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          console.log('Scroll position:', window.pageYOffset);
+        }, 500);
+      }, 100);
+    });
+    
+    // Handle errors gracefully
+    map.on('error', (e) => {
+      if (e.error && e.error.status === 404) {
+        // Tile not found is common at edges, ignore
+      } else if (e.error) {
+        console.error('Map error:', e.error);
+      }
+    });
+    
+  </script>
+</body>
+</html>

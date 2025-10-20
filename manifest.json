@@ -1,0 +1,29 @@
+{
+  "name": "Ocean Currents Viewer",
+  "short_name": "Currents",
+  "description": "Real-time ocean current forecasts for Puget Sound",
+  "start_url": "./map-viewer-mobile.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#0077be",
+  "background_color": "#ffffff",
+  "icons": [
+    {
+      "src": "./app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./app-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "./app-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
