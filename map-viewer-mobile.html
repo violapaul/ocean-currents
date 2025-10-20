@@ -763,12 +763,44 @@
       
       // Store marker info
       magnitudeMarker = { x, y, magnitude };
+      
+      // Debug: Add a temporary blue dot to show the exact press location
+      const debugDot = document.createElement('div');
+      debugDot.style.cssText = `
+        position: fixed;
+        left: ${x - 3}px;
+        top: ${y - 3}px;
+        width: 6px;
+        height: 6px;
+        background: blue;
+        border-radius: 50%;
+        z-index: 9999;
+        pointer-events: none;
+      `;
+      debugDot.id = 'debug-dot';
+      
+      // Remove any existing debug dot
+      const existingDot = document.getElementById('debug-dot');
+      if (existingDot) existingDot.remove();
+      
+      document.body.appendChild(debugDot);
+      
+      // Remove debug dot after 3 seconds
+      setTimeout(() => {
+        if (document.getElementById('debug-dot')) {
+          document.getElementById('debug-dot').remove();
+        }
+      }, 3000);
     }
     
     function hideMagnitudeMarker() {
       const marker = document.getElementById('magnitude-marker');
       marker.style.display = 'none';
       magnitudeMarker = null;
+      
+      // Also remove debug dot if it exists
+      const debugDot = document.getElementById('debug-dot');
+      if (debugDot) debugDot.remove();
     }
     
     function formatTimeLocal(date) {
@@ -1239,6 +1271,31 @@
       longPressTimer = setTimeout(async () => {
         console.log('⏰ Long press timer triggered!');
         
+        // ROUND-TRIP TEST: Convert lat/lon back to screen coordinates
+        const testPoint = map.project([lngLat.lng, lngLat.lat]);
+        const testScreenPoint = {
+          x: testPoint.x + rect.left,
+          y: testPoint.y + rect.top
+        };
+        
+        console.log('🔄 ROUND-TRIP TEST:', {
+          original: {
+            screen: screenPoint,
+            mapRelative: point
+          },
+          calculated: {
+            lngLat: { lat: lngLat.lat, lng: lngLat.lng }
+          },
+          roundTrip: {
+            mapRelative: testPoint,
+            screen: testScreenPoint
+          },
+          difference: {
+            x: testScreenPoint.x - screenPoint.x,
+            y: testScreenPoint.y - screenPoint.y
+          }
+        });
+        
         // Vibrate if available (haptic feedback)
         if (navigator.vibrate) {
           console.log('📳 Triggering haptic feedback');
@@ -1252,7 +1309,8 @@
         const result = await fetchCurrentMagnitude(lngLat.lat, lngLat.lng);
         if (result) {
           console.log('📌 Showing marker with value:', result.value);
-          showMagnitudeMarker(screenPoint.x, screenPoint.y, result.value);
+          // Use the round-trip tested position to verify accuracy
+          showMagnitudeMarker(testScreenPoint.x, testScreenPoint.y, result.value);
         } else {
           console.log('❌ No result to show');
         }
