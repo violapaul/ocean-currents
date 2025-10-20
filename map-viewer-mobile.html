@@ -88,8 +88,7 @@
       /* Simple positioning - let the container handle safe areas */
       top: calc(28px + env(safe-area-inset-top, 0px));
       /* Bottom should just be the height of the slider container */
-      bottom: calc(42px + env(safe-area-inset-bottom, 0px));
-    }
+      bottom: 42px; }
     
     /* Top header with time display */
     .header {
@@ -134,8 +133,7 @@
       box-shadow: 0 -1px 3px rgba(0,0,0,0.12);
       padding: 4px 45px 0 45px;
       /* Only add bottom padding for safe area, not extra height */
-      padding-bottom: env(safe-area-inset-bottom, 0px);
-      z-index: 2;
+      padding-bottom: 0; z-index: 2;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -467,7 +465,7 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
-      APP_VERSION: 'v1.3.4', // PWA size fix, again.
+      APP_VERSION: 'v1.3.5', // PWA size fix, again, again.
       PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
