@@ -1,6 +1,6 @@
 # Ocean Currents Mobile Viewer
 
-A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current forecasts from NOAA's Salish Sea Coastal Ocean Forecast System (SSCOFS).
+A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current forecasts from NOAA's Salish Sea Coastal Ocean Forecast System (SSCOFS) with tide data integration.
 
 ## 🌊 Live Demo
 
@@ -8,17 +8,33 @@ A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current
 
 ## Features
 
-- **Real-time ocean current visualization** for Puget Sound
-- **Mobile-optimized interface** with touch-friendly controls
-- **Time slider** to view forecasts up to 72 hours ahead
+### Core Functionality
+- **Real-time ocean current visualization** for Puget Sound region
+- **Mobile-first design** with touch-optimized controls
+- **Time slider** with hour-by-hour navigation (-1/+1 buttons)
 - **Progressive Web App** - installable on iOS and Android
 - **Automatic model detection** - always shows the latest available SSCOFS data
+
+### Interactive Features
+- **Tap to show current speed** - Display current magnitude in knots at any point
+- **Auto-updating measurements** - Current speed updates when time changes
+- **Seattle tide chart** - Live tide visualization showing full day (midnight to midnight)
+- **Moving time indicator** - Red line shows current position in tidal cycle
+
+### User Interface
+- **Compact layout** - Maximized map area with minimal UI chrome
+- **Left-aligned time display** - Current forecast time clearly visible
+- **Tide chart overlay** - 200x100px chart in upper right corner
+- **Smart data caching** - Efficient loading and smooth transitions
 
 ## Architecture
 
 - **Static Hosting**: GitHub Pages (free, HTTPS, CDN)
-- **Proxy Server**: Cloudflare Worker (serverless, handles CORS)
-- **Data Source**: NOAA/UW coral.apl.uw.edu tile server
+- **Proxy Server**: Cloudflare Worker (serverless, handles CORS for tiles, NVS API, and NOAA tides)
+- **Data Sources**: 
+  - Ocean currents: NOAA/UW coral.apl.uw.edu tile server
+  - Current magnitudes: NVS NANOOS API
+  - Tide predictions: NOAA CO-OPS API (Station 9447130 - Seattle)
 - **Map Library**: MapLibre GL JS
 
 ## Files
@@ -32,12 +48,18 @@ A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current
 
 ## How It Works
 
-1. User visits the GitHub Pages site
+1. User visits the GitHub Pages site (or installs as PWA)
 2. Mobile-optimized interface loads with MapLibre GL
-3. JavaScript requests ocean current tiles through Cloudflare Worker proxy
-4. Proxy bypasses CORS restrictions and fetches tiles from NOAA server
-5. Tiles are displayed as overlays on the map
-6. Time slider allows viewing different forecast hours
+3. App detects latest available SSCOFS model run
+4. JavaScript requests ocean current tiles through Cloudflare Worker proxy
+5. Proxy handles CORS for:
+   - Ocean current tiles from coral.apl.uw.edu
+   - Current magnitude data from NVS API
+   - Tide predictions from NOAA CO-OPS
+6. Interactive features:
+   - Tap anywhere to see current speed in knots
+   - Drag slider or use -1/+1 buttons to change time
+   - Tide chart updates showing daily cycle with current position
 
 ## SSCOFS Model Information
 
@@ -48,16 +70,35 @@ The app automatically detects and uses the latest available SSCOFS model run:
 
 ## Development
 
-To run locally:
+### Local Testing
 
-1. Start a local proxy server (if testing tile loading):
 ```bash
-cd Web/wwm-proxy
-npm install
-node server.js
+# Navigate to the OceanCurrents directory
+cd OceanCurrents
+
+# Start a simple HTTP server
+python3 -m http.server 8000
+
+# Open in browser
+# http://localhost:8000/map-viewer-mobile.html
 ```
 
-2. Open `map-viewer-mobile.html` in a browser
+### Debug Logging
+
+Control logging verbosity via URL parameters or localStorage:
+
+```javascript
+// URL parameter (temporary)
+map-viewer-mobile.html?log=debug  // All messages
+map-viewer-mobile.html?log=info   // Info and above
+map-viewer-mobile.html?log=warn   // Warnings and errors (default)
+map-viewer-mobile.html?log=off    // No logging
+
+// localStorage (persistent)
+localStorage.setItem('logLevel', 'debug');
+```
+
+Log levels: `off` (0), `error` (1), `warn` (2), `info` (3), `debug` (4)
 
 ## Deployment
 

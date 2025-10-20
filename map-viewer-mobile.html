@@ -397,76 +397,46 @@
 
   <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
   <script>
-    // Logging system - levels: 0=off, 1=error, 2=warn, 3=info, 4=debug
-    const LOG_LEVELS = { off: 0, error: 1, warn: 2, info: 3, debug: 4 };
-    let LOG_LEVEL = LOG_LEVELS.warn; // Default to warnings and errors only
+    // Register service worker for offline support
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./service-worker.js')
+        .then(reg => console.log('Service Worker registered'))
+        .catch(err => console.warn('Service Worker registration failed:', err));
+    }
     
-    // Allow runtime override via ?log=debug or localStorage
-    (function initLogLevel() {
-      const qs = new URLSearchParams(location.search).get('log');
-      const stored = localStorage.getItem('logLevel');
-      const v = qs || stored;
-      if (v && v in LOG_LEVELS) {
-        LOG_LEVEL = LOG_LEVELS[v];
-        console.log(`📊 Log level set to: ${v} (${LOG_LEVEL})`);
-      }
-    })();
+    // Simple production logging - errors only by default
+    const IS_DEBUG = new URLSearchParams(location.search).has('debug');
     
     const logger = {
-      error: (...a) => LOG_LEVEL >= LOG_LEVELS.error && console.error(...a),
-      warn:  (...a) => LOG_LEVEL >= LOG_LEVELS.warn  && console.warn(...a),
-      info:  (...a) => LOG_LEVEL >= LOG_LEVELS.info  && console.info(...a),
-      debug: (...a) => LOG_LEVEL >= LOG_LEVELS.debug && console.log(...a),
-      group: (...a) => LOG_LEVEL >= LOG_LEVELS.info  && console.group(...a),
-      groupEnd: () => LOG_LEVEL >= LOG_LEVELS.info   && console.groupEnd(),
+      error: console.error,
+      warn: IS_DEBUG ? console.warn : () => {},
+      info: IS_DEBUG ? console.info : () => {},
+      debug: IS_DEBUG ? console.log : () => {},
     };
     
-    // Compatibility flag for old DEBUG_MODE references
-    const DEBUG_MODE = LOG_LEVEL >= LOG_LEVELS.debug;
+    // ========== CONFIGURATION ==========
+    const CONFIG = {
+      PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
+      CENTER: [-122.3321, 47.6062], // Seattle
+      ZOOM: 10,
+      SSCOFS_CYCLES: [0, 3, 9, 15, 21],
+      TIDE_STATION_ID: '9447130', // Seattle
+      TILE_MIN_SIZE: 5000, // Minimum tile size in bytes to be considered valid
+      MAX_FORECAST_HOURS: 72,
+    };
     
-    // Configuration
-    // IMPORTANT: Replace YOUR-CLOUDFLARE-SUBDOMAIN with your actual Cloudflare subdomain
-    // You'll get this after running 'wrangler deploy'
-    const PROXY_HOST = (() => {
-      // For local testing (127.0.0.1 or localhost), use the deployed Cloudflare worker
-      if (window.location.hostname === 'localhost' || 
-          window.location.hostname === '127.0.0.1' || 
-          window.location.protocol === 'file:') {
-        logger.info('🏠 Local environment detected - using Cloudflare Worker proxy');
-        return 'https://ocean-currents-proxy.violapaul.workers.dev';
-      } else if (window.location.hostname.includes('github.io')) {
-        // GitHub Pages deployment - using Cloudflare Worker
-        logger.info('🌐 GitHub Pages detected - using Cloudflare Worker proxy');
-        return 'https://ocean-currents-proxy.violapaul.workers.dev';
-      } else {
-        // Fallback for other deployments
-        logger.info('🔧 Other deployment - attempting local proxy');
-        return `http://${window.location.hostname}:8787`;
-      }
-    })();
+    const PROXY_BASE = `${CONFIG.PROXY_HOST}/tiles/eis-live`;
     
-    const PROXY_BASE = `${PROXY_HOST}/tiles/eis-live`;
-    const CENTER = [-122.3321, 47.6062]; // Seattle
-    const ZOOM = 10; // Slightly zoomed out for mobile
-    const HOURS_AHEAD = 35;
-    const SSCOFS_CYCLES = [0, 3, 9, 15, 21];
-    
-    logger.info('🔗 Proxy configuration:', {
-      host: PROXY_HOST,
-      base: PROXY_BASE,
-      protocol: window.location.protocol,
-      hostname: window.location.hostname,
-      version: 'v2-always-proxy'  // Version indicator
-    });
-    
-    // State
-    let currentModelInfo = null;
-    let modelCycleStart = null;
-    let isUpdating = false;
-    let modelAvailability = []; // Store model availability info from exploration
-    let magnitudeMarker = null; // Track magnitude marker state with lat/lng
-    let tideData = null; // Cache tide data
-    let currentDisplayTime = null; // Track current display time for tide chart
+    // ========== APPLICATION STATE ==========
+    const state = {
+      currentModelInfo: null,
+      isUpdating: false,
+      modelAvailability: [],
+      magnitudeMarker: null,
+      tideData: null,
+      currentDisplayTime: null,
+      isOffline: false,
+    };
     
     // ========== MODEL FUNCTIONS ==========
     
@@ -474,11 +444,11 @@
       const date = new Date(utcDate);
       const hour = date.getUTCHours();
       
-      for (let i = SSCOFS_CYCLES.length - 1; i >= 0; i--) {
-        if (hour >= SSCOFS_CYCLES[i]) {
+      for (let i = CONFIG.SSCOFS_CYCLES.length - 1; i >= 0; i--) {
+        if (hour >= CONFIG.SSCOFS_CYCLES[i]) {
           return {
             date: new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())),
-            cycle: SSCOFS_CYCLES[i]
+            cycle: CONFIG.SSCOFS_CYCLES[i]
           };
         }
       }
@@ -487,7 +457,7 @@
       prevDate.setUTCDate(prevDate.getUTCDate() - 1);
       return {
         date: new Date(Date.UTC(prevDate.getUTCFullYear(), prevDate.getUTCMonth(), prevDate.getUTCDate())),
-        cycle: SSCOFS_CYCLES[SSCOFS_CYCLES.length - 1]
+        cycle: CONFIG.SSCOFS_CYCLES[CONFIG.SSCOFS_CYCLES.length - 1]
       };
     }
     
@@ -495,7 +465,7 @@
       const cycleStart = new Date(cycleDate);
       cycleStart.setUTCHours(cycleHour, 0, 0, 0);
       const hoursDiff = (targetDate - cycleStart) / (1000 * 60 * 60);
-      return Math.max(0, Math.min(72, Math.round(hoursDiff)));
+      return Math.max(0, Math.min(CONFIG.MAX_FORECAST_HOURS, Math.round(hoursDiff)));
     }
     
     // ========== UTILITY FUNCTIONS ==========
@@ -510,11 +480,71 @@
     
     // ========== TIDE FUNCTIONS ==========
     
-    // Seattle station ID: 9447130
-    const TIDE_STATION_ID = '9447130';
-    const TIDE_STATION_NAME = 'Seattle';
+    // Cache tide data in localStorage with expiration
+    function getTideCacheKey(date) {
+      const d = new Date(date);
+      return `tide_${CONFIG.TIDE_STATION_ID}_${d.getFullYear()}_${d.getMonth()}_${d.getDate()}`;
+    }
+    
+    function getCachedTideData(date) {
+      try {
+        const key = getTideCacheKey(date);
+        const cached = localStorage.getItem(key);
+        if (cached) {
+          const data = JSON.parse(cached);
+          // Check if cache is less than 24 hours old
+          if (Date.now() - data.timestamp < 24 * 60 * 60 * 1000) {
+            // Convert string dates back to Date objects
+            data.tides = data.tides.map(t => ({
+              time: new Date(t.time),
+              height: t.height
+            }));
+            logger.debug('Using cached tide data');
+            return data.tides;
+          }
+        }
+      } catch (e) {
+        logger.warn('Error reading tide cache:', e);
+      }
+      return null;
+    }
+    
+    function cacheTideData(date, tides) {
+      try {
+        const key = getTideCacheKey(date);
+        localStorage.setItem(key, JSON.stringify({
+          timestamp: Date.now(),
+          tides: tides
+        }));
+        
+        // Clean up old cache entries (keep only last 7 days)
+        const cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
+        const keys = Object.keys(localStorage);
+        keys.forEach(k => {
+          if (k.startsWith('tide_')) {
+            try {
+              const data = JSON.parse(localStorage.getItem(k));
+              if (data.timestamp < cutoff) {
+                localStorage.removeItem(k);
+              }
+            } catch (e) {
+              // Invalid entry, remove it
+              localStorage.removeItem(k);
+            }
+          }
+        });
+      } catch (e) {
+        logger.warn('Error caching tide data:', e);
+      }
+    }
     
     async function fetchTideData(displayTime) {
+      // Check cache first
+      const cached = getCachedTideData(displayTime);
+      if (cached) {
+        return cached;
+      }
+      
       // Get start and end of the current day in local time
       const localDate = new Date(displayTime);
       const dayStart = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0);
@@ -539,7 +569,7 @@
       const noaaUrl = 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?' +
         `begin_date=${formatNOAADate(startTime)}&` +
         `end_date=${formatNOAADate(endTime)}&` +
-        `station=${TIDE_STATION_ID}&` +
+        `station=${CONFIG.TIDE_STATION_ID}&` +
         `product=predictions&` +
         `datum=MLLW&` +
         `time_zone=lst_ldt&` +
@@ -548,7 +578,7 @@
         `format=json`;
       
       // Always use proxy - NOAA doesn't provide CORS headers either
-      const url = `${PROXY_HOST}/noaa/tides?${noaaUrl.split('?')[1]}`;
+      const url = `${CONFIG.PROXY_HOST}/noaa/tides?${noaaUrl.split('?')[1]}`;
       
       logger.debug('🌊 Fetching tide data:', url);
       
@@ -564,13 +594,14 @@
           }));
           
           logger.info(`🌊 Loaded ${tides.length} tide points`);
+          // Cache the data
+          cacheTideData(displayTime, tides);
           return tides;
         }
       } catch (error) {
         logger.error('❌ Error fetching tide data:', error);
+        return null;
       }
-      
-      return null;
     }
     
     function drawTideChart(tides, currentTime) {
@@ -677,11 +708,11 @@
       
       // Update title with current tide height
       document.querySelector('.tide-chart-title').textContent = 
-        `${TIDE_STATION_NAME} - ${currentHeight.toFixed(1)}ft`;
+        `Seattle - ${currentHeight.toFixed(1)}ft`;
     }
     
     async function updateTideChart(displayTime) {
-      currentDisplayTime = displayTime;
+      state.currentDisplayTime = displayTime;
       
       // Get the day boundaries for the display time
       const localDate = new Date(displayTime);
@@ -692,51 +723,49 @@
       // We need new data if:
       // 1. We don't have any data
       // 2. Our current data doesn't cover the full day we're trying to display
-      const needNewData = !tideData || 
-                          tideData.length === 0 ||
-                          tideData[0].time > dayStart ||
-                          tideData[tideData.length - 1].time < dayEnd;
+      const needNewData = !state.tideData || 
+                          state.tideData.length === 0 ||
+                          state.tideData[0].time > dayStart ||
+                          state.tideData[state.tideData.length - 1].time < dayEnd;
       
       if (needNewData) {
         logger.info('🌊 Fetching new tide data for day:', dayStart.toLocaleDateString());
-        tideData = await fetchTideData(displayTime);
+        state.tideData = await fetchTideData(displayTime);
       }
       
-      if (tideData) {
-        drawTideChart(tideData, displayTime);
+      if (state.tideData) {
+        drawTideChart(state.tideData, displayTime);
       }
     }
     
     // ========== MAGNITUDE FUNCTIONS ==========
     
     async function fetchCurrentMagnitude(lat, lon) {
-      if (DEBUG_MODE) console.log('🎯 fetchCurrentMagnitude called:', { lat, lon });
+      logger.debug('🎯 fetchCurrentMagnitude called:', { lat, lon });
       
-      if (!currentModelInfo) {
-        if (DEBUG_MODE) console.warn('❌ No model info available');
+      if (!state.currentModelInfo) {
+        logger.warn('❌ No model info available');
         return null;
       }
       
       // Build the time strings for the API
-      const cycleStart = new Date(currentModelInfo.cycleDate);
-      cycleStart.setUTCHours(currentModelInfo.cycleHour, 0, 0, 0);
+      const cycleStart = new Date(state.currentModelInfo.cycleDate);
+      cycleStart.setUTCHours(state.currentModelInfo.cycleHour, 0, 0, 0);
       const startTime = toIsoUTC(cycleStart);
-      const endTime = toIsoUTC(currentModelInfo.targetTime);
+      const endTime = toIsoUTC(state.currentModelInfo.targetTime);
       
-      if (DEBUG_MODE) {
-        console.log('📊 Model info:', {
-          cycleStart: formatTimeLocal(cycleStart),
-          targetTime: formatTimeLocal(currentModelInfo.targetTime),
-          startTime,
-          endTime
-        });
-      }
+      logger.debug('📊 Model info:', {
+        cycleStart: formatTimeLocal(cycleStart),
+        targetTime: formatTimeLocal(state.currentModelInfo.targetTime),
+        startTime,
+        endTime
+      });
       
       // Call NVS API through proxy to avoid CORS issues
       const layer = `salish-currents-vec/${startTime}/${endTime}/Surface`;
       
       // Always use proxy - NVS doesn't provide CORS headers
-      const baseUrl = `${PROXY_HOST}/nvs/get_values`;
+      const baseUrl = `${CONFIG.PROXY_HOST}/nvs/get_values`;
       
       const url = `${baseUrl}?` +
         `sid=${Math.random()}&` +
@@ -748,12 +777,16 @@
         `lon=${lon}`;
       
       logger.debug('🌐 API URL:', url);
-      logger.debug('🔀 Using proxy:', baseUrl.includes(PROXY_HOST));
+      logger.debug('🔀 Using proxy:', baseUrl.includes(CONFIG.PROXY_HOST));
       
       try {
         logger.debug('📡 Fetching from NVS API...');
         const response = await fetch(url);
         logger.debug('📡 Response status:', response.status);
+        
+        if (!response.ok) {
+          throw new Error(`API returned ${response.status}`);
+        }
         
         const data = await response.json();
         logger.debug('📦 API Response:', data);
@@ -771,19 +804,11 @@
         }
       } catch (error) {
         logger.error('❌ Error fetching magnitude:', error);
+        return null;
       }
-      
-      // Fallback: estimate from nearby tile data (simplified approach)
-      // In production, you'd want to implement proper interpolation
-      const fallback = {
-        value: Math.random() * 2.0, // Dummy value in knots (typical range 0-2 knots)
-        direction: Math.random() * 360
-      };
-      logger.warn('⚠️ Using fallback data:', fallback);
-      return fallback;
     }
     
-    function showMagnitudeMarker(x, y, magnitude, lat, lng, showDebug = false) {
+    function showMagnitudeMarker(x, y, magnitude, lat, lng) {
       const marker = document.getElementById('magnitude-marker');
       const valueEl = document.getElementById('magnitude-value');
       
@@ -796,48 +821,13 @@
       marker.style.display = 'block';
       
       // Store marker info including lat/lng for updates
-      magnitudeMarker = { x, y, magnitude, lat, lng };
-      
-      // Only show debug dot if DEBUG_MODE is enabled
-      if (showDebug) {
-        // Debug: Add a temporary blue dot to show the exact press location
-        const debugDot = document.createElement('div');
-        debugDot.style.cssText = `
-          position: fixed;
-          left: ${x - 3}px;
-          top: ${y - 3}px;
-          width: 6px;
-          height: 6px;
-          background: blue;
-          border-radius: 50%;
-          z-index: 9999;
-          pointer-events: none;
-        `;
-        debugDot.id = 'debug-dot';
-        
-        // Remove any existing debug dot
-        const existingDot = document.getElementById('debug-dot');
-        if (existingDot) existingDot.remove();
-        
-        document.body.appendChild(debugDot);
-        
-        // Remove debug dot after 3 seconds
-        setTimeout(() => {
-          if (document.getElementById('debug-dot')) {
-            document.getElementById('debug-dot').remove();
-          }
-        }, 3000);
-      }
+      state.magnitudeMarker = { x, y, magnitude, lat, lng };
     }
     
     function hideMagnitudeMarker() {
       const marker = document.getElementById('magnitude-marker');
       marker.style.display = 'none';
-      magnitudeMarker = null;
-      
-      // Also remove debug dot if it exists
-      const debugDot = document.getElementById('debug-dot');
-      if (debugDot) debugDot.remove();
+      state.magnitudeMarker = null;
     }
     
     function formatTimeLocal(date) {
@@ -862,8 +852,32 @@
       return date.toLocaleString('en-US', options);
     }
     
-    function showLoading(show = true) {
-      document.getElementById('loading').className = show ? 'loading' : 'loading hidden';
+    function showLoading(message = 'Loading...', show = true) {
+      const loadingEl = document.getElementById('loading');
+      if (show) {
+        loadingEl.textContent = message;
+        loadingEl.className = 'loading';
+      } else {
+        loadingEl.className = 'loading hidden';
+      }
+    }
+    
+    function showError(message) {
+      const loadingEl = document.getElementById('loading');
+      loadingEl.innerHTML = `
+        <div style="color: #cc0000; font-weight: bold;">⚠️ ${message}</div>
+        <button onclick="location.reload()" style="
+          margin-top: 10px;
+          padding: 8px 16px;
+          background: #0066cc;
+          color: white;
+          border: none;
+          border-radius: 4px;
+          font-size: 14px;
+          cursor: pointer;
+        ">Reload App</button>
+      `;
+      loadingEl.className = 'loading';
     }
     
     function updateTimeDisplay(modelInfo) {
@@ -905,8 +919,8 @@
           }
         ]
       },
-      center: CENTER,
-      zoom: ZOOM,
+      center: CONFIG.CENTER,
+      zoom: CONFIG.ZOOM,
       attributionControl: false // Clean mobile view
     });
     
@@ -920,12 +934,12 @@
       const bestModel = getBestModelForForecast(targetTime);
       
       if (!bestModel) {
-        console.warn('No model available for forecast hour', hoursFromNow);
+        logger.warn('No model available for forecast hour', hoursFromNow);
         return;
       }
       
       // Update current model info
-      currentModelInfo = bestModel;
+      state.currentModelInfo = bestModel;
       
       // Get the model cycle start time for this specific model
       const thisCycleStart = new Date(bestModel.cycleDate);
@@ -938,15 +952,15 @@
       updateTideChart(targetTime);
       
       // Update magnitude marker if one is displayed
-      if (magnitudeMarker && magnitudeMarker.lat && magnitudeMarker.lng) {
+      if (state.magnitudeMarker && state.magnitudeMarker.lat && state.magnitudeMarker.lng) {
         // Fetch updated magnitude for the same location
-        fetchCurrentMagnitude(magnitudeMarker.lat, magnitudeMarker.lng).then(result => {
+        fetchCurrentMagnitude(state.magnitudeMarker.lat, state.magnitudeMarker.lng).then(result => {
           if (result) {
             // Update just the value, keep the same position
             const valueEl = document.getElementById('magnitude-value');
             if (valueEl) {
               valueEl.textContent = result.value.toFixed(1);
-              magnitudeMarker.magnitude = result.value;
+              state.magnitudeMarker.magnitude = result.value;
             }
           }
         });
@@ -959,8 +973,8 @@
       
       const tileUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${startTime}/${endTime}/Surface/v2/ValueLocList/{z}/{y}/{x}.png`;
       
-      console.log(`Target: ${formatTimeLocal(targetTime)} | Model: ${formatTimeLocal(thisCycleStart)} (${bestModel.cycleHour}z) | F${bestModel.forecastHour.toString().padStart(3,'0')}`);
-      console.log('🗺️ Tile URL pattern:', tileUrl);
+      logger.info(`Target: ${formatTimeLocal(targetTime)} | Model: ${formatTimeLocal(thisCycleStart)} (${bestModel.cycleHour}z) | F${bestModel.forecastHour.toString().padStart(3,'0')}`);
+      logger.debug('🗺️ Tile URL pattern:', tileUrl);
       
       if (!map.getSource("currents")) {
         map.addSource("currents", {
@@ -978,7 +992,8 @@
       } else {
         const source = map.getSource("currents");
         source.tiles = [tileUrl];
-        map.style.sourceCaches['currents'].clearTiles();
+        // Don't clear tiles - let browser/service worker cache work
+        // map.style.sourceCaches['currents'].clearTiles();
         map.style.sourceCaches['currents'].update(map.transform);
         map.triggerRepaint();
       }
@@ -990,7 +1005,7 @@
     async function findMaxForecastHour(cycleTime) {
       const testStartTime = toIsoUTC(cycleTime);
       let low = 0;
-      let high = 72;
+      let high = CONFIG.MAX_FORECAST_HOURS;
       let maxAvailable = -1;
       
       // Helper to test if a specific forecast hour is available
@@ -1003,7 +1018,7 @@
           const response = await fetch(testUrl);
           if (response.ok) {
             const blob = await response.blob();
-            return blob.size >= 5000; // Real data vs placeholder
+            return blob.size >= CONFIG.TILE_MIN_SIZE; // Real data vs placeholder
           }
         } catch (err) {
           // Ignore errors
@@ -1028,8 +1043,8 @@
     }
     
     async function exploreRecentModels(count = 10) {
-      console.log('📊 Exploring recent model cycles (stopping at first full 72h model)...');
-      console.log('================================================');
+      logger.info('📊 Exploring recent model cycles (stopping at first full 72h model)...');
+      logger.info('================================================');
       
       const now = new Date();
       const results = [];
@@ -1038,13 +1053,13 @@
       // Get the latest theoretical cycle
       const latestCycle = getLatestCycle(now);
       let searchDate = new Date(latestCycle.date);
-      let cycleIndex = SSCOFS_CYCLES.indexOf(latestCycle.cycle);
+      let cycleIndex = CONFIG.SSCOFS_CYCLES.indexOf(latestCycle.cycle);
       let modelsChecked = 0;
       
       // Check the last N model cycles, but stop once we find a full 72h model
       for (let daysBack = 0; daysBack <= 7 && modelsChecked < count && !foundFull72; daysBack++) {
         for (let i = cycleIndex; i >= 0 && modelsChecked < count && !foundFull72; i--) {
-          const testCycle = SSCOFS_CYCLES[i];
+          const testCycle = CONFIG.SSCOFS_CYCLES[i];
           const cycleTime = new Date(searchDate);
           cycleTime.setUTCHours(testCycle, 0, 0, 0);
           
@@ -1078,7 +1093,7 @@
             details += ' | Past only';
           }
           
-          console.log(`${status} | ${formatTimeLocal(cycleTime)} (${String(testCycle).padStart(2,'0')}z) | ${hoursOld.toFixed(1)}h old | ${details}`);
+          logger.info(`${status} | ${formatTimeLocal(cycleTime)} (${String(testCycle).padStart(2,'0')}z) | ${hoursOld.toFixed(1)}h old | ${details}`);
           
           results.push({
             time: cycleTime,
@@ -1093,17 +1108,17 @@
           modelsChecked++;
           
           if (foundFull72) {
-            console.log('🛑 Stopping exploration - found full 72h model');
+            logger.info('🛑 Stopping exploration - found full 72h model');
           }
         }
         
         searchDate.setUTCDate(searchDate.getUTCDate() - 1);
-        cycleIndex = SSCOFS_CYCLES.length - 1;
+        cycleIndex = CONFIG.SSCOFS_CYCLES.length - 1;
       }
       
       // Analyze which models are actually needed for future coverage
-      console.log('================================================');
-      console.log('=== Future Coverage Analysis ===');
+      logger.info('================================================');
+      logger.info('=== Future Coverage Analysis ===');
       
       // Sort by how far into the future they reach
       const futureModels = results
@@ -1118,37 +1133,37 @@
         if (model.futureEnd > maxCoverage) {
           // This model extends our coverage
           neededModels.push(model);
-          console.log(`✅ NEEDED: ${formatTimeLocal(model.time)} (${model.cycle}z) extends coverage to +${Math.round(model.futureEnd)}h`);
+          logger.info(`✅ NEEDED: ${formatTimeLocal(model.time)} (${model.cycle}z) extends coverage to +${Math.round(model.futureEnd)}h`);
           maxCoverage = model.futureEnd;
         } else {
           // This model is redundant
           redundantModels.push(model);
-          console.log(`⏭️  REDUNDANT: ${formatTimeLocal(model.time)} (${model.cycle}z) only reaches +${Math.round(model.futureEnd)}h`);
+          logger.info(`⏭️  REDUNDANT: ${formatTimeLocal(model.time)} (${model.cycle}z) only reaches +${Math.round(model.futureEnd)}h`);
         }
       }
       
       // Summary
-      console.log('================================================');
-      console.log(`Models needed for future coverage: ${neededModels.length}`);
-      console.log(`Redundant models: ${redundantModels.length}`);
-      console.log(`Maximum future coverage: +${Math.round(maxCoverage)} hours`);
+      logger.info('================================================');
+      logger.info(`Models needed for future coverage: ${neededModels.length}`);
+      logger.info(`Redundant models: ${redundantModels.length}`);
+      logger.info(`Maximum future coverage: +${Math.round(maxCoverage)} hours`);
       
       // Store only the needed models for future coverage
-      modelAvailability = neededModels;
+      state.modelAvailability = neededModels;
       
       return results;
     }
     
     // Find the best (newest) model that has data for a specific forecast hour
     function getBestModelForForecast(targetDate) {
-      if (!modelAvailability || modelAvailability.length === 0) {
+      if (!state.modelAvailability || state.modelAvailability.length === 0) {
         return null;
       }
       
       const now = new Date();
       
       // Find the newest model that can provide this forecast
-      for (const model of modelAvailability) {
+      for (const model of state.modelAvailability) {
         if (model.maxHour < 0) continue; // Skip models with no data
         
         // Calculate what forecast hour this would be for this model
@@ -1157,7 +1172,7 @@
         
         // Check if this model covers the requested time
         if (hoursSinceModel >= 0 && hoursSinceModel <= model.maxHour) {
-          console.log(`Using model from ${formatTimeLocal(modelTime)} (${model.cycle}z) for F${Math.round(hoursSinceModel).toString().padStart(3,'0')}`);
+          logger.info(`Using model from ${formatTimeLocal(modelTime)} (${model.cycle}z) for F${Math.round(hoursSinceModel).toString().padStart(3,'0')}`);
           return {
             cycleDate: model.time,
             cycleHour: model.cycle,
@@ -1168,40 +1183,106 @@
         }
       }
       
-      console.warn('No model available for requested time:', formatTimeLocal(targetDate));
+      logger.warn('No model available for requested time:', formatTimeLocal(targetDate));
       return null;
     }
     
     // ========== INITIALIZATION ==========
     
+    // Monitor online/offline status
+    window.addEventListener('online', () => {
+      state.isOffline = false;
+      logger.info('Back online');
+      // Optionally refresh model data
+    });
+    
+    window.addEventListener('offline', () => {
+      state.isOffline = true;
+      logger.warn('App is offline - using cached data');
+      showOfflineIndicator();
+    });
+    
+    function showOfflineIndicator() {
+      const indicator = document.createElement('div');
+      indicator.id = 'offline-indicator';
+      indicator.style.cssText = `
+        position: fixed;
+        top: 40px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #ff9800;
+        color: white;
+        padding: 8px 16px;
+        border-radius: 4px;
+        font-size: 13px;
+        z-index: 1000;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      `;
+      indicator.textContent = '📵 Offline - Using cached data';
+      document.body.appendChild(indicator);
+      
+      // Remove when back online
+      const checkOnline = setInterval(() => {
+        if (!state.isOffline) {
+          indicator.remove();
+          clearInterval(checkOnline);
+        }
+      }, 1000);
+    }
+    
     async function initialize() {
-      showLoading(true);
-      
-      const now = new Date();
-      now.setMinutes(0, 0, 0);
-      
-      console.log('=== Model Initialization ===');
-      console.log('Proxy URL:', PROXY_HOST);
-      
-      // First explore recent models to show what's available
-      // This populates the global modelAvailability array
-      await exploreRecentModels(10);
-      
-      if (!modelAvailability || modelAvailability.length === 0 || modelAvailability.every(m => m.maxHour < 0)) {
-        console.error('❌ No available models found!');
-        showLoading(false);
-        document.getElementById('loading').textContent = 'No model data available';
-        return;
-      }
+      try {
+        showLoading('Searching for model data...');
+        
+        const now = new Date();
+        now.setMinutes(0, 0, 0);
+        
+        logger.info('=== Model Initialization ===');
+        logger.info('Proxy URL:', CONFIG.PROXY_HOST);
+        
+        // Check if we're offline
+        if (!navigator.onLine) {
+          state.isOffline = true;
+          logger.warn('Starting in offline mode');
+          // Try to use cached model availability from localStorage
+          const cachedModels = localStorage.getItem('model_availability');
+          if (cachedModels) {
+            const parsed = JSON.parse(cachedModels);
+            // Convert date strings back to Date objects
+            state.modelAvailability = parsed.map(m => ({
+              ...m,
+              time: new Date(m.time)
+            }));
+            logger.info('Using cached model availability');
+          } else {
+            showError('No cached data available. Please connect to internet.');
+            return;
+          }
+        } else {
+          // First explore recent models to show what's available
+          // This populates the state.modelAvailability array
+          await exploreRecentModels(10);
+          
+          // Cache model availability for offline use
+          localStorage.setItem('model_availability', JSON.stringify(state.modelAvailability));
+        }
+        
+        if (!state.modelAvailability || state.modelAvailability.length === 0 || state.modelAvailability.every(m => m.maxHour < 0)) {
+          logger.error('❌ No available models found!');
+          if (state.isOffline) {
+            showError('Cannot load model data while offline.');
+          } else {
+            showError('No ocean current data available. Please try again later.');
+          }
+          return;
+        }
       
       // Find the maximum future coverage available
-      const maxFutureCoverage = Math.max(...modelAvailability.map(m => m.futureEnd));
+      const maxFutureCoverage = Math.max(...state.modelAvailability.map(m => m.futureEnd));
       
-      console.log('');
-      console.log('=== Model Selection Strategy ===');
-      console.log('Will use the newest model available for each forecast time');
-      console.log(`Future coverage: 0 to +${Math.round(maxFutureCoverage)} hours`);
-      console.log('===========================');
+      logger.info('=== Model Selection Strategy ===');
+      logger.info('Will use the newest model available for each forecast time');
+      logger.info(`Future coverage: 0 to +${Math.round(maxFutureCoverage)} hours`);
       
       // Update slider to match available future coverage
       const slider = document.getElementById('time-slider');
@@ -1215,13 +1296,17 @@
       // Update display with initial position (current time)
       updateCurrentsLayer(0);
       
-      showLoading(false);
+      showLoading('', false);
+      } catch (error) {
+        logger.error('Initialization error:', error);
+        showError('Failed to initialize app. Please check your connection and try again.');
+      }
     }
     
     // ========== EVENT HANDLERS ==========
     
     document.getElementById('time-slider').addEventListener('input', (e) => {
-      if (isUpdating) return;
+      if (state.isUpdating) return;
       
       const hoursFromNow = parseInt(e.target.value);
       
@@ -1275,13 +1360,11 @@
     
     // Handle tap for showing magnitude
     map.on('click', async (e) => {
-      if (DEBUG_MODE) {
-        console.log('👆 Click/tap event fired', {
-          lngLat: e.lngLat,
-          point: e.point,
-          timestamp: new Date().toISOString()
-        });
-      }
+      logger.debug('👆 Click/tap event fired', {
+        lngLat: e.lngLat,
+        point: e.point,
+        timestamp: new Date().toISOString()
+      });
       
       // Get the click position
       const lngLat = e.lngLat;
@@ -1295,28 +1378,34 @@
         y: point.y + rect.top
       };
       
-      if (DEBUG_MODE) {
-        console.log('📍 Click position:', {
-          screen: screenPoint,
-          mapRelative: point,
-          lngLat: { lat: lngLat.lat, lng: lngLat.lng }
-        });
-      }
+      logger.debug('📍 Click position:', {
+        screen: screenPoint,
+        mapRelative: point,
+        lngLat: { lat: lngLat.lat, lng: lngLat.lng }
+      });
       
       // Vibrate if available (haptic feedback)
       if (navigator.vibrate) {
-        if (DEBUG_MODE) console.log('📳 Triggering haptic feedback');
+        logger.debug('📳 Triggering haptic feedback');
         navigator.vibrate(10);
       }
       
       // Fetch and show magnitude
-      if (DEBUG_MODE) console.log('🔍 Fetching magnitude for:', { lat: lngLat.lat, lng: lngLat.lng });
+      logger.debug('🔍 Fetching magnitude for:', { lat: lngLat.lat, lng: lngLat.lng });
+      
+      // Check if offline
+      if (state.isOffline) {
+        logger.warn('Cannot fetch magnitude while offline');
+        // Could show a message to user
+        return;
+      }
+      
       const result = await fetchCurrentMagnitude(lngLat.lat, lngLat.lng);
       if (result) {
-        if (DEBUG_MODE) console.log('📌 Showing marker with value:', result.value);
-        showMagnitudeMarker(screenPoint.x, screenPoint.y, result.value, lngLat.lat, lngLat.lng, DEBUG_MODE);
+        logger.debug('📌 Showing marker with value:', result.value);
+        showMagnitudeMarker(screenPoint.x, screenPoint.y, result.value, lngLat.lat, lngLat.lng);
       } else {
-        if (DEBUG_MODE) console.log('❌ No result to show');
+        logger.debug('❌ No result to show');
       }
     });
     
@@ -1327,7 +1416,7 @@
     
     // Hide marker when starting to pan
     map.on('movestart', () => {
-      if (DEBUG_MODE) console.log('🗺️ Map movestart - hiding marker');
+      logger.debug('🗺️ Map movestart - hiding marker');
       hideMagnitudeMarker();
     });
     
@@ -1341,7 +1430,7 @@
       if (e.error && e.error.status === 404) {
         // Tile not found is common at edges, ignore
       } else if (e.error) {
-        console.error('Map error:', e.error);
+        logger.error('Map error:', e.error);
       }
     });
     
