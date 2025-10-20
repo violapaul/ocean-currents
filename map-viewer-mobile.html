@@ -26,11 +26,12 @@
   <style>
     html, body, .app-wrapper {
       position: fixed;
-      inset: 0;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
       width: 100%;
-      /* Dynamic viewport first, JS fallback second */
-      height: 100dvh;
-      height: var(--vhpx, 100vh);
+      height: 100%;
       overflow: hidden;
       /* Prevent text selection and touch callouts */
       -webkit-user-select: none;
@@ -58,7 +59,7 @@
       -webkit-overflow-scrolling: touch;
     }
     
-    /* App wrapper fills viewport exactly */
+    /* App wrapper fills viewport exactly - simplified */
     .app-wrapper {
       position: fixed;
       top: 0;
@@ -67,17 +68,7 @@
       bottom: 0;
       width: 100%;
       height: 100%;
-      /* Use full available height */
-      height: 100vh;
-      height: -webkit-fill-available;
       overflow: hidden;
-      /* Prevent text selection and touch callouts */
-      -webkit-user-select: none;
-      -moz-user-select: none;
-      -ms-user-select: none;
-      user-select: none;
-      -webkit-touch-callout: none;
-      -webkit-tap-highlight-color: transparent;
     }
     
     #map {
@@ -85,12 +76,13 @@
       left: 0;
       right: 0;
       width: 100%;
-      /* Simple positioning - let the container handle safe areas */
-      top: calc(28px + env(safe-area-inset-top, 0px));
-      /* Bottom should just be the height of the slider container */
-      bottom: 42px; }
+      /* Map extends edge to edge for maximum coverage */
+      top: 0;  /* Map goes under header */
+      bottom: 0;  /* Map extends all the way to bottom */
+      z-index: 1;
+    }
     
-    /* Top header with time display */
+    /* Top header with time display - floats over map */
     .header {
       position: fixed;
       top: 0;
@@ -99,14 +91,16 @@
       height: 28px;
       /* Support safe area for notch */
       padding-top: env(safe-area-inset-top, 0px);
-      background: rgba(255, 255, 255, 0.92);
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
       box-shadow: 0 1px 3px rgba(0,0,0,0.12);
       display: flex;
       align-items: center;
       justify-content: flex-start;
       padding-left: 12px;
       padding-right: 210px; /* Make room for tide chart */
-      z-index: 2;
+      z-index: 10;
     }
     
     .time-display {
@@ -121,19 +115,16 @@
       font-weight: normal;
     }
     
-    /* Bottom slider control */
+    /* Bottom slider control - transparent, floats over map */
     .slider-container {
       position: fixed;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      /* Total height includes the control height plus safe area */
+      bottom: env(safe-area-inset-bottom, 0px);  /* Positioned above safe area */
+      left: 10px;
+      right: 10px;
       height: 42px;
-      background: rgba(255, 255, 255, 0.92);
-      box-shadow: 0 -1px 3px rgba(0,0,0,0.12);
+      background: transparent;  /* No background */
       padding: 4px 45px 0 45px;
-      /* Only add bottom padding for safe area, not extra height */
-      padding-bottom: 0; z-index: 2;
+      z-index: 10;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -149,14 +140,14 @@
       border-radius: 16px;
       background: #0066cc;
       color: white;
-      border: none;
+      border: 2px solid white;  /* White border for contrast */
       font-size: 16px;
       font-weight: bold;
       display: flex;
       align-items: center;
       justify-content: center;
       cursor: pointer;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3), 0 0 0 1px rgba(0,0,0,0.1);  /* Enhanced shadow */
       transition: background 0.2s;
       z-index: 3;
     }
@@ -174,30 +165,36 @@
     }
     
     .slider-label {
-      position: absolute;
-      top: 2px;
+      position: fixed;
+      bottom: max(5px, calc(env(safe-area-inset-bottom, 0px) - 20px));  /* Below slider, but visible */
       left: 50%;
       transform: translateX(-50%);
       font-size: 10px;
-      color: #666;
+      color: #333;
+      font-weight: 500;
       text-align: center;
       white-space: nowrap;
-      z-index: 3;
-      background: rgba(255, 255, 255, 0.8);
-      padding: 0 4px;
-      border-radius: 2px;
+      z-index: 9;  /* Below slider container */
+      background: rgba(255, 255, 255, 0.95);
+      border: 1px solid white;
+      padding: 1px 6px;
+      border-radius: 3px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
     }
     
     .version-label {
-      position: absolute;
-      top: 2px;
-      right: 48px; /* Position inside the next button */
+      position: fixed;
+      top: calc(5px + env(safe-area-inset-top, 0px));  /* Top right, accounting for safe area */
+      right: 5px;  /* Over the tide chart */
       font-size: 9px;
-      color: #999;
-      z-index: 3;
-      background: rgba(255, 255, 255, 0.9);
-      padding: 0 4px;
+      color: #666;
+      font-weight: 500;
+      z-index: 11;  /* Above tide chart */
+      background: rgba(255, 255, 255, 0.95);
+      border: 1px solid white;
+      padding: 1px 4px;
       border-radius: 2px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.15);
     }
     
     .time-slider {
@@ -212,8 +209,10 @@
     .time-slider::-webkit-slider-track {
       width: 100%;
       height: 6px;
-      background: #e0e0e0;
+      background: rgba(224, 224, 224, 0.9);
+      border: 1px solid white;  /* White border for contrast */
       border-radius: 3px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
     }
     
     .time-slider::-webkit-slider-thumb {
@@ -222,26 +221,29 @@
       width: 24px;
       height: 24px;
       background: #0066cc;
+      border: 2px solid white;  /* White border for contrast */
       border-radius: 50%;
       cursor: pointer;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3), 0 0 0 1px rgba(0,0,0,0.1);
     }
     
     .time-slider::-moz-range-track {
       width: 100%;
       height: 6px;
-      background: #e0e0e0;
+      background: rgba(224, 224, 224, 0.9);
+      border: 1px solid white;  /* White border for contrast */
       border-radius: 3px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
     }
     
     .time-slider::-moz-range-thumb {
       width: 24px;
       height: 24px;
       background: #0066cc;
+      border: 2px solid white;  /* White border for contrast */
       border-radius: 50%;
-      border: none;
       cursor: pointer;
-      box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3), 0 0 0 1px rgba(0,0,0,0.1);
     }
     
     /* Loading indicator */
@@ -250,11 +252,13 @@
       top: 50%;
       left: 50%;
       transform: translate(-50%, -50%);
-      background: rgba(255, 255, 255, 0.9);
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
       padding: 15px 25px;
       border-radius: 8px;
       box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-      z-index: 10;
+      z-index: 100;
       font-size: 14px;
       color: #666;
     }
@@ -267,7 +271,7 @@
     .magnitude-marker {
       position: absolute;
       pointer-events: none;
-      z-index: 5;
+      z-index: 50;
       transform: translate(-50%, -50%);
     }
     
@@ -317,18 +321,20 @@
       white-space: nowrap;
     }
     
-    /* Tide chart */
+    /* Tide chart - floats over map */
     .tide-chart {
       position: fixed;
       top: 0;
       right: 0;
       width: 200px;
       height: 100px;
-      background: rgba(255, 255, 255, 0.92);
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
       border-radius: 0 0 0 6px;
       box-shadow: 0 2px 8px rgba(0,0,0,0.15);
       padding: 4px;
-      z-index: 3;
+      z-index: 10;
       /* Account for safe area */
       padding-top: calc(4px + env(safe-area-inset-top, 0px));
     }
@@ -395,18 +401,6 @@
       }
     }
     
-    /* iOS PWA standalone mode specific fixes */
-    @media (display-mode: standalone) {
-      /* Ensure we use full height in standalone mode */
-      html, body, .app-wrapper { height: 100dvh; }
-    }
-      
-      .app-wrapper {
-        height: 100vh;
-        height: -webkit-fill-available;
-      }
-    }
-    
   </style>
 </head>
 <body>
@@ -465,7 +459,7 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
-      APP_VERSION: 'v1.3.5', // PWA size fix, again, again.
+      APP_VERSION: 'v1.4.2', // Fixed label positioning for non-PWA mode
       PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
@@ -974,18 +968,20 @@
       attributionControl: false // Clean mobile view
     });
 
-// --- Visual viewport sync + MapLibre resize ---
-function applyViewportHeight() {
-  const h = window.visualViewport ? window.visualViewport.height : window.innerHeight;
-  document.documentElement.style.setProperty('--vhpx', `${h}px`);
-  try { map.resize(); } catch {}
+// Simplified viewport handling - just resize map when needed
+function handleViewportChange() {
+  if (map) {
+    try { 
+      map.resize(); 
+    } catch (e) {
+      // Ignore resize errors during initialization
+    }
+  }
 }
-window.addEventListener('load', applyViewportHeight);
-window.addEventListener('orientationchange', applyViewportHeight);
-window.addEventListener('resize', applyViewportHeight);
-if (window.visualViewport) {
-  window.visualViewport.addEventListener('resize', applyViewportHeight);
-}
+
+window.addEventListener('load', handleViewportChange);
+window.addEventListener('orientationchange', handleViewportChange);
+window.addEventListener('resize', handleViewportChange);
 
     
     function updateCurrentsLayer(hoursFromNow) {
