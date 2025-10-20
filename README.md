@@ -1,191 +1,80 @@
-# Ocean Currents Mobile Viewer Deployment
+# Ocean Currents Mobile Viewer
 
-This directory contains all the files needed to deploy the Ocean Currents mobile viewer using GitHub Pages for hosting and Cloudflare Worker for the proxy.
+A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current forecasts from NOAA's Salish Sea Coastal Ocean Forecast System (SSCOFS).
 
-## 📁 Files Included
+## 🌊 Live Demo
 
-- `index.html` - Landing page that redirects to mobile viewer
-- `map-viewer-mobile.html` - Main mobile PWA application
-- `manifest.json` - PWA manifest for installability
-- `app-icon.svg` - Vector app icon
-- `app-icon-192.png` - PWA icon (192x192)
-- `app-icon-512.png` - PWA icon (512x512)
-- `apple-touch-icon.png` - iOS home screen icon
-- `.nojekyll` - Prevents GitHub Pages from processing files
+**App**: https://violapaul.github.io/ocean-currents/
+
+## Features
+
+- **Real-time ocean current visualization** for Puget Sound
+- **Mobile-optimized interface** with touch-friendly controls
+- **Time slider** to view forecasts up to 72 hours ahead
+- **Progressive Web App** - installable on iOS and Android
+- **Automatic model detection** - always shows the latest available SSCOFS data
+
+## Architecture
+
+- **Static Hosting**: GitHub Pages (free, HTTPS, CDN)
+- **Proxy Server**: Cloudflare Worker (serverless, handles CORS)
+- **Data Source**: NOAA/UW coral.apl.uw.edu tile server
+- **Map Library**: MapLibre GL JS
+
+## Files
+
+- `index.html` - Landing page with redirect
+- `map-viewer-mobile.html` - Main PWA application
+- `manifest.json` - PWA configuration
+- `app-icon-*.png/svg` - App icons for various platforms
 - `proxy-worker.js` - Cloudflare Worker proxy script
 - `wrangler.toml` - Cloudflare Worker configuration
 
-## 🚀 Deployment Steps
+## How It Works
 
-### Step 1: Deploy Cloudflare Worker (Proxy)
+1. User visits the GitHub Pages site
+2. Mobile-optimized interface loads with MapLibre GL
+3. JavaScript requests ocean current tiles through Cloudflare Worker proxy
+4. Proxy bypasses CORS restrictions and fetches tiles from NOAA server
+5. Tiles are displayed as overlays on the map
+6. Time slider allows viewing different forecast hours
 
-1. **Create a Cloudflare account** (free):
-   - Go to https://dash.cloudflare.com/sign-up
-   - Verify your email
+## SSCOFS Model Information
 
-2. **Install Wrangler CLI**:
-   ```bash
-   npm install -g wrangler
-   ```
+The app automatically detects and uses the latest available SSCOFS model run:
+- Model runs: 00z, 03z, 09z, 15z, 21z UTC daily
+- Forecast range: 0-72 hours
+- Data typically available 3-5 hours after model run time
 
-3. **Login to Cloudflare**:
-   ```bash
-   wrangler login
-   ```
-   This will open your browser to authenticate.
+## Development
 
-4. **Deploy the Worker**:
-   ```bash
-   # From this directory
-   wrangler deploy
-   ```
-   
-   You'll see output like:
-   ```
-   Uploaded ocean-currents-proxy (1.23 sec)
-   Published ocean-currents-proxy (0.45 sec)
-   https://ocean-currents-proxy.YOUR-SUBDOMAIN.workers.dev
-   ```
+To run locally:
 
-5. **Note your Worker URL** - you'll need this for the next step!
-
-### Step 2: Update the Proxy URL
-
-1. **Edit `map-viewer-mobile.html`**:
-   - Find line ~220 where it says:
-     ```javascript
-     return 'https://ocean-currents-proxy.YOUR-CLOUDFLARE-SUBDOMAIN.workers.dev';
-     ```
-   - Replace `YOUR-CLOUDFLARE-SUBDOMAIN` with your actual subdomain from Step 1
-
-2. **Save the file**
-
-### Step 3: Deploy to GitHub Pages
-
-1. **Create a new GitHub repository**:
-   - Go to https://github.com/new
-   - Name it something like `ocean-currents`
-   - Make it public
-   - Don't initialize with README (we have our own)
-
-2. **Push the files**:
-   ```bash
-   # Initialize git in this directory
-   git init
-   
-   # Add all files
-   git add .
-   
-   # Commit
-   git commit -m "Initial deployment of Ocean Currents viewer"
-   
-   # Add your GitHub repo as origin
-   git remote add origin https://github.com/YOUR-USERNAME/ocean-currents.git
-   
-   # Push to main branch
-   git push -u origin main
-   ```
-
-3. **Enable GitHub Pages**:
-   - Go to your repository on GitHub
-   - Click **Settings** tab
-   - Scroll down to **Pages** section (left sidebar)
-   - Under **Source**, select:
-     - Deploy from a branch: `main`
-     - Folder: `/ (root)`
-   - Click **Save**
-
-4. **Wait for deployment** (1-2 minutes):
-   - GitHub will show a green checkmark when ready
-   - Your site will be available at:
-     ```
-     https://YOUR-USERNAME.github.io/ocean-currents/
-     ```
-
-## ✅ Testing Your Deployment
-
-### Desktop Browser
-1. Open `https://YOUR-USERNAME.github.io/ocean-currents/`
-2. Check browser console (F12) for any errors
-3. Verify tiles are loading (you should see ocean current overlays)
-
-### Mobile Device (iOS/Android)
-1. Open the URL on your mobile device
-2. The interface should be optimized for mobile
-3. Try the time slider to change forecast hours
-4. **Install as PWA**:
-   - **iOS**: Tap Share → Add to Home Screen
-   - **Android**: Menu → Install App or Add to Home Screen
-
-## 🔍 Troubleshooting
-
-### Tiles Not Loading
-- Check browser console for CORS errors
-- Verify your Cloudflare Worker URL is correct in `map-viewer-mobile.html`
-- Test the proxy directly: `https://YOUR-WORKER.workers.dev/healthz`
-
-### GitHub Pages Not Working
-- Make sure repository is public
-- Check that GitHub Pages is enabled in Settings
-- Wait a few minutes for initial deployment
-- Try hard refresh (Ctrl+Shift+R or Cmd+Shift+R)
-
-### PWA Not Installing
-- Must be served over HTTPS (GitHub Pages does this)
-- Check that all icon files are present
-- Verify manifest.json is valid JSON
-
-## 📊 Monitoring
-
-### Cloudflare Analytics
-1. Log into Cloudflare dashboard
-2. Go to Workers & Pages
-3. Click on your worker
-4. View Analytics tab for:
-   - Request count
-   - Error rate
-   - Response times
-
-### GitHub Pages
-- No built-in analytics
-- Consider adding Google Analytics if needed
-
-## 🔧 Making Updates
-
-To update the app after initial deployment:
-
-1. Make changes to files locally
-2. Commit and push to GitHub:
-   ```bash
-   git add .
-   git commit -m "Description of changes"
-   git push
-   ```
-3. GitHub Pages will automatically redeploy (1-2 minutes)
-
-To update the Cloudflare Worker:
+1. Start a local proxy server (if testing tile loading):
 ```bash
-wrangler deploy
+cd Web/wwm-proxy
+npm install
+node server.js
 ```
 
-## 📝 Notes
+2. Open `map-viewer-mobile.html` in a browser
 
-- **Free Tier Limits**:
-  - Cloudflare Worker: 100,000 requests/day
-  - GitHub Pages: 100GB bandwidth/month
-  
-- **No Custom Domain Required**: Both services provide their own URLs
+## Deployment
 
-- **Data Source**: Tiles are proxied from coral.apl.uw.edu (NOAA/UW data)
+See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed deployment instructions.
 
-## 🆘 Support
+## URLs
 
-If you encounter issues:
-1. Check the browser console for errors
-2. Verify all URLs are correct
-3. Ensure Cloudflare Worker is deployed and accessible
-4. Check that GitHub Pages is enabled
+- **Production App**: https://violapaul.github.io/ocean-currents/
+- **Cloudflare Proxy**: https://ocean-currents-proxy.violapaul.workers.dev
+- **GitHub Repository**: https://github.com/violapaul/ocean-currents
 
-## 📜 License
+## License
 
 This viewer interfaces with NOAA public data services. Refer to NOAA's data usage policies for commercial applications.
+
+## Credits
+
+- Ocean current data: NOAA/NOS/CO-OPS Salish Sea Coastal Ocean Forecast System
+- Tile service: University of Washington Applied Physics Lab
+- Map library: MapLibre GL JS
