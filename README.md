@@ -119,3 +119,11 @@ This viewer interfaces with NOAA public data services. Refer to NOAA's data usag
 - Ocean current data: NOAA/NOS/CO-OPS Salish Sea Coastal Ocean Forecast System
 - Tile service: University of Washington Applied Physics Lab
 - Map library: MapLibre GL JS
+- Helpful web page:  https://chrishewett.com/blog/slippy-tile-explorer/?
+- Cloudflare:  https://dash.cloudflare.com/
+- Safari mobile debugging using the iphone15 simulator (better than nothing!)
+    - Enable Developer.
+    - Use "responsive design mode"
+    - Use a simulator.
+
+    
