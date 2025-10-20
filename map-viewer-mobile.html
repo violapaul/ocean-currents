@@ -88,7 +88,7 @@
       /* Simple positioning - let the container handle safe areas */
       top: calc(28px + env(safe-area-inset-top, 0px));
       /* Bottom should just be the height of the slider container */
-      bottom: calc(46px + env(safe-area-inset-bottom, 0px));
+      bottom: calc(42px + env(safe-area-inset-bottom, 0px));
     }
     
     /* Top header with time display */
@@ -129,7 +129,7 @@
       left: 0;
       right: 0;
       /* Total height includes the control height plus safe area */
-      min-height: 42px;
+      height: 42px;
       background: rgba(255, 255, 255, 0.92);
       box-shadow: 0 -1px 3px rgba(0,0,0,0.12);
       padding: 4px 45px 0 45px;
@@ -467,7 +467,7 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
-      APP_VERSION: 'v1.3.3', // Attempting PWA Fix.
+      APP_VERSION: 'v1.3.4', // PWA size fix, again.
       PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
