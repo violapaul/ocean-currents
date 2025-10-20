@@ -78,16 +78,16 @@
       box-shadow: 0 1px 3px rgba(0,0,0,0.12);
       display: flex;
       align-items: center;
-      justify-content: center;
+      justify-content: flex-start;
       padding-left: 12px;
-      padding-right: 170px; /* Make room for tide chart */
+      padding-right: 210px; /* Make room for tide chart */
       z-index: 2;
     }
     
     .time-display {
       font-size: 13px;
       color: #222;
-      text-align: center;
+      text-align: left;
       font-weight: 500;
     }
     
@@ -286,8 +286,8 @@
       position: fixed;
       top: 0;
       right: 0;
-      width: 160px;
-      height: 80px;
+      width: 200px;
+      height: 100px;
       background: rgba(255, 255, 255, 0.92);
       border-radius: 0 0 0 6px;
       box-shadow: 0 2px 8px rgba(0,0,0,0.15);
@@ -306,7 +306,7 @@
     
     .tide-chart-canvas {
       width: 100%;
-      height: 60px;
+      height: 80px;
       position: relative;
     }
     
@@ -365,7 +365,7 @@
   <div class="app-wrapper">
     <div class="header">
       <div class="time-display" id="time-display">
-        <span class="model-time" id="model-time">Model: --</span> | <span id="forecast-time">--</span>
+        <span id="forecast-time">--</span>
       </div>
     </div>
     
@@ -466,10 +466,12 @@
     let modelCycleStart = null;
     let isUpdating = false;
     let modelAvailability = []; // Store model availability info from exploration
-    let magnitudeMarker = null; // Track magnitude marker state
-    let longPressTimer = null; // Timer for long press detection
+    let magnitudeMarker = null; // Track magnitude marker state with lat/lng
     let tideData = null; // Cache tide data
     let currentDisplayTime = null; // Track current display time for tide chart
+    
+    // Debug flag - set to true to enable verbose logging
+    const DEBUG_MODE = false; // Change to true for debugging
     
     // ========== MODEL FUNCTIONS ==========
     
@@ -517,10 +519,16 @@
     const TIDE_STATION_ID = '9447130';
     const TIDE_STATION_NAME = 'Seattle';
     
-    async function fetchTideData(centerTime) {
-      // Fetch 48 hours of data centered on the given time
-      const startTime = new Date(centerTime.getTime() - 24 * 60 * 60 * 1000);
-      const endTime = new Date(centerTime.getTime() + 24 * 60 * 60 * 1000);
+    async function fetchTideData(displayTime) {
+      // Get start and end of the current day in local time
+      const localDate = new Date(displayTime);
+      const dayStart = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0);
+      const dayEnd = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate() + 1, 0, 0, 0); // Midnight of next day
+      
+      // Fetch data for the full day plus some buffer for interpolation
+      // This ensures we always have complete data for the entire day
+      const startTime = dayStart;
+      const endTime = dayEnd;
       
       // Format dates for NOAA API (YYYYMMDD HH:MM)
       const formatNOAADate = (d) => {
@@ -578,18 +586,25 @@
         return;
       }
       
-      // Filter to 24-hour window (12 hours before and after current time)
-      const windowStart = new Date(currentTime.getTime() - 12 * 60 * 60 * 1000);
-      const windowEnd = new Date(currentTime.getTime() + 12 * 60 * 60 * 1000);
+      // Get start and end of current day in local time
+      const localDate = new Date(currentTime);
+      const dayStart = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0);
+      const dayEnd = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate() + 1, 0, 0, 0); // Midnight of next day
       
+      // Filter tides to current day
       const windowTides = tides.filter(t => 
-        t.time >= windowStart && t.time <= windowEnd
+        t.time >= dayStart && t.time <= dayEnd
       );
       
       if (windowTides.length === 0) {
-        canvas.innerHTML = '<div class="tide-error">No data for this time</div>';
+        canvas.innerHTML = '<div class="tide-error">No data for this day</div>';
         return;
       }
+      
+      // Calculate position of current time indicator (0-1 range)
+      const dayDuration = dayEnd - dayStart;
+      const currentOffset = currentTime - dayStart;
+      const currentPosition = Math.max(0, Math.min(1, currentOffset / dayDuration));
       
       // Find min/max for scaling
       const heights = windowTides.map(t => t.height);
@@ -598,8 +613,8 @@
       const heightRange = maxHeight - minHeight;
       
       // SVG dimensions
-      const width = 152; // Account for padding
-      const height = 60;
+      const width = 192; // Account for padding
+      const height = 80;
       const margin = { top: 3, right: 3, bottom: 12, left: 3 };
       const chartWidth = width - margin.left - margin.right;
       const chartHeight = height - margin.top - margin.bottom;
@@ -633,13 +648,13 @@
             
             <!-- Current time indicator -->
             <line class="tide-current-line" 
-                  x1="${chartWidth/2}" y1="0" 
-                  x2="${chartWidth/2}" y2="${chartHeight}"/>
+                  x1="${chartWidth * currentPosition}" y1="0" 
+                  x2="${chartWidth * currentPosition}" y2="${chartHeight}"/>
             
             <!-- Labels -->
-            <text x="2" y="${chartHeight + 12}" class="tide-label">-12h</text>
-            <text x="${chartWidth/2}" y="${chartHeight + 12}" class="tide-label" text-anchor="middle">Now</text>
-            <text x="${chartWidth - 2}" y="${chartHeight + 12}" class="tide-label" text-anchor="end">+12h</text>
+            <text x="2" y="${chartHeight + 12}" class="tide-label">12am</text>
+            <text x="${chartWidth/2}" y="${chartHeight + 12}" class="tide-label" text-anchor="middle">12pm</text>
+            <text x="${chartWidth - 2}" y="${chartHeight + 12}" class="tide-label" text-anchor="end">12am</text>
             
             <!-- Height labels -->
             <text x="2" y="10" class="tide-label">${maxHeight.toFixed(1)}ft</text>
@@ -650,24 +665,45 @@
       
       canvas.innerHTML = svg;
       
-      // Update title with current tide height
-      const currentTideIndex = Math.floor(windowTides.length / 2);
-      const currentTide = windowTides[currentTideIndex];
-      if (currentTide) {
-        document.querySelector('.tide-chart-title').textContent = 
-          `${TIDE_STATION_NAME} - ${currentTide.height.toFixed(1)}ft`;
+      // Find the tide height at current time by interpolation
+      let currentHeight = 0;
+      for (let i = 0; i < windowTides.length - 1; i++) {
+        if (currentTime >= windowTides[i].time && currentTime <= windowTides[i + 1].time) {
+          // Linear interpolation between two points
+          const t1 = windowTides[i].time.getTime();
+          const t2 = windowTides[i + 1].time.getTime();
+          const h1 = windowTides[i].height;
+          const h2 = windowTides[i + 1].height;
+          const ratio = (currentTime.getTime() - t1) / (t2 - t1);
+          currentHeight = h1 + (h2 - h1) * ratio;
+          break;
+        }
       }
+      
+      // Update title with current tide height
+      document.querySelector('.tide-chart-title').textContent = 
+        `${TIDE_STATION_NAME} - ${currentHeight.toFixed(1)}ft`;
     }
     
     async function updateTideChart(displayTime) {
       currentDisplayTime = displayTime;
       
-      // Check if we need to fetch new data (if current data doesn't cover this time)
-      if (!tideData || tideData.length === 0 ||
-          displayTime < tideData[0].time || 
-          displayTime > tideData[tideData.length - 1].time) {
-        
-        console.log('🌊 Fetching new tide data for', formatTimeLocal(displayTime));
+      // Get the day boundaries for the display time
+      const localDate = new Date(displayTime);
+      const dayStart = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0);
+      const dayEnd = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate() + 1, 0, 0, 0); // Midnight of next day
+      
+      // Check if we need to fetch new data
+      // We need new data if:
+      // 1. We don't have any data
+      // 2. Our current data doesn't cover the full day we're trying to display
+      const needNewData = !tideData || 
+                          tideData.length === 0 ||
+                          tideData[0].time > dayStart ||
+                          tideData[tideData.length - 1].time < dayEnd;
+      
+      if (needNewData) {
+        console.log('🌊 Fetching new tide data for day:', dayStart.toLocaleDateString());
         tideData = await fetchTideData(displayTime);
       }
       
@@ -726,11 +762,12 @@
         console.log('📦 API Response:', data);
         
         if (data.success && data.values && data.values.length > 0) {
+          // Convert from m/s to knots (1 m/s = 1.94384 knots)
           const result = {
-            value: data.values[0].value,
+            value: data.values[0].value * 1.94384,
             direction: data.values[0].direction
           };
-          console.log('✅ Magnitude data:', result);
+          console.log('✅ Magnitude data (converted to knots):', result);
           return result;
         } else {
           console.warn('⚠️ No valid data in response');
@@ -742,14 +779,14 @@
       // Fallback: estimate from nearby tile data (simplified approach)
       // In production, you'd want to implement proper interpolation
       const fallback = {
-        value: Math.random() * 2.5, // Dummy value in knots
+        value: Math.random() * 2.0, // Dummy value in knots (typical range 0-2 knots)
         direction: Math.random() * 360
       };
       console.log('⚠️ Using fallback data:', fallback);
       return fallback;
     }
     
-    function showMagnitudeMarker(x, y, magnitude) {
+    function showMagnitudeMarker(x, y, magnitude, lat, lng, showDebug = false) {
       const marker = document.getElementById('magnitude-marker');
       const valueEl = document.getElementById('magnitude-value');
       
@@ -761,36 +798,39 @@
       marker.style.top = y + 'px';
       marker.style.display = 'block';
       
-      // Store marker info
-      magnitudeMarker = { x, y, magnitude };
+      // Store marker info including lat/lng for updates
+      magnitudeMarker = { x, y, magnitude, lat, lng };
       
-      // Debug: Add a temporary blue dot to show the exact press location
-      const debugDot = document.createElement('div');
-      debugDot.style.cssText = `
-        position: fixed;
-        left: ${x - 3}px;
-        top: ${y - 3}px;
-        width: 6px;
-        height: 6px;
-        background: blue;
-        border-radius: 50%;
-        z-index: 9999;
-        pointer-events: none;
-      `;
-      debugDot.id = 'debug-dot';
-      
-      // Remove any existing debug dot
-      const existingDot = document.getElementById('debug-dot');
-      if (existingDot) existingDot.remove();
-      
-      document.body.appendChild(debugDot);
-      
-      // Remove debug dot after 3 seconds
-      setTimeout(() => {
-        if (document.getElementById('debug-dot')) {
-          document.getElementById('debug-dot').remove();
-        }
-      }, 3000);
+      // Only show debug dot if DEBUG_MODE is enabled
+      if (showDebug) {
+        // Debug: Add a temporary blue dot to show the exact press location
+        const debugDot = document.createElement('div');
+        debugDot.style.cssText = `
+          position: fixed;
+          left: ${x - 3}px;
+          top: ${y - 3}px;
+          width: 6px;
+          height: 6px;
+          background: blue;
+          border-radius: 50%;
+          z-index: 9999;
+          pointer-events: none;
+        `;
+        debugDot.id = 'debug-dot';
+        
+        // Remove any existing debug dot
+        const existingDot = document.getElementById('debug-dot');
+        if (existingDot) existingDot.remove();
+        
+        document.body.appendChild(debugDot);
+        
+        // Remove debug dot after 3 seconds
+        setTimeout(() => {
+          if (document.getElementById('debug-dot')) {
+            document.getElementById('debug-dot').remove();
+          }
+        }, 3000);
+      }
     }
     
     function hideMagnitudeMarker() {
@@ -830,13 +870,7 @@
     }
     
     function updateTimeDisplay(modelInfo) {
-      const cycleTime = new Date(modelInfo.cycleDate);
-      cycleTime.setUTCHours(modelInfo.cycleHour, 0, 0, 0);
-      
-      // Model time (when the model was run)
-      document.getElementById('model-time').textContent = `${formatTimeShort(cycleTime)}`;
-      
-      // Forecast time (what time we're showing)
+      // Only show forecast time (what time we're showing)
       document.getElementById('forecast-time').textContent = formatTimeLocal(modelInfo.targetTime);
     }
     
@@ -905,6 +939,21 @@
       
       // Update tide chart for the current display time
       updateTideChart(targetTime);
+      
+      // Update magnitude marker if one is displayed
+      if (magnitudeMarker && magnitudeMarker.lat && magnitudeMarker.lng) {
+        // Fetch updated magnitude for the same location
+        fetchCurrentMagnitude(magnitudeMarker.lat, magnitudeMarker.lng).then(result => {
+          if (result) {
+            // Update just the value, keep the same position
+            const valueEl = document.getElementById('magnitude-value');
+            if (valueEl) {
+              valueEl.textContent = result.value.toFixed(1);
+              magnitudeMarker.magnitude = result.value;
+            }
+          }
+        });
+      }
       
       // CRITICAL: Always use the MODEL CYCLE START as the tile start time
       // The end time determines which forecast hour we get
@@ -1227,146 +1276,61 @@
     
     // ========== TOUCH HANDLERS FOR MAGNITUDE ==========
     
-    // Handle long press for showing magnitude
-    map.on('touchstart', (e) => {
-      console.log('👆 touchstart event fired', {
-        touches: e.originalEvent.touches.length,
-        timestamp: new Date().toISOString()
-      });
-      
-      // Clear any existing timer
-      if (longPressTimer) {
-        clearTimeout(longPressTimer);
-        console.log('🔄 Cleared existing long press timer');
+    // Handle tap for showing magnitude
+    map.on('click', async (e) => {
+      if (DEBUG_MODE) {
+        console.log('👆 Click/tap event fired', {
+          lngLat: e.lngLat,
+          point: e.point,
+          timestamp: new Date().toISOString()
+        });
       }
       
-      // Hide existing marker when starting a new touch
-      hideMagnitudeMarker();
+      // Get the click position
+      const lngLat = e.lngLat;
+      const point = e.point;
       
-      // Store touch position - get map container position
-      const touch = e.originalEvent.touches[0];
+      // Calculate screen position
       const mapContainer = map.getContainer();
       const rect = mapContainer.getBoundingClientRect();
-      
-      // Calculate position relative to map container
-      const point = { 
-        x: touch.clientX - rect.left, 
-        y: touch.clientY - rect.top 
+      const screenPoint = {
+        x: point.x + rect.left,
+        y: point.y + rect.top
       };
       
-      // Convert to lat/lng using map's unproject
-      const lngLat = map.unproject([point.x, point.y]);
-      
-      // Store the screen position for marker placement
-      const screenPoint = { x: touch.clientX, y: touch.clientY };
-      
-      console.log('📍 Touch position:', {
-        screen: screenPoint,
-        mapRelative: point,
-        lngLat: { lat: lngLat.lat, lng: lngLat.lng }
-      });
-      
-      // Start long press timer (300ms)
-      console.log('⏱️ Starting 300ms long press timer...');
-      longPressTimer = setTimeout(async () => {
-        console.log('⏰ Long press timer triggered!');
-        
-        // ROUND-TRIP TEST: Convert lat/lon back to screen coordinates
-        const testPoint = map.project([lngLat.lng, lngLat.lat]);
-        const testScreenPoint = {
-          x: testPoint.x + rect.left,
-          y: testPoint.y + rect.top
-        };
-        
-        console.log('🔄 ROUND-TRIP TEST:', {
-          original: {
-            screen: screenPoint,
-            mapRelative: point
-          },
-          calculated: {
-            lngLat: { lat: lngLat.lat, lng: lngLat.lng }
-          },
-          roundTrip: {
-            mapRelative: testPoint,
-            screen: testScreenPoint
-          },
-          difference: {
-            x: testScreenPoint.x - screenPoint.x,
-            y: testScreenPoint.y - screenPoint.y
-          }
+      if (DEBUG_MODE) {
+        console.log('📍 Click position:', {
+          screen: screenPoint,
+          mapRelative: point,
+          lngLat: { lat: lngLat.lat, lng: lngLat.lng }
         });
-        
-        // Vibrate if available (haptic feedback)
-        if (navigator.vibrate) {
-          console.log('📳 Triggering haptic feedback');
-          navigator.vibrate(10);
-        } else {
-          console.log('📳 Vibrate API not available');
-        }
-        
-        // Fetch and show magnitude
-        console.log('🔍 Fetching magnitude for:', { lat: lngLat.lat, lng: lngLat.lng });
-        const result = await fetchCurrentMagnitude(lngLat.lat, lngLat.lng);
-        if (result) {
-          console.log('📌 Showing marker with value:', result.value);
-          // Use the round-trip tested position to verify accuracy
-          showMagnitudeMarker(testScreenPoint.x, testScreenPoint.y, result.value);
-        } else {
-          console.log('❌ No result to show');
-        }
-      }, 300);
-    });
-    
-    // Cancel long press on move or end
-    map.on('touchmove', () => {
-      if (longPressTimer) {
-        console.log('👆 touchmove - cancelling long press');
-        clearTimeout(longPressTimer);
-        longPressTimer = null;
       }
-    });
-    
-    map.on('touchend', () => {
-      if (longPressTimer) {
-        console.log('👆 touchend - cancelling long press');
-        clearTimeout(longPressTimer);
-        longPressTimer = null;
-      } else {
-        console.log('👆 touchend - no timer to cancel');
-      }
-    });
-    
-    map.on('touchcancel', () => {
-      if (longPressTimer) {
-        console.log('👆 touchcancel - cancelling long press');
-        clearTimeout(longPressTimer);
-        longPressTimer = null;
-      }
-    });
-    
-    // Also support click for desktop testing
-    map.on('contextmenu', async (e) => {
-      console.log('🖱️ Right-click detected at:', { 
-        point: e.point, 
-        lngLat: { lat: e.lngLat.lat, lng: e.lngLat.lng }
-      });
       
-      e.preventDefault();
-      const point = e.point;
-      const lngLat = e.lngLat;
+      // Vibrate if available (haptic feedback)
+      if (navigator.vibrate) {
+        if (DEBUG_MODE) console.log('📳 Triggering haptic feedback');
+        navigator.vibrate(10);
+      }
       
       // Fetch and show magnitude
-      console.log('🔍 Fetching magnitude for right-click...');
+      if (DEBUG_MODE) console.log('🔍 Fetching magnitude for:', { lat: lngLat.lat, lng: lngLat.lng });
       const result = await fetchCurrentMagnitude(lngLat.lat, lngLat.lng);
       if (result) {
-        console.log('📌 Showing marker with value:', result.value);
-        showMagnitudeMarker(point.x, point.y, result.value);
+        if (DEBUG_MODE) console.log('📌 Showing marker with value:', result.value);
+        showMagnitudeMarker(screenPoint.x, screenPoint.y, result.value, lngLat.lat, lngLat.lng, DEBUG_MODE);
+      } else {
+        if (DEBUG_MODE) console.log('❌ No result to show');
       }
+    });
+    
+    // Prevent context menu on right-click
+    map.on('contextmenu', (e) => {
+      e.preventDefault();
     });
     
     // Hide marker when starting to pan
     map.on('movestart', () => {
-      console.log('🗺️ Map movestart - hiding marker');
+      if (DEBUG_MODE) console.log('🗺️ Map movestart - hiding marker');
       hideMagnitudeMarker();
     });
     
