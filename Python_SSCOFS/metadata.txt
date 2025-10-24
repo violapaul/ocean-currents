@@ -1,0 +1,567 @@
+================================================================================
+SSCOFS NETCDF METADATA REPORT
+================================================================================
+
+FILE INFORMATION
+--------------------------------------------------------------------------------
+  run_date: 2025-10-16
+  cycle: 21z
+  forecast_hour: 4
+  url: https://noaa-nos-ofs-pds.s3.amazonaws.com/sscofs/netcdf/2025/10/16/sscofs.t21z.20251016.fields.f004.nc
+
+GLOBAL ATTRIBUTES
+--------------------------------------------------------------------------------
+  title: SSCOFS
+  institution: School for Marine Science and Technology
+  source: FVCOM_4.4.7
+  history: model started at: 16/10/2025   22:08
+  references: http://fvcom.smast.umassd.edu, https://github.com/FVCOM-GitHub/FVCOM
+  Conventions: CF-1.0
+  CoordinateSystem: GeoReferenced
+  CoordinateProjection: proj=utm +ellps=WGS84 +zone=10
+  Tidal_Forcing: Tidal Forcing Time Series Title: sscofs lateral open boundary netCDF file
+  River_Forcing: THERE ARE 38 RIVERS IN THIS MODEL.
+RIVER INFLOW IS ON THE nodes WHERE TEMPERATURE AND SALINITY ARE specified IN THE MODEL.
+THE FOLLOWING RIVER NAMES ARE USED:
+14144700
+14144700
+08MF005
+08MF005
+1220050...
+  GroundWater_Forcing: GROUND WATER FORCING IS OFF!
+  Surface_Heat_Forcing: FVCOM variable surface heat forcing file:
+FILE NAME:sscofs.t21z.20251016.hflux.forecast.nc
+SOURCE:FVCOM grid (unstructured) surface forcing
+Unknown start date meta data format
+  Surface_Wind_Forcing: FVCOM variable surface Wind forcing:
+FILE NAME:sscofs.t21z.20251016.met.forecast.nc
+SOURCE:FVCOM grid (unstructured) surface forcing
+Unknown start date meta data format
+  Surface_PrecipEvap_Forcing: SURFACE PRECIPITATION FORCING IS OFF
+
+DIMENSIONS
+--------------------------------------------------------------------------------
+  nele: 433,410
+  node: 239,734
+  siglev: 11
+  three: 3
+  time: 1
+  maxnode: 11
+  maxelem: 9
+  four: 4
+  siglay: 10
+
+SPATIAL INFORMATION
+--------------------------------------------------------------------------------
+  Nodes: 239,734
+    Longitude range: -129.5065 to -121.9590
+    Latitude range: 44.3926 to 52.1123
+    Center: (48.0892, -123.5331)
+  Elements: 433,410
+    Longitude range: -129.4946 to -121.9603
+    Latitude range: 44.3956 to 52.1046
+  Vertical layers: 10
+
+TEMPORAL INFORMATION
+--------------------------------------------------------------------------------
+  Number of time steps: 1
+  First time: 2025-10-17T00:59:59.999999776
+  Last time: 2025-10-17T00:59:59.999999776
+
+GRID CONNECTIVITY
+--------------------------------------------------------------------------------
+  mesh_type: unstructured_triangular
+  vertices_per_element: 3
+  num_elements: 433410
+  has_neighbor_info: True
+
+COORDINATES
+--------------------------------------------------------------------------------
+  siglev:
+    Type: float32
+    Shape: (11, 239734)
+    Dimensions: ['siglev', 'node']
+    Range: -1 to -0
+    Mean: -0.410154
+    Note: 2D array (11 x 239734), values not shown
+  lon:
+    Type: float32
+    Shape: (239734,)
+    Dimensions: ['node']
+    Range: 230.493 to 238.041
+    Mean: 236.467
+    Value sample (first 5 and last 5): [235.91026306152344, 235.89251708984375, 235.8726348876953, 235.8350067138672, 235.79736328125, '...', 238.03982543945312, 238.038330078125, 238.0367431640625, 238.04100036621094, 238.03778076171875]
+  lat:
+    Type: float32
+    Shape: (239734,)
+    Dimensions: ['node']
+    Range: 44.3926 to 52.1123
+    Mean: 48.0892
+    Value sample (first 5 and last 5): [44.39291000366211, 44.39344024658203, 44.39402770996094, 44.39485168457031, 44.395381927490234, '...', 45.63385009765625, 45.63473129272461, 45.63572692871094, 45.63492202758789, 45.63686752319336]
+  lonc:
+    Type: float32
+    Shape: (433410,)
+    Dimensions: ['nele']
+    Range: 230.505 to 238.04
+    Mean: 236.474
+    Value sample (first 5 and last 5): [235.9066925048828, 235.90036010742188, 235.89190673828125, 235.8833465576172, 235.87557983398438, '...', 238.0371551513672, 238.0369110107422, 238.0397186279297, 238.03903198242188, 238.03761291503906]
+  latc:
+    Type: float32
+    Shape: (433410,)
+    Dimensions: ['nele']
+    Range: 44.3956 to 52.1046
+    Mean: 48.0834
+    Value sample (first 5 and last 5): [44.39794158935547, 44.39556884765625, 44.400047302246094, 44.3979377746582, 44.40494155883789, '...', 45.63427734375, 45.6350212097168, 45.63450241088867, 45.63550567626953, 45.63577651977539]
+  siglay:
+    Type: float32
+    Shape: (10, 239734)
+    Dimensions: ['siglay', 'node']
+    Range: -0.926907 to -0.0158114
+    Mean: -0.401169
+    Note: 2D array (10 x 239734), values not shown
+  time:
+    Type: datetime64[ns]
+    Shape: (1,)
+    Dimensions: ['time']
+
+DATA VARIABLES
+--------------------------------------------------------------------------------
+Total data size: 165.43 MB
+
+  nprocs:
+    Type: int32
+    Shape: ()
+    Dimensions: []
+    Size: 0.00 MB
+    Range: 600 to 600
+    Mean: 600
+    Std Dev: 0
+    Note: Statistics computed from full dataset
+
+  partition:
+    Type: int32
+    Shape: (433410,)
+    Dimensions: ['nele']
+    Size: 1.65 MB
+    Range: 1 to 600
+    Mean: 300.772
+    Std Dev: 173.196
+    Note: Statistics computed from full dataset
+
+  x:
+    Type: float32
+    Shape: (239734,)
+    Dimensions: ['node']
+    Size: 0.91 MB
+    Range: 43197.7 to 581135
+    Mean: 462082
+    Std Dev: 99854.2
+    Note: Statistics computed from full dataset
+
+  y:
+    Type: float32
+    Shape: (239734,)
+    Dimensions: ['node']
+    Size: 0.91 MB
+    Range: 4.91609e+06 to 5.78493e+06
+    Mean: 5.3273e+06
+    Std Dev: 155850
+    Note: Statistics computed from full dataset
+
+  xc:
+    Type: float32
+    Shape: (433410,)
+    Dimensions: ['nele']
+    Size: 1.65 MB
+    Range: 44014.8 to 581036
+    Mean: 462558
+    Std Dev: 99538.2
+    Note: Statistics computed from full dataset
+
+  yc:
+    Type: float32
+    Shape: (433410,)
+    Dimensions: ['nele']
+    Size: 1.65 MB
+    Range: 4.9164e+06 to 5.78406e+06
+    Mean: 5.32664e+06
+    Std Dev: 153405
+    Note: Statistics computed from full dataset
+
+  h:
+    Type: float32
+    Shape: (239734,)
+    Dimensions: ['node']
+    Size: 0.91 MB
+    Range: -8.929 to 2018.56
+    Mean: 63.4202
+    Std Dev: 112.993
+    Note: Statistics computed from full dataset
+
+  nv:
+    Type: int32
+    Shape: (3, 433410)
+    Dimensions: ['three', 'nele']
+    Size: 4.96 MB
+    Range: 1 to 239734
+    Mean: 118617
+    Std Dev: 69072.9
+    Note: Statistics computed from full dataset
+
+  iint:
+    Type: int32
+    Shape: (1,)
+    Dimensions: ['time']
+    Size: 0.00 MB
+    Range: 2.3413e+07 to 2.3413e+07
+    Mean: 2.3413e+07
+    Std Dev: 0
+    Note: Statistics computed from full dataset
+
+  Times:
+    Type: |S26
+    Shape: (1,)
+    Dimensions: ['time']
+    Size: 0.00 MB
+
+  zeta:
+    Type: float32
+    Shape: (1, 239734)
+    Dimensions: ['time', 'node']
+    Size: 0.91 MB
+    Range: -0.392476 to 9.229
+    Mean: 0.705779
+    Std Dev: 0.545894
+    Note: Statistics computed from full dataset
+
+  nbe:
+    Type: int32
+    Shape: (3, 433410)
+    Dimensions: ['three', 'nele']
+    Size: 4.96 MB
+    Range: 0 to 433410
+    Mean: 208108
+    Std Dev: 129159
+    Note: Statistics computed from full dataset
+
+  ntsn:
+    Type: int32
+    Shape: (239734,)
+    Dimensions: ['node']
+    Size: 0.91 MB
+    Range: 4 to 10
+    Mean: 6.81317
+    Std Dev: 0.664452
+    Note: Statistics computed from full dataset
+
+  nbsn:
+    Type: int32
+    Shape: (11, 239734)
+    Dimensions: ['maxnode', 'node']
+    Size: 10.06 MB
+    Range: 0 to 239734
+    Mean: 74028.3
+    Std Dev: 79568.6
+    Note: Statistics computed from full dataset
+
+  ntve:
+    Type: int32
+    Shape: (239734,)
+    Dimensions: ['node']
+    Size: 0.91 MB
+    Range: 1 to 8
+    Mean: 5.42364
+    Std Dev: 1.30814
+    Note: Statistics computed from full dataset
+
+  nbve:
+    Type: int32
+    Shape: (9, 239734)
+    Dimensions: ['maxelem', 'node']
+    Size: 8.23 MB
+    Range: 0 to 433410
+    Mean: 149709
+    Std Dev: 144223
+    Note: Statistics computed from full dataset
+
+  a1u:
+    Type: float32
+    Shape: (4, 433410)
+    Dimensions: ['four', 'nele']
+    Size: 6.61 MB
+    Range: -0.0236573 to 0.0307582
+    Mean: -4.4008e-12
+    Std Dev: 0.00354633
+    Note: Statistics computed from full dataset
+
+  a2u:
+    Type: float32
+    Shape: (4, 433410)
+    Dimensions: ['four', 'nele']
+    Size: 6.61 MB
+    Range: -0.0262879 to 0.0218227
+    Mean: 0
+    Std Dev: 0.003538
+    Note: Statistics computed from full dataset
+
+  aw0:
+    Type: float32
+    Shape: (3, 433410)
+    Dimensions: ['three', 'nele']
+    Size: 4.96 MB
+    Range: 0.333142 to 0.333511
+    Mean: 0.333333
+    Std Dev: 9.45317e-06
+    Note: Statistics computed from full dataset
+
+  awx:
+    Type: float32
+    Shape: (3, 433410)
+    Dimensions: ['three', 'nele']
+    Size: 4.96 MB
+    Range: -0.0276609 to 0.0322746
+    Mean: 0
+    Std Dev: 0.00447727
+    Note: Statistics computed from full dataset
+
+  awy:
+    Type: float32
+    Shape: (3, 433410)
+    Dimensions: ['three', 'nele']
+    Size: 4.96 MB
+    Range: -0.0283495 to 0.0302293
+    Mean: 2.91861e-08
+    Std Dev: 0.00446093
+    Note: Statistics computed from full dataset
+
+  art2:
+    Type: float32
+    Shape: (239734,)
+    Dimensions: ['node']
+    Size: 0.91 MB
+    Range: 2525.97 to 2.74367e+07
+    Mean: 1.01617e+06
+    Std Dev: 3.09222e+06
+    Note: Statistics computed from full dataset
+
+  art1:
+    Type: float32
+    Shape: (239734,)
+    Dimensions: ['node']
+    Size: 0.91 MB
+    Range: 841.989 to 9.14556e+06
+    Mean: 338725
+    Std Dev: 1.03074e+06
+    Note: Statistics computed from full dataset
+
+  u:
+    Type: float32
+    Shape: (1, 10, 433410)
+    Dimensions: ['time', 'siglay', 'nele']
+    Size: 16.53 MB
+    Range: -3.76119 to 1.80094
+    Mean: -0.0434218
+    Std Dev: 0.228255
+    Note: Statistics computed from full dataset
+
+  v:
+    Type: float32
+    Shape: (1, 10, 433410)
+    Dimensions: ['time', 'siglay', 'nele']
+    Size: 16.53 MB
+    Range: -2.60459 to 4.08399
+    Mean: 0.0147841
+    Std Dev: 0.22691
+    Note: Statistics computed from full dataset
+
+  tauc:
+    Type: float32
+    Shape: (1, 433410)
+    Dimensions: ['time', 'nele']
+    Size: 1.65 MB
+    Range: 0 to 0.19455
+    Mean: 0.000377905
+    Std Dev: 0.00169887
+    Note: Statistics computed from full dataset
+
+  omega:
+    Type: float32
+    Shape: (1, 11, 239734)
+    Dimensions: ['time', 'siglev', 'node']
+    Size: 10.06 MB
+    Range: -0.116464 to 0.114875
+    Mean: -4.09068e-06
+    Std Dev: 0.00206403
+    Note: Statistics computed from full dataset
+
+  ww:
+    Type: float32
+    Shape: (1, 10, 433410)
+    Dimensions: ['time', 'siglay', 'nele']
+    Size: 16.53 MB
+    Range: -0.343214 to 0.208368
+    Mean: -8.31505e-05
+    Std Dev: 0.00356481
+    Note: Statistics computed from full dataset
+
+  temp:
+    Type: float32
+    Shape: (1, 10, 239734)
+    Dimensions: ['time', 'siglay', 'node']
+    Size: 9.15 MB
+    Range: 0.575595 to 21.8244
+    Mean: 11.2223
+    Std Dev: 1.43578
+    Note: Statistics computed from full dataset
+
+  salinity:
+    Type: float32
+    Shape: (1, 10, 239734)
+    Dimensions: ['time', 'siglay', 'node']
+    Size: 9.15 MB
+    Range: -0.000380669 to 34.6044
+    Mean: 26.6776
+    Std Dev: 10.2853
+    Note: Statistics computed from full dataset
+
+  short_wave:
+    Type: float32
+    Shape: (1, 239734)
+    Dimensions: ['time', 'node']
+    Size: 0.91 MB
+    Range: 0.524891 to 23.7618
+    Mean: 6.63434
+    Std Dev: 4.53685
+    Note: Statistics computed from full dataset
+
+  net_heat_flux:
+    Type: float32
+    Shape: (1, 239734)
+    Dimensions: ['time', 'node']
+    Size: 0.91 MB
+    Range: -402.97 to 58.0657
+    Mean: -12.85
+    Std Dev: 26.6077
+    Note: Statistics computed from full dataset
+
+  sensible_heat_flux:
+    Type: float32
+    Shape: (1, 239734)
+    Dimensions: ['time', 'node']
+    Size: 0.91 MB
+    Range: -93.7356 to 25.0786
+    Mean: -0.768708
+    Std Dev: 5.80406
+    Note: Statistics computed from full dataset
+
+  latent_heat_flux:
+    Type: float32
+    Shape: (1, 239734)
+    Dimensions: ['time', 'node']
+    Size: 0.91 MB
+    Range: -198.839 to 15.3783
+    Mean: -9.24573
+    Std Dev: 10.1515
+    Note: Statistics computed from full dataset
+
+  long_wave:
+    Type: float32
+    Shape: (1, 239734)
+    Dimensions: ['time', 'node']
+    Size: 0.91 MB
+    Range: -125.994 to 48.2584
+    Mean: -9.46989
+    Std Dev: 20.9048
+    Note: Statistics computed from full dataset
+
+  uwind_speed:
+    Type: float32
+    Shape: (1, 433410)
+    Dimensions: ['time', 'nele']
+    Size: 1.65 MB
+    Range: -6.07004 to 7.84326
+    Mean: -0.239339
+    Std Dev: 1.6192
+    Note: Statistics computed from full dataset
+
+  vwind_speed:
+    Type: float32
+    Shape: (1, 433410)
+    Dimensions: ['time', 'nele']
+    Size: 1.65 MB
+    Range: -5.43761 to 6.72392
+    Mean: 1.81119
+    Std Dev: 1.39615
+    Note: Statistics computed from full dataset
+
+  atmos_press:
+    Type: float32
+    Shape: (1, 239734)
+    Dimensions: ['time', 'node']
+    Size: 0.91 MB
+    Range: 101610 to 102224
+    Mean: 102009
+    Std Dev: 117.877
+    Note: Statistics computed from full dataset
+
+  wet_nodes:
+    Type: int32
+    Shape: (1, 239734)
+    Dimensions: ['time', 'node']
+    Size: 0.91 MB
+    Range: 0 to 1
+    Mean: 0.98339
+    Std Dev: 0.127805
+    Note: Statistics computed from full dataset
+
+  wet_cells:
+    Type: int32
+    Shape: (1, 433410)
+    Dimensions: ['time', 'nele']
+    Size: 1.65 MB
+    Range: 0 to 1
+    Mean: 0.978791
+    Std Dev: 0.144079
+    Note: Statistics computed from full dataset
+
+  wet_nodes_prev_int:
+    Type: int32
+    Shape: (1, 239734)
+    Dimensions: ['time', 'node']
+    Size: 0.91 MB
+    Range: 0 to 1
+    Mean: 0.98339
+    Std Dev: 0.127805
+    Note: Statistics computed from full dataset
+
+  wet_cells_prev_int:
+    Type: int32
+    Shape: (1, 433410)
+    Dimensions: ['time', 'nele']
+    Size: 1.65 MB
+    Range: 0 to 1
+    Mean: 0.978791
+    Std Dev: 0.144079
+    Note: Statistics computed from full dataset
+
+  wet_cells_prev_ext:
+    Type: int32
+    Shape: (1, 433410)
+    Dimensions: ['time', 'nele']
+    Size: 1.65 MB
+    Range: 0 to 1
+    Mean: 0.978791
+    Std Dev: 0.144079
+    Note: Statistics computed from full dataset
+
+  inundation_cells:
+    Type: int32
+    Shape: (1, 433410)
+    Dimensions: ['time', 'nele']
+    Size: 1.65 MB
+    Range: 0 to 1
+    Mean: 0.0096929
+    Std Dev: 0.0979742
+    Note: Statistics computed from full dataset
+
+================================================================================
