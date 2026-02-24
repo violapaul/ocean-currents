@@ -1,0 +1,2296 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  
+  <!-- PWA meta tags for full screen -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Ocean Currents - Mobile</title>
+  
+  <!-- PWA Manifest -->
+  <link rel="manifest" href="manifest.json">
+  
+  <!-- Favicon for browser tab -->
+  <link rel="icon" type="image/svg+xml" href="app-icon.svg">
+  
+  <!-- Apple Touch Icon (must be PNG for iOS) -->
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  
+  <!-- Theme color for browser chrome -->
+  <meta name="theme-color" content="#0077be">
+  
+  <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    html, body, .app-wrapper {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      /* Prevent text selection and touch callouts */
+      -webkit-user-select: none;
+      -moz-user-select: none;
+      -ms-user-select: none;
+      user-select: none;
+      -webkit-touch-callout: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    html {
+      height: 100%;
+      /* This is critical for iOS PWA full screen */
+      height: -webkit-fill-available;
+    }
+    
+    body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, sans-serif;
+      /* Prevent bounce scrolling on iOS */
+      overscroll-behavior: none;
+      -webkit-overflow-scrolling: touch;
+    }
+    
+    /* App wrapper fills viewport exactly - simplified */
+    .app-wrapper {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+    
+    #map {
+      position: fixed;
+      left: 0;
+      right: 0;
+      width: 100%;
+      /* Map extends edge to edge for maximum coverage */
+      top: 0;  /* Map goes under header */
+      bottom: 0;  /* Map extends all the way to bottom */
+      z-index: 1;
+    }
+    
+    /* Top header with time display - floats over map */
+    .header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 28px;
+      /* Support safe area for notch */
+      padding-top: env(safe-area-inset-top, 0px);
+      background: rgba(255, 255, 255, 0.95);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      padding-left: 12px;
+      padding-right: 210px; /* Make room for tide chart */
+      z-index: 10;
+    }
+    
+    .time-display {
+      font-size: 13px;
+      color: #222;
+      text-align: left;
+      font-weight: 500;
+    }
+    
+    .model-time {
+      color: #666;
+      font-weight: normal;
+    }
+    
+    /* Bottom slider control - transparent, floats over map */
+    .slider-container {
+      position: fixed;
+      bottom: env(safe-area-inset-bottom, 0px);  /* Positioned above safe area */
+      left: 0;
+      right: 0;
+      width: 100%;
+      height: 42px;
+      background: transparent;  /* No background */
+      padding: 4px 50px 0 50px;  /* More padding for buttons */
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-sizing: border-box;
+    }
+    
+    /* Hour adjustment buttons */
+    .hour-btn {
+      position: absolute;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 32px;
+      height: 32px;
+      border-radius: 16px;
+      background: #0066cc;
+      color: white;
+      border: 2px solid white;  /* White border for contrast */
+      font-size: 16px;
+      font-weight: bold;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3), 0 0 0 1px rgba(0,0,0,0.1);  /* Enhanced shadow */
+      transition: background 0.2s;
+      z-index: 3;
+    }
+    
+    .hour-btn:active {
+      background: #0052a3;
+    }
+    
+    .hour-btn.prev {
+      left: 10px;
+    }
+    
+    .hour-btn.next {
+      right: 10px;
+    }
+    
+    .slider-label {
+      position: fixed;
+      bottom: max(5px, calc(env(safe-area-inset-bottom, 0px) - 20px));  /* Below slider, but visible */
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 10px;
+      color: #333;
+      font-weight: 500;
+      text-align: center;
+      white-space: nowrap;
+      z-index: 9;  /* Below slider container */
+      background: rgba(255, 255, 255, 0.95);
+      border: 1px solid white;
+      padding: 1px 6px;
+      border-radius: 3px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    
+    .version-label {
+      position: fixed;
+      top: calc(5px + env(safe-area-inset-top, 0px));  /* Top right, accounting for safe area */
+      right: 5px;  /* Over the tide chart */
+      font-size: 9px;
+      color: #666;
+      font-weight: 500;
+      z-index: 11;  /* Above tide chart */
+      background: rgba(255, 255, 255, 0.95);
+      border: 1px solid white;
+      padding: 1px 4px;
+      border-radius: 2px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+    }
+    
+    .time-slider {
+      width: 100%;
+      height: 35px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: transparent;
+      outline: none;
+    }
+    
+    .time-slider::-webkit-slider-track {
+      width: 100%;
+      height: 6px;
+      background: rgba(224, 224, 224, 0.9);
+      border: 1px solid white;  /* White border for contrast */
+      border-radius: 3px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    
+    .time-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 24px;
+      height: 24px;
+      background: #0066cc;
+      border: 2px solid white;  /* White border for contrast */
+      border-radius: 50%;
+      cursor: pointer;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3), 0 0 0 1px rgba(0,0,0,0.1);
+    }
+    
+    .time-slider::-moz-range-track {
+      width: 100%;
+      height: 6px;
+      background: rgba(224, 224, 224, 0.9);
+      border: 1px solid white;  /* White border for contrast */
+      border-radius: 3px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    
+    .time-slider::-moz-range-thumb {
+      width: 24px;
+      height: 24px;
+      background: #0066cc;
+      border: 2px solid white;  /* White border for contrast */
+      border-radius: 50%;
+      cursor: pointer;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3), 0 0 0 1px rgba(0,0,0,0.1);
+    }
+    
+    /* Loading indicator */
+    .loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(255, 255, 255, 0.95);
+      padding: 15px 25px;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      z-index: 100;
+      font-size: 14px;
+      color: #666;
+    }
+    
+    .loading.hidden {
+      display: none;
+    }
+    
+    /* Current magnitude marker */
+    .magnitude-marker {
+      position: absolute;
+      pointer-events: none;
+      z-index: 50;
+      transform: translate(-50%, -50%);
+    }
+    
+    .magnitude-cross {
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+    }
+    
+    .magnitude-cross::before,
+    .magnitude-cross::after {
+      content: '';
+      position: absolute;
+      background: #ff0000;
+    }
+    
+    .magnitude-cross::before {
+      width: 2px;
+      height: 20px;
+      left: 9px;
+      top: 0;
+    }
+    
+    .magnitude-cross::after {
+      width: 20px;
+      height: 2px;
+      left: 0;
+      top: 9px;
+    }
+    
+    .magnitude-value {
+      position: absolute;
+      top: -8px;
+      left: 15px;
+      color: #ff0000;
+      font-size: 14px;
+      font-weight: bold;
+      text-shadow: 
+        -1px -1px 0 #fff,
+        1px -1px 0 #fff,
+        -1px 1px 0 #fff,
+        1px 1px 0 #fff,
+        0 0 2px #fff;
+      white-space: nowrap;
+    }
+    
+    /* Tide chart - floats over map */
+    .tide-chart {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 200px;
+      height: 100px;
+      background: rgba(255, 255, 255, 0.95);
+      border-radius: 0 0 0 6px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+      padding: 4px;
+      z-index: 10;
+      /* Account for safe area */
+      padding-top: calc(4px + env(safe-area-inset-top, 0px));
+    }
+    
+    .tide-chart-title {
+      font-size: 10px;
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 2px;
+    }
+    
+    .tide-chart-canvas {
+      width: 100%;
+      height: 80px;
+      position: relative;
+    }
+    
+    .tide-chart-svg {
+      width: 100%;
+      height: 100%;
+    }
+    
+    .tide-current-line {
+      stroke: #ff0000;
+      stroke-width: 1.5;
+      stroke-dasharray: 2,2;
+      opacity: 0.7;
+    }
+    
+    .tide-curve {
+      fill: none;
+      stroke: #0077be;
+      stroke-width: 2;
+    }
+    
+    .tide-area {
+      fill: #0077be;
+      opacity: 0.15;
+    }
+    
+    .tide-label {
+      font-size: 9px;
+      fill: #666;
+    }
+    
+    .tide-loading {
+      font-size: 10px;
+      color: #999;
+      text-align: center;
+      padding-top: 25px;
+    }
+    
+    .tide-error {
+      font-size: 10px;
+      color: #cc0000;
+      text-align: center;
+      padding-top: 20px;
+    }
+    
+    /* Adjust tide chart for very small screens */
+    @media (max-width: 360px) {
+      .tide-chart {
+        width: 160px;  /* Slightly smaller but still visible */
+        height: 90px;
+        font-size: 9px;  /* Slightly smaller text */
+      }
+      .tide-chart-title {
+        font-size: 9px;
+      }
+      .tide-chart-canvas {
+        height: 70px;
+      }
+      .header {
+        padding-right: 170px;  /* Make room for smaller tide chart */
+      }
+    }
+    
+    /* Ultra-compact for extremely narrow viewports (< 320px) */
+    @media (max-width: 320px) {
+      .tide-chart {
+        width: 140px;  /* Even smaller but always visible */
+        height: 80px;
+      }
+      .tide-chart-canvas {
+        height: 60px;
+      }
+      .header {
+        padding-right: 150px;
+        font-size: 12px;
+      }
+    }
+    
+  </style>
+</head>
+<body>
+  <div class="app-wrapper">
+    <div class="header">
+      <div class="time-display" id="time-display">
+        <span id="forecast-time">--</span>
+      </div>
+    </div>
+    
+    <div id="map"></div>
+    <canvas id="currents-canvas" style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2;"></canvas>
+    
+    <!-- Tide chart -->
+    <div class="tide-chart" id="tide-chart">
+      <div class="tide-chart-title">Seattle Tides</div>
+      <div class="tide-chart-canvas" id="tide-canvas">
+        <div class="tide-loading">Loading tides...</div>
+      </div>
+    </div>
+    
+    <div class="slider-container">
+      <button class="hour-btn prev" id="hour-prev" aria-label="Previous hour">−1</button>
+      <div class="slider-label" id="slider-label">Drag to change time</div>
+      <div class="version-label" id="version-label"></div>
+      <input type="range" class="time-slider" id="time-slider" min="0" max="72" value="0" step="1">
+      <button class="hour-btn next" id="hour-next" aria-label="Next hour">+1</button>
+    </div>
+    
+    <div class="loading" id="loading">Searching for model data...</div>
+    
+    <!-- Magnitude marker (hidden by default) -->
+    <div class="magnitude-marker" id="magnitude-marker" style="display: none;">
+      <div class="magnitude-cross"></div>
+      <div class="magnitude-value" id="magnitude-value">0.0</div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+  <script>
+    // Register service worker for offline support
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./service-worker.js')
+        .then(reg => console.log('Service Worker registered'))
+        .catch(err => console.warn('Service Worker registration failed:', err));
+    }
+    
+    // Simple production logging - errors only by default
+    const IS_DEBUG = new URLSearchParams(location.search).has('debug');
+    
+    const logger = {
+      error: console.error,
+      warn: IS_DEBUG ? console.warn : () => {},
+      info: IS_DEBUG ? console.info : () => {},
+      debug: IS_DEBUG ? console.log : () => {},
+    };
+    
+    // ========== CONFIGURATION ==========
+    const CONFIG = {
+      APP_VERSION: 'v2.0.0', // Self-hosted current data with Canvas rendering
+      PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
+      CENTER: [-122.3321, 47.6062], // Seattle
+      ZOOM: 10,
+      SSCOFS_CYCLES: [0, 3, 9, 15, 21],
+      TIDE_STATION_ID: '9447130', // Seattle
+      TILE_MIN_SIZE: 5000,
+      MAX_FORECAST_HOURS: 72,
+      // Self-hosted current data (Canvas rendering)
+      CURRENT_DATA_URL: location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+        ? `${location.origin}/Python_SSCOFS/current_data`
+        : 'https://ocean-currents-proxy.violapaul.workers.dev/current-data',
+      USE_CANVAS_RENDERER: true,
+    };
+    
+    const PROXY_BASE = `${CONFIG.PROXY_HOST}/tiles/eis-live`;
+    
+    // ========== APPLICATION STATE ==========
+    const state = {
+      currentModelInfo: null,
+      isUpdating: false,
+      modelAvailability: [],
+      magnitudeMarker: null,
+      tideData: null,
+      currentDisplayTime: null,
+      isOffline: false,
+      isStaleData: false,
+      staleModelStart: null,
+      // Canvas renderer state
+      canvasRenderer: null,
+      useCanvasRenderer: false,
+    };
+    
+    // ========== CANVAS CURRENT RENDERER ==========
+    
+    class CurrentDataRenderer {
+      constructor(mapInstance) {
+        this.map = mapInstance;
+        this.canvas = document.getElementById('currents-canvas');
+        this.ctx = this.canvas.getContext('2d');
+        this.geometry = null;    // Float32Array [lon0,lat0,lon1,lat1,...]
+        this.numElements = 0;
+        this.manifest = null;
+        this.velocityCache = {};  // hour -> Float32Array [u0,v0,u1,v1,...]
+        this.currentHour = -1;
+        this.currentVelocity = null;
+        this.spatialIndex = null; // { cellSize, cols, rows, cells: Map<cellKey, [indices]> }
+        this._renderScheduled = false;
+        this._boundRender = () => this._doRender();
+      }
+      
+      async initialize(baseUrl) {
+        logger.info('Canvas renderer: initializing from', baseUrl);
+        
+        // Fetch latest.json to find current model run
+        const latestResp = await fetch(`${baseUrl}/latest.json`);
+        if (!latestResp.ok) throw new Error(`latest.json: HTTP ${latestResp.status}`);
+        const latest = await latestResp.json();
+        const runTag = latest.run;
+        this.runUrl = `${baseUrl}/${runTag}`;
+        logger.info(`Canvas renderer: using run ${runTag}`);
+        
+        // Fetch manifest
+        const manifestResp = await fetch(`${this.runUrl}/manifest.json`);
+        if (!manifestResp.ok) throw new Error(`manifest.json: HTTP ${manifestResp.status}`);
+        this.manifest = await manifestResp.json();
+        this.numElements = this.manifest.num_elements;
+        logger.info(`Canvas renderer: ${this.numElements.toLocaleString()} elements, ${this.manifest.forecast_hours.length} hours`);
+        
+        // Fetch geometry (gzipped Float32)
+        const geomResp = await fetch(`${this.runUrl}/geometry.bin`);
+        if (!geomResp.ok) throw new Error(`geometry.bin: HTTP ${geomResp.status}`);
+        const geomBuf = await this._decompressResponse(geomResp);
+        this.geometry = new Float32Array(geomBuf);
+        
+        if (this.geometry.length !== this.numElements * 2) {
+          logger.warn(`Geometry size mismatch: got ${this.geometry.length/2} elements, expected ${this.numElements}`);
+          this.numElements = this.geometry.length / 2;
+        }
+        
+        // Build spatial index
+        this._buildSpatialIndex();
+        
+        // Size canvas to device pixels
+        this._resizeCanvas();
+        
+        // Listen for map events
+        this.map.on('move', () => this.scheduleRender());
+        this.map.on('zoom', () => this.scheduleRender());
+        this.map.on('resize', () => { this._resizeCanvas(); this.scheduleRender(); });
+        window.addEventListener('resize', () => { this._resizeCanvas(); this.scheduleRender(); });
+        
+        return this.manifest;
+      }
+      
+      async _decompressResponse(resp) {
+        const raw = await resp.arrayBuffer();
+        // Check if gzip-compressed (magic bytes 0x1f 0x8b)
+        const header = new Uint8Array(raw, 0, 2);
+        if (header[0] === 0x1f && header[1] === 0x8b) {
+          const ds = new DecompressionStream('gzip');
+          const writer = ds.writable.getWriter();
+          writer.write(raw);
+          writer.close();
+          const reader = ds.readable.getReader();
+          const chunks = [];
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+          }
+          let totalLen = 0;
+          for (const c of chunks) totalLen += c.byteLength;
+          const result = new Uint8Array(totalLen);
+          let offset = 0;
+          for (const c of chunks) {
+            result.set(new Uint8Array(c.buffer || c), offset);
+            offset += c.byteLength;
+          }
+          return result.buffer;
+        }
+        return raw;
+      }
+      
+      _resizeCanvas() {
+        const dpr = window.devicePixelRatio || 1;
+        this.canvas.width = this.canvas.clientWidth * dpr;
+        this.canvas.height = this.canvas.clientHeight * dpr;
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+      
+      _buildSpatialIndex() {
+        const bounds = this.manifest.bounds;
+        const cellSize = 0.05; // ~5km cells
+        const cols = Math.ceil((bounds.lon_max - bounds.lon_min) / cellSize);
+        const rows = Math.ceil((bounds.lat_max - bounds.lat_min) / cellSize);
+        const cells = new Map();
+        
+        for (let i = 0; i < this.numElements; i++) {
+          const lon = this.geometry[i * 2];
+          const lat = this.geometry[i * 2 + 1];
+          const col = Math.floor((lon - bounds.lon_min) / cellSize);
+          const row = Math.floor((lat - bounds.lat_min) / cellSize);
+          const key = row * cols + col;
+          if (!cells.has(key)) cells.set(key, []);
+          cells.get(key).push(i);
+        }
+        
+        this.spatialIndex = { cellSize, cols, rows, cells, bounds };
+        logger.info(`Spatial index: ${cols}x${rows} grid, ${cells.size} non-empty cells`);
+      }
+      
+      async _prefetchHour(hour) {
+        if (this.velocityCache[hour]) return;
+        try {
+          const fname = `f${String(hour).padStart(3, '0')}.bin`;
+          const resp = await fetch(`${this.runUrl}/${fname}`);
+          if (!resp.ok) return;
+          const buf = await this._decompressResponse(resp);
+          const f16 = new Uint16Array(buf);
+          const f32 = new Float32Array(f16.length);
+          for (let i = 0; i < f16.length; i++) f32[i] = this._float16ToFloat32(f16[i]);
+          this.velocityCache[hour] = f32;
+        } catch(e) { /* ignore prefetch failures */ }
+      }
+      
+      async loadHour(hour) {
+        if (this.velocityCache[hour]) {
+          this.currentVelocity = this.velocityCache[hour];
+          this.currentHour = hour;
+          this.scheduleRender();
+          return;
+        }
+        
+        const fname = `f${String(hour).padStart(3, '0')}.bin`;
+        const resp = await fetch(`${this.runUrl}/${fname}`);
+        if (!resp.ok) throw new Error(`${fname}: HTTP ${resp.status}`);
+        const buf = await this._decompressResponse(resp);
+        
+        // Convert Float16 to Float32
+        const f16 = new Uint16Array(buf);
+        const f32 = new Float32Array(f16.length);
+        for (let i = 0; i < f16.length; i++) {
+          f32[i] = this._float16ToFloat32(f16[i]);
+        }
+        
+        this.velocityCache[hour] = f32;
+        this.currentVelocity = f32;
+        this.currentHour = hour;
+        this.scheduleRender();
+      }
+      
+      _float16ToFloat32(h) {
+        const sign = (h >> 15) & 1;
+        const exp = (h >> 10) & 0x1f;
+        const frac = h & 0x3ff;
+        if (exp === 0) {
+          if (frac === 0) return sign ? -0 : 0;
+          // Subnormal
+          let val = frac / 1024;
+          return (sign ? -1 : 1) * val * Math.pow(2, -14);
+        }
+        if (exp === 31) {
+          return frac === 0 ? (sign ? -Infinity : Infinity) : NaN;
+        }
+        return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
+      }
+      
+      scheduleRender() {
+        if (!this._renderScheduled) {
+          this._renderScheduled = true;
+          requestAnimationFrame(this._boundRender);
+        }
+      }
+      
+      _doRender() {
+        this._renderScheduled = false;
+        if (!this.currentVelocity || !this.geometry) return;
+        
+        // Lazily build a 256-entry color LUT on first render
+        // Scale: basemap water → saturated blue → cyan → green → yellow → orange → red
+        // Key: quick saturation increase at low speeds, then clear hue progression
+        if (!this._colorStrings) {
+          const stops = [
+            [0.00, 170, 211, 223],  // basemap water (no current)
+            [0.10,  50, 110, 210],  // saturated blue (obvious change)
+            [0.25,  20, 170, 220],  // cyan
+            [0.40,  20, 190, 110],  // teal
+            [0.55,  60, 195,  45],  // green
+            [0.70, 210, 195,  35],  // yellow
+            [0.85, 245, 115,  30],  // orange
+            [1.00, 215,  45,  45],  // red (3+ knots)
+          ];
+          this._colorStrings = new Array(256);
+          this._colorRGB = new Array(256);
+          for (let i = 0; i < 256; i++) {
+            const t = i / 255;
+            let stopIdx = 0;
+            while (stopIdx < stops.length - 2 && t > stops[stopIdx + 1][0]) stopIdx++;
+            const frac = (t - stops[stopIdx][0]) / (stops[stopIdx + 1][0] - stops[stopIdx][0]);
+            const r = Math.round(stops[stopIdx][1] + frac * (stops[stopIdx + 1][1] - stops[stopIdx][1]));
+            const g = Math.round(stops[stopIdx][2] + frac * (stops[stopIdx + 1][2] - stops[stopIdx][2]));
+            const b = Math.round(stops[stopIdx][3] + frac * (stops[stopIdx + 1][3] - stops[stopIdx][3]));
+            this._colorStrings[i] = `rgb(${r},${g},${b})`;
+            this._colorRGB[i] = [r, g, b];
+          }
+        }
+        
+        const ctx = this.ctx;
+        const w = this.canvas.clientWidth;
+        const h = this.canvas.clientHeight;
+        ctx.clearRect(0, 0, w, h);
+        
+        const zoom = this.map.getZoom();
+        const mapBounds = this.map.getBounds();
+        const vLonMin = mapBounds.getWest();
+        const vLonMax = mapBounds.getEast();
+        const vLatMin = mapBounds.getSouth();
+        const vLatMax = mapBounds.getNorth();
+        
+        // Precompute Mercator projection to avoid expensive per-element map.project() calls.
+        // Falls back to map.project() when bearing/pitch are active.
+        const center = this.map.getCenter();
+        const useFastProj = Math.abs(this.map.getBearing()) < 0.01 && Math.abs(this.map.getPitch()) < 0.01;
+        const worldSize = 512 * Math.pow(2, zoom);
+        const DEG2RAD = Math.PI / 180;
+        const PI = Math.PI;
+        const lngScale = worldSize / 360;
+        const centerPxX = (center.lng + 180) * lngScale;
+        const cLatRad = center.lat * DEG2RAD;
+        const centerPxY = (1 - Math.log(Math.tan(cLatRad) + 1 / Math.cos(cLatRad)) / PI) * 0.5 * worldSize;
+        const halfW = w * 0.5;
+        const halfH = h * 0.5;
+        
+        // Determine which spatial index cells overlap the viewport
+        const si = this.spatialIndex;
+        const colMin = Math.max(0, Math.floor((vLonMin - si.bounds.lon_min) / si.cellSize));
+        const colMax = Math.min(si.cols - 1, Math.floor((vLonMax - si.bounds.lon_min) / si.cellSize));
+        const rowMin = Math.max(0, Math.floor((vLatMin - si.bounds.lat_min) / si.cellSize));
+        const rowMax = Math.min(si.rows - 1, Math.floor((vLatMax - si.bounds.lat_min) / si.cellSize));
+        
+        // Count visible elements for adaptive density control
+        let totalVisible = 0;
+        for (let row = rowMin; row <= rowMax; row++) {
+          for (let col = colMin; col <= colMax; col++) {
+            const key = row * si.cols + col;
+            const indices = si.cells.get(key);
+            if (indices) totalVisible += indices.length;
+          }
+        }
+        
+        // Screen grid for consistent arrow density at all zoom levels
+        // Divide screen into fixed-size cells, one arrow per cell max
+        const arrowSpacing = 30;  // pixels between arrows
+        const gridCols = Math.ceil(w / arrowSpacing);
+        const gridRows = Math.ceil(h / arrowSpacing);
+        const gridSize = gridCols * gridRows;
+        
+        // Arrow size scaling based on zoom
+        const arrowScale = Math.min(2.0, Math.max(0.5, (zoom - 8) * 0.25 + 0.5));
+        const baseLen = 12 * arrowScale;
+        
+        // Precompute arrowhead trig constants (half-angle = 0.45 rad ≈ 26°)
+        const cosHA = Math.cos(0.45);
+        const sinHA = Math.sin(0.45);
+        
+        const vel = this.currentVelocity;
+        const geom = this.geometry;
+        const colors = this._colorStrings;
+        const colorsRGB = this._colorRGB;
+        let drawn = 0;
+        
+        ctx.lineCap = 'round';
+        
+        // === HEATMAP PASS: Draw colored dots for ALL visible elements ===
+        // Dot radius must scale EXPONENTIALLY with zoom (screen distance doubles per zoom level).
+        // At zoom 10, grid points are ~2px apart. Radius scales as 2^(zoom-10).
+        const dotRadius = Math.max(1.5, Math.min(60, 1.8 * Math.pow(2, zoom - 10)));
+        ctx.globalAlpha = 0.55;
+        
+        for (let row = rowMin; row <= rowMax; row++) {
+          for (let col = colMin; col <= colMax; col++) {
+            const key = row * si.cols + col;
+            const indices = si.cells.get(key);
+            if (!indices) continue;
+            
+            for (let ii = 0; ii < indices.length; ii++) {
+              const idx = indices[ii];
+              const u = vel[idx * 2];
+              const v = vel[idx * 2 + 1];
+              const speed = Math.sqrt(u * u + v * v);
+              if (speed < 0.001) continue;
+              
+              const lon = geom[idx * 2];
+              const lat = geom[idx * 2 + 1];
+              
+              let sx, sy;
+              if (useFastProj) {
+                const pxX = (lon + 180) * lngScale;
+                const latRad = lat * DEG2RAD;
+                const pxY = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * worldSize;
+                sx = pxX - centerPxX + halfW;
+                sy = pxY - centerPxY + halfH;
+              } else {
+                const pt = this.map.project([lon, lat]);
+                sx = pt.x;
+                sy = pt.y;
+              }
+              
+              if (sx < -dotRadius || sx > w + dotRadius || sy < -dotRadius || sy > h + dotRadius) continue;
+              
+              const speedKnots = speed * 1.94384;
+              const ci = Math.min(255, Math.round(Math.min(speedKnots / 3.0, 1.0) * 255));
+              const rgb = colorsRGB[ci];
+              
+              ctx.beginPath();
+              ctx.arc(sx, sy, dotRadius, 0, 6.283185307);
+              ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+              ctx.fill();
+            }
+          }
+        }
+        
+        ctx.globalAlpha = 1.0;
+        
+        // === ARROW PASS: Grid-based sampling for uniform density ===
+        // Each screen grid cell gets at most one arrow (the highest speed element in that cell)
+        const arrowGrid = new Float32Array(gridSize * 5);  // [sx, sy, nx, ny, speed] per cell
+        for (let i = 0; i < gridSize; i++) arrowGrid[i * 5 + 4] = -1;  // mark empty
+        
+        for (let row = rowMin; row <= rowMax; row++) {
+          for (let col = colMin; col <= colMax; col++) {
+            const key = row * si.cols + col;
+            const indices = si.cells.get(key);
+            if (!indices) continue;
+            
+            for (let ii = 0; ii < indices.length; ii++) {
+              const idx = indices[ii];
+              const u = vel[idx * 2];
+              const v = vel[idx * 2 + 1];
+              const speed = Math.sqrt(u * u + v * v);
+              if (speed < 0.001) continue;
+              
+              const lon = geom[idx * 2];
+              const lat = geom[idx * 2 + 1];
+              
+              let sx, sy;
+              if (useFastProj) {
+                const pxX = (lon + 180) * lngScale;
+                const latRad = lat * DEG2RAD;
+                const pxY = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * worldSize;
+                sx = pxX - centerPxX + halfW;
+                sy = pxY - centerPxY + halfH;
+              } else {
+                const pt = this.map.project([lon, lat]);
+                sx = pt.x;
+                sy = pt.y;
+              }
+              
+              if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+              
+              // Determine which screen grid cell this element belongs to
+              const gc = Math.floor(sx / arrowSpacing);
+              const gr = Math.floor(sy / arrowSpacing);
+              const gi = gr * gridCols + gc;
+              
+              // Keep the highest speed element per grid cell
+              if (speed > arrowGrid[gi * 5 + 4]) {
+                const invSpd = 1 / speed;
+                arrowGrid[gi * 5 + 0] = sx;
+                arrowGrid[gi * 5 + 1] = sy;
+                arrowGrid[gi * 5 + 2] = u * invSpd;
+                arrowGrid[gi * 5 + 3] = -v * invSpd;
+                arrowGrid[gi * 5 + 4] = speed;
+              }
+            }
+          }
+        }
+        
+        // Draw one arrow per occupied grid cell
+        for (let gi = 0; gi < gridSize; gi++) {
+          const speed = arrowGrid[gi * 5 + 4];
+          if (speed < 0) continue;
+          this._drawArrow(ctx,
+            arrowGrid[gi * 5 + 0], arrowGrid[gi * 5 + 1],
+            arrowGrid[gi * 5 + 2], arrowGrid[gi * 5 + 3],
+            speed, baseLen, colors, cosHA, sinHA);
+          drawn++;
+        }
+        
+        if (IS_DEBUG) {
+          logger.debug(`Rendered ${drawn.toLocaleString()} arrows at z${zoom.toFixed(1)}, grid=${gridCols}x${gridRows}, visible=${totalVisible.toLocaleString()}`);
+        }
+      }
+      
+      _drawArrow(ctx, x, y, nx, ny, speed, baseLen, colors, cosHA, sinHA) {
+        const len = baseLen;  // Fixed length - speed shown via heatmap color
+        
+        const dx = nx * len;
+        const dy = ny * len;
+        const x0 = x - dx * 0.5;
+        const y0 = y - dy * 0.5;
+        const tipX = x + dx * 0.5;
+        const tipY = y + dy * 0.5;
+        const lineW = Math.max(1.5, len * 0.1);
+        
+        // Shaft: white halo then black stroke
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(tipX, tipY);
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+        ctx.lineWidth = lineW + 1.5;
+        ctx.stroke();
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = lineW;
+        ctx.stroke();
+        
+        // Arrowhead using precomputed trig (larger: 0.4 head length)
+        const headLen = len * 0.4;
+        ctx.beginPath();
+        ctx.moveTo(tipX, tipY);
+        ctx.lineTo(
+          tipX - headLen * (nx * cosHA + ny * sinHA),
+          tipY - headLen * (ny * cosHA - nx * sinHA)
+        );
+        ctx.lineTo(
+          tipX - headLen * (nx * cosHA - ny * sinHA),
+          tipY - headLen * (ny * cosHA + nx * sinHA)
+        );
+        ctx.closePath();
+        ctx.fillStyle = '#000';
+        ctx.fill();
+      }
+      
+      getNearestCurrent(lng, lat) {
+        if (!this.currentVelocity || !this.geometry) return null;
+        
+        let bestDist = Infinity;
+        let bestIdx = -1;
+        const geom = this.geometry;
+        
+        // Search nearby spatial index cells
+        const si = this.spatialIndex;
+        const col = Math.floor((lng - si.bounds.lon_min) / si.cellSize);
+        const row = Math.floor((lat - si.bounds.lat_min) / si.cellSize);
+        
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            const r = row + dr, c = col + dc;
+            if (r < 0 || r >= si.rows || c < 0 || c >= si.cols) continue;
+            const key = r * si.cols + c;
+            const indices = si.cells.get(key);
+            if (!indices) continue;
+            for (const idx of indices) {
+              const dlon = (geom[idx * 2] - lng) * Math.cos(lat * Math.PI / 180);
+              const dlat = geom[idx * 2 + 1] - lat;
+              const dist = dlon * dlon + dlat * dlat;
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestIdx = idx;
+              }
+            }
+          }
+        }
+        
+        if (bestIdx < 0) return null;
+        const vel = this.currentVelocity;
+        const u = vel[bestIdx * 2];
+        const v = vel[bestIdx * 2 + 1];
+        const speed = Math.sqrt(u * u + v * v);
+        return { speed, speedKnots: speed * 1.94384, u, v, distDeg: Math.sqrt(bestDist) };
+      }
+      
+      hide() {
+        this.canvas.style.display = 'none';
+      }
+      
+      show() {
+        this.canvas.style.display = 'block';
+        this.scheduleRender();
+      }
+    }
+    
+    // ========== MODEL FUNCTIONS ==========
+    
+    function getLatestCycle(utcDate) {
+      const date = new Date(utcDate);
+      const hour = date.getUTCHours();
+      
+      for (let i = CONFIG.SSCOFS_CYCLES.length - 1; i >= 0; i--) {
+        if (hour >= CONFIG.SSCOFS_CYCLES[i]) {
+          return {
+            date: new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())),
+            cycle: CONFIG.SSCOFS_CYCLES[i]
+          };
+        }
+      }
+      
+      const prevDate = new Date(date);
+      prevDate.setUTCDate(prevDate.getUTCDate() - 1);
+      return {
+        date: new Date(Date.UTC(prevDate.getUTCFullYear(), prevDate.getUTCMonth(), prevDate.getUTCDate())),
+        cycle: CONFIG.SSCOFS_CYCLES[CONFIG.SSCOFS_CYCLES.length - 1]
+      };
+    }
+    
+    function calculateForecastHour(cycleDate, cycleHour, targetDate) {
+      const cycleStart = new Date(cycleDate);
+      cycleStart.setUTCHours(cycleHour, 0, 0, 0);
+      const hoursDiff = (targetDate - cycleStart) / (1000 * 60 * 60);
+      return Math.max(0, Math.min(CONFIG.MAX_FORECAST_HOURS, Math.round(hoursDiff)));
+    }
+    
+    // ========== UTILITY FUNCTIONS ==========
+    
+    function toIsoUTC(d) {
+      const pad = (n) => String(n).padStart(2, "0");
+      return d.getUTCFullYear() + "-" + 
+             pad(d.getUTCMonth()+1) + "-" + 
+             pad(d.getUTCDate()) + "T" + 
+             pad(d.getUTCHours()) + ":00:00Z";
+    }
+    
+    // ========== TIDE FUNCTIONS ==========
+    
+    // Cache tide data in localStorage with expiration
+    function getTideCacheKey(date) {
+      const d = new Date(date);
+      return `tide_${CONFIG.TIDE_STATION_ID}_${d.getFullYear()}_${d.getMonth()}_${d.getDate()}`;
+    }
+    
+    function getCachedTideData(date) {
+      try {
+        const key = getTideCacheKey(date);
+        const cached = localStorage.getItem(key);
+        if (cached) {
+          const data = JSON.parse(cached);
+          // Check if cache is less than 24 hours old
+          if (Date.now() - data.timestamp < 24 * 60 * 60 * 1000) {
+            // Convert string dates back to Date objects
+            data.tides = data.tides.map(t => ({
+              time: new Date(t.time),
+              height: t.height
+            }));
+            logger.debug('Using cached tide data');
+            return data.tides;
+          }
+        }
+      } catch (e) {
+        logger.warn('Error reading tide cache:', e);
+      }
+      return null;
+    }
+    
+    function cacheTideData(date, tides) {
+      try {
+        const key = getTideCacheKey(date);
+        localStorage.setItem(key, JSON.stringify({
+          timestamp: Date.now(),
+          tides: tides
+        }));
+        
+        // Clean up old cache entries (keep only last 7 days)
+        const cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
+        const keys = Object.keys(localStorage);
+        keys.forEach(k => {
+          if (k.startsWith('tide_')) {
+            try {
+              const data = JSON.parse(localStorage.getItem(k));
+              if (data.timestamp < cutoff) {
+                localStorage.removeItem(k);
+              }
+            } catch (e) {
+              // Invalid entry, remove it
+              localStorage.removeItem(k);
+            }
+          }
+        });
+      } catch (e) {
+        logger.warn('Error caching tide data:', e);
+      }
+    }
+    
+    async function fetchTideData(displayTime) {
+      // Check cache first
+      const cached = getCachedTideData(displayTime);
+      if (cached) {
+        return cached;
+      }
+      
+      // Get start and end of the current day in local time
+      const localDate = new Date(displayTime);
+      const dayStart = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0);
+      const dayEnd = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate() + 1, 0, 0, 0); // Midnight of next day
+      
+      // Fetch data for the full day plus some buffer for interpolation
+      // This ensures we always have complete data for the entire day
+      const startTime = dayStart;
+      const endTime = dayEnd;
+      
+      // Format dates for NOAA API (YYYYMMDD HH:MM)
+      const formatNOAADate = (d) => {
+        const pad = (n) => String(n).padStart(2, "0");
+        return d.getFullYear() + 
+               pad(d.getMonth()+1) + 
+               pad(d.getDate()) + ' ' +
+               pad(d.getHours()) + ':' +
+               pad(d.getMinutes());
+      };
+      
+      // NOAA CO-OPS API for tide predictions
+      const noaaUrl = 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?' +
+        `begin_date=${formatNOAADate(startTime)}&` +
+        `end_date=${formatNOAADate(endTime)}&` +
+        `station=${CONFIG.TIDE_STATION_ID}&` +
+        `product=predictions&` +
+        `datum=MLLW&` +
+        `time_zone=lst_ldt&` +
+        `units=english&` +
+        `interval=6&` + // 6-minute intervals for smooth curve
+        `format=json`;
+      
+      // Always use proxy - NOAA doesn't provide CORS headers either
+      const url = `${CONFIG.PROXY_HOST}/noaa/tides?${noaaUrl.split('?')[1]}`;
+      
+      logger.debug('🌊 Fetching tide data:', url);
+      
+      try {
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (data.predictions && data.predictions.length > 0) {
+          // Convert to simpler format with timestamps
+          const tides = data.predictions.map(p => ({
+            time: new Date(p.t.replace(' ', 'T')),
+            height: parseFloat(p.v)
+          }));
+          
+          logger.info(`🌊 Loaded ${tides.length} tide points`);
+          // Cache the data
+          cacheTideData(displayTime, tides);
+          return tides;
+        }
+      } catch (error) {
+        logger.error('❌ Error fetching tide data:', error);
+        return null;
+      }
+    }
+    
+    function drawTideChart(tides, currentTime) {
+      const canvas = document.getElementById('tide-canvas');
+      
+      if (!tides || tides.length === 0) {
+        canvas.innerHTML = '<div class="tide-error">No tide data</div>';
+        return;
+      }
+      
+      // Get start and end of current day in local time
+      const localDate = new Date(currentTime);
+      const dayStart = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0);
+      const dayEnd = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate() + 1, 0, 0, 0); // Midnight of next day
+      
+      // Filter tides to current day
+      const windowTides = tides.filter(t => 
+        t.time >= dayStart && t.time <= dayEnd
+      );
+      
+      if (windowTides.length === 0) {
+        canvas.innerHTML = '<div class="tide-error">No data for this day</div>';
+        return;
+      }
+      
+      // Calculate position of current time indicator (0-1 range)
+      const dayDuration = dayEnd - dayStart;
+      const currentOffset = currentTime - dayStart;
+      const currentPosition = Math.max(0, Math.min(1, currentOffset / dayDuration));
+      
+      // Find min/max for scaling
+      const heights = windowTides.map(t => t.height);
+      const minHeight = Math.min(...heights);
+      const maxHeight = Math.max(...heights);
+      const heightRange = maxHeight - minHeight;
+      
+      // SVG dimensions
+      const width = 192; // Account for padding
+      const height = 80;
+      const margin = { top: 3, right: 3, bottom: 12, left: 3 };
+      const chartWidth = width - margin.left - margin.right;
+      const chartHeight = height - margin.top - margin.bottom;
+      
+      // Create SVG
+      const svg = `
+        <svg class="tide-chart-svg" viewBox="0 0 ${width} ${height}">
+          <g transform="translate(${margin.left},${margin.top})">
+            <!-- Grid lines -->
+            <line x1="0" y1="${chartHeight/2}" x2="${chartWidth}" y2="${chartHeight/2}" 
+                  stroke="#e0e0e0" stroke-width="0.5"/>
+            
+            <!-- Tide curve area -->
+            <path class="tide-area" d="${
+              'M ' + windowTides.map((t, i) => {
+                const x = (i / (windowTides.length - 1)) * chartWidth;
+                const y = chartHeight - ((t.height - minHeight) / heightRange) * chartHeight;
+                return `${x},${y}`;
+              }).join(' L ') + 
+              ` L ${chartWidth},${chartHeight} L 0,${chartHeight} Z`
+            }"/>
+            
+            <!-- Tide curve line -->
+            <path class="tide-curve" d="${
+              'M ' + windowTides.map((t, i) => {
+                const x = (i / (windowTides.length - 1)) * chartWidth;
+                const y = chartHeight - ((t.height - minHeight) / heightRange) * chartHeight;
+                return `${x},${y}`;
+              }).join(' L ')
+            }"/>
+            
+            <!-- Current time indicator -->
+            <line class="tide-current-line" 
+                  x1="${chartWidth * currentPosition}" y1="0" 
+                  x2="${chartWidth * currentPosition}" y2="${chartHeight}"/>
+            
+            <!-- Labels -->
+            <text x="2" y="${chartHeight + 12}" class="tide-label">12am</text>
+            <text x="${chartWidth/2}" y="${chartHeight + 12}" class="tide-label" text-anchor="middle">12pm</text>
+            <text x="${chartWidth - 2}" y="${chartHeight + 12}" class="tide-label" text-anchor="end">12am</text>
+            
+            <!-- Height labels -->
+            <text x="2" y="10" class="tide-label">${maxHeight.toFixed(1)}ft</text>
+            <text x="2" y="${chartHeight}" class="tide-label">${minHeight.toFixed(1)}ft</text>
+          </g>
+        </svg>
+      `;
+      
+      canvas.innerHTML = svg;
+      
+      // Find the tide height at current time by interpolation
+      let currentHeight = 0;
+      for (let i = 0; i < windowTides.length - 1; i++) {
+        if (currentTime >= windowTides[i].time && currentTime <= windowTides[i + 1].time) {
+          // Linear interpolation between two points
+          const t1 = windowTides[i].time.getTime();
+          const t2 = windowTides[i + 1].time.getTime();
+          const h1 = windowTides[i].height;
+          const h2 = windowTides[i + 1].height;
+          const ratio = (currentTime.getTime() - t1) / (t2 - t1);
+          currentHeight = h1 + (h2 - h1) * ratio;
+          break;
+        }
+      }
+      
+      // Update title with current tide height
+      document.querySelector('.tide-chart-title').textContent = 
+        `Seattle - ${currentHeight.toFixed(1)}ft`;
+    }
+    
+    async function updateTideChart(displayTime) {
+      state.currentDisplayTime = displayTime;
+      
+      // Get the day boundaries for the display time
+      const localDate = new Date(displayTime);
+      const dayStart = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate(), 0, 0, 0);
+      const dayEnd = new Date(localDate.getFullYear(), localDate.getMonth(), localDate.getDate() + 1, 0, 0, 0); // Midnight of next day
+      
+      // Check if we need to fetch new data
+      // We need new data if:
+      // 1. We don't have any data
+      // 2. Our current data doesn't cover the full day we're trying to display
+      const needNewData = !state.tideData || 
+                          state.tideData.length === 0 ||
+                          state.tideData[0].time > dayStart ||
+                          state.tideData[state.tideData.length - 1].time < dayEnd;
+      
+      if (needNewData) {
+        logger.info('🌊 Fetching new tide data for day:', dayStart.toLocaleDateString());
+        state.tideData = await fetchTideData(displayTime);
+      }
+      
+      if (state.tideData) {
+        drawTideChart(state.tideData, displayTime);
+      }
+    }
+    
+    // ========== MAGNITUDE FUNCTIONS ==========
+    
+    async function fetchCurrentMagnitude(lat, lon) {
+      logger.debug('🎯 fetchCurrentMagnitude called:', { lat, lon });
+      
+      if (!state.currentModelInfo) {
+        logger.warn('❌ No model info available');
+        return null;
+      }
+      
+      // Build the time strings for the API
+      const cycleStart = new Date(state.currentModelInfo.cycleDate);
+      cycleStart.setUTCHours(state.currentModelInfo.cycleHour, 0, 0, 0);
+      const startTime = toIsoUTC(cycleStart);
+      const endTime = toIsoUTC(state.currentModelInfo.targetTime);
+      
+      logger.debug('📊 Model info:', {
+        cycleStart: formatTimeLocal(cycleStart),
+        targetTime: formatTimeLocal(state.currentModelInfo.targetTime),
+        startTime,
+        endTime
+      });
+      
+      // Call NVS API through proxy to avoid CORS issues
+      const layer = `salish-currents-vec/${startTime}/${endTime}/Surface`;
+      
+      // Always use proxy - NVS doesn't provide CORS headers
+      const baseUrl = `${CONFIG.PROXY_HOST}/nvs/get_values`;
+      
+      const url = `${baseUrl}?` +
+        `sid=${Math.random()}&` +
+        `layer1=${encodeURIComponent(layer)}&` +
+        `var1=H1_CurrSpeed&` +
+        `num_layers=1&` +
+        `location_mode=interpolate&` +
+        `lat=${lat}&` +
+        `lon=${lon}`;
+      
+      logger.debug('🌐 API URL:', url);
+      logger.debug('🔀 Using proxy:', baseUrl.includes(CONFIG.PROXY_HOST));
+      
+      try {
+        logger.debug('📡 Fetching from NVS API...');
+        const response = await fetch(url);
+        logger.debug('📡 Response status:', response.status);
+        
+        if (!response.ok) {
+          throw new Error(`API returned ${response.status}`);
+        }
+        
+        const data = await response.json();
+        logger.debug('📦 API Response:', data);
+        
+        if (data.success && data.values && data.values.length > 0) {
+          // Convert from m/s to knots (1 m/s = 1.94384 knots)
+          const result = {
+            value: data.values[0].value * 1.94384,
+            direction: data.values[0].direction
+          };
+          logger.debug('✅ Magnitude data (converted to knots):', result);
+          return result;
+        } else {
+          logger.warn('⚠️ No valid data in response');
+        }
+      } catch (error) {
+        logger.error('❌ Error fetching magnitude:', error);
+        return null;
+      }
+    }
+    
+    function showMagnitudeMarker(x, y, magnitude, lat, lng) {
+      const marker = document.getElementById('magnitude-marker');
+      const valueEl = document.getElementById('magnitude-value');
+      
+      // Format magnitude to 1 decimal place
+      valueEl.textContent = magnitude.toFixed(1);
+      
+      // Position the marker
+      marker.style.left = x + 'px';
+      marker.style.top = y + 'px';
+      marker.style.display = 'block';
+      
+      // Store marker info including lat/lng for updates
+      state.magnitudeMarker = { x, y, magnitude, lat, lng };
+    }
+    
+    function hideMagnitudeMarker() {
+      const marker = document.getElementById('magnitude-marker');
+      marker.style.display = 'none';
+      state.magnitudeMarker = null;
+    }
+    
+    function formatTimeLocal(date) {
+      const options = {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+      };
+      return date.toLocaleString('en-US', options);
+    }
+    
+    function formatTimeShort(date) {
+      const options = {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        hour12: true
+      };
+      return date.toLocaleString('en-US', options);
+    }
+    
+    function showLoading(message = 'Loading...', show = true) {
+      const loadingEl = document.getElementById('loading');
+      if (show) {
+        loadingEl.textContent = message;
+        loadingEl.className = 'loading';
+      } else {
+        loadingEl.className = 'loading hidden';
+      }
+    }
+    
+    function showError(message) {
+      const loadingEl = document.getElementById('loading');
+      loadingEl.innerHTML = `
+        <div style="color: #cc0000; font-weight: bold;">⚠️ ${message}</div>
+        <button onclick="location.reload()" style="
+          margin-top: 10px;
+          padding: 8px 16px;
+          background: #0066cc;
+          color: white;
+          border: none;
+          border-radius: 4px;
+          font-size: 14px;
+          cursor: pointer;
+        ">Reload App</button>
+      `;
+      loadingEl.className = 'loading';
+    }
+    
+    function updateTimeDisplay(modelInfo) {
+      // Only show forecast time (what time we're showing)
+      document.getElementById('forecast-time').textContent = formatTimeLocal(modelInfo.targetTime);
+    }
+    
+    // ========== MAP FUNCTIONS ==========
+    
+    const map = new maplibregl.Map({
+      container: "map",
+      style: {
+        version: 8,
+        sources: {
+          basemap: {
+            type: "raster",
+            tiles: ["https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}"],
+            tileSize: 256,
+            attribution: "© Esri"
+          },
+          shoreline: {
+            type: "raster",
+            tiles: [`${PROXY_BASE}/tiles/us_west_shoreline/v2/ValueLocList/{z}/{y}/{x}.png`],
+            tileSize: 256,
+            maxzoom: 18
+          }
+        },
+        layers: [
+          {
+            id: "basemap",
+            type: "raster",
+            source: "basemap"
+          },
+          {
+            id: "shoreline",
+            type: "raster",
+            source: "shoreline",
+            paint: { "raster-opacity": 1.0 }
+          }
+        ]
+      },
+      center: CONFIG.CENTER,
+      zoom: CONFIG.ZOOM,
+      attributionControl: false // Clean mobile view
+    });
+
+// Simplified viewport handling - just resize map when needed
+function handleViewportChange() {
+  if (map) {
+    try { 
+      map.resize(); 
+    } catch (e) {
+      // Ignore resize errors during initialization
+    }
+  }
+}
+
+window.addEventListener('load', handleViewportChange);
+window.addEventListener('orientationchange', handleViewportChange);
+window.addEventListener('resize', handleViewportChange);
+
+    
+    function updateCurrentsLayer(hoursFromNow) {
+      // Calculate target time based on hours from current time
+      const now = new Date();
+      now.setMinutes(0, 0, 0);
+      const targetTime = new Date(now.getTime() + hoursFromNow * 60 * 60 * 1000); // Hours into the future
+      
+      // Find the best model for this target time
+      const bestModel = getBestModelForForecast(targetTime);
+      
+      if (!bestModel) {
+        logger.warn('No model available for forecast hour', hoursFromNow);
+        return;
+      }
+      
+      // Update current model info
+      state.currentModelInfo = bestModel;
+      
+      // Get the model cycle start time for this specific model
+      const thisCycleStart = new Date(bestModel.cycleDate);
+      thisCycleStart.setUTCHours(bestModel.cycleHour, 0, 0, 0);
+      
+      // Update display
+      updateTimeDisplay(bestModel);
+      
+      // Update tide chart for the current display time
+      updateTideChart(targetTime);
+      
+      // Update magnitude marker if one is displayed
+      if (state.magnitudeMarker && state.magnitudeMarker.lat && state.magnitudeMarker.lng) {
+        // Fetch updated magnitude for the same location
+        fetchCurrentMagnitude(state.magnitudeMarker.lat, state.magnitudeMarker.lng).then(result => {
+          if (result) {
+            // Update just the value, keep the same position
+            const valueEl = document.getElementById('magnitude-value');
+            if (valueEl) {
+              valueEl.textContent = result.value.toFixed(1);
+              state.magnitudeMarker.magnitude = result.value;
+            }
+          }
+        });
+      }
+      
+      // CRITICAL: Always use the MODEL CYCLE START as the tile start time
+      // The end time determines which forecast hour we get
+      const startTime = toIsoUTC(thisCycleStart);
+      const endTime = toIsoUTC(targetTime);
+      
+      const tileUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${startTime}/${endTime}/Surface/v2/ValueLocList/{z}/{y}/{x}.png`;
+      
+      logger.info(`Target: ${formatTimeLocal(targetTime)} | Model: ${formatTimeLocal(thisCycleStart)} (${bestModel.cycleHour}z) | F${bestModel.forecastHour.toString().padStart(3,'0')}`);
+      logger.debug('🗺️ Tile URL pattern:', tileUrl);
+      
+      if (!map.getSource("currents")) {
+        map.addSource("currents", {
+          type: "raster",
+          tiles: [tileUrl],
+          tileSize: 256,
+          maxzoom: 18
+        });
+        map.addLayer({
+          id: "currents",
+          type: "raster",
+          source: "currents",
+          paint: { "raster-opacity": 1.0 }
+        }, "shoreline");
+      } else {
+        const source = map.getSource("currents");
+        source.tiles = [tileUrl];
+        // Clear MapLibre's internal tile cache to force re-fetch
+        // (Service worker will still cache the HTTP responses)
+        map.style.sourceCaches['currents'].clearTiles();
+        map.style.sourceCaches['currents'].update(map.transform);
+        map.triggerRepaint();
+      }
+    }
+    
+    // ========== MODEL EXPLORATION ==========
+    
+    async function fetchDataAvailability() {
+      const url = `${CONFIG.PROXY_HOST}/eis-info/info/salish-currents-vec/get_data_availability`;
+      logger.info('📡 Fetching data availability from EIS API...');
+      
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        
+        if (!Array.isArray(data) || data.length === 0) {
+          logger.warn('No model runs in availability response');
+          return null;
+        }
+        
+        const now = new Date();
+        const results = [];
+        
+        for (const run of data) {
+          const cycleTime = new Date(run.model_run);
+          const layers = run.layers || [];
+          if (layers.length === 0) continue;
+          
+          const lastLayer = new Date(layers[layers.length - 1].layer_end_time);
+          const maxHour = Math.round((lastLayer - cycleTime) / (1000 * 60 * 60));
+          const hoursOld = (now - cycleTime) / (1000 * 60 * 60);
+          const futureEnd = maxHour - hoursOld;
+          
+          const cycle = cycleTime.getUTCHours();
+          const status = maxHour >= 72 ? '✅ FULL' : maxHour >= 0 ? '⚠️  PARTIAL' : '❌ NOT FOUND';
+          const details = `F000-F${String(maxHour).padStart(3,'0')}` +
+            (futureEnd > 0 ? ` | Future: +${Math.round(futureEnd)}h` : ` | Expired ${Math.round(-futureEnd)}h ago`);
+          
+          logger.info(`${status} | ${formatTimeLocal(cycleTime)} (${String(cycle).padStart(2,'0')}z) | ${hoursOld.toFixed(1)}h old | ${details}`);
+          
+          results.push({
+            time: cycleTime,
+            cycle: cycle,
+            hoursOld: hoursOld,
+            maxHour: maxHour,
+            futureEnd: futureEnd,
+            available: maxHour >= 72,
+            partial: maxHour >= 0 && maxHour < 72
+          });
+        }
+        
+        return results;
+      } catch (err) {
+        logger.warn('Data availability API failed, falling back to binary search:', err.message);
+        return null;
+      }
+    }
+    
+    // Binary search to find the maximum available forecast hour for a model
+    async function findMaxForecastHour(cycleTime) {
+      const testStartTime = toIsoUTC(cycleTime);
+      let low = 0;
+      let high = CONFIG.MAX_FORECAST_HOURS;
+      let maxAvailable = -1;
+      
+      // Helper to test if a specific forecast hour is available
+      async function testHour(hour) {
+        const endTime = new Date(cycleTime.getTime() + hour * 60 * 60 * 1000);
+        const testEndTime = toIsoUTC(endTime);
+        const testUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${testStartTime}/${testEndTime}/Surface/v2/ValueLocList/8/90/39.png`;
+        
+        try {
+          const response = await fetch(testUrl);
+          if (response.ok) {
+            const blob = await response.blob();
+            return blob.size >= CONFIG.TILE_MIN_SIZE; // Real data vs placeholder
+          }
+        } catch (err) {
+          // Ignore errors
+        }
+        return false;
+      }
+      
+      // Binary search for the maximum available hour
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        const isAvailable = await testHour(mid);
+        
+        if (isAvailable) {
+          maxAvailable = mid;
+          low = mid + 1; // Look for higher hours
+        } else {
+          high = mid - 1; // Look for lower hours
+        }
+      }
+      
+      return maxAvailable;
+    }
+    
+    async function exploreRecentModels(count = 10) {
+      logger.info('📊 Exploring recent model cycles (stopping at first full 72h model)...');
+      logger.info('================================================');
+      
+      const now = new Date();
+      const results = [];
+      let foundFull72 = false;
+      
+      // Get the latest theoretical cycle
+      const latestCycle = getLatestCycle(now);
+      let searchDate = new Date(latestCycle.date);
+      let cycleIndex = CONFIG.SSCOFS_CYCLES.indexOf(latestCycle.cycle);
+      let modelsChecked = 0;
+      
+      // Check the last N model cycles, but stop once we find a full 72h model
+      for (let daysBack = 0; daysBack <= 7 && modelsChecked < count && !foundFull72; daysBack++) {
+        for (let i = cycleIndex; i >= 0 && modelsChecked < count && !foundFull72; i--) {
+          const testCycle = CONFIG.SSCOFS_CYCLES[i];
+          const cycleTime = new Date(searchDate);
+          cycleTime.setUTCHours(testCycle, 0, 0, 0);
+          
+          const hoursOld = (now - cycleTime) / (1000 * 60 * 60);
+          
+          // Use binary search to find max available forecast hour
+          const maxHour = await findMaxForecastHour(cycleTime);
+          
+          // Calculate the future coverage (hours from now that this model covers)
+          const futureStart = Math.max(0, -hoursOld); // When this model starts covering the future
+          const futureEnd = maxHour - hoursOld; // How far into the future this model reaches
+          
+          // Determine status
+          let status, details;
+          if (maxHour >= 72) {
+            status = '✅ FULL';
+            details = `F000-F072`;
+            foundFull72 = true; // Found a full model, will stop after this
+          } else if (maxHour >= 0) {
+            status = '⚠️  PARTIAL';
+            details = `F000-F${String(maxHour).padStart(3,'0')}`;
+          } else {
+            status = '❌ NOT FOUND';
+            details = '';
+          }
+          
+          // Add future coverage info
+          if (futureEnd > 0) {
+            details += ` | Future: +${Math.round(futureEnd)}h`;
+          } else {
+            details += ' | Past only';
+          }
+          
+          logger.info(`${status} | ${formatTimeLocal(cycleTime)} (${String(testCycle).padStart(2,'0')}z) | ${hoursOld.toFixed(1)}h old | ${details}`);
+          
+          results.push({
+            time: cycleTime,
+            cycle: testCycle,
+            hoursOld: hoursOld,
+            maxHour: maxHour,
+            futureEnd: futureEnd,
+            available: maxHour >= 72,
+            partial: maxHour >= 0 && maxHour < 72
+          });
+          
+          modelsChecked++;
+          
+          if (foundFull72) {
+            logger.info('🛑 Stopping exploration - found full 72h model');
+          }
+        }
+        
+        searchDate.setUTCDate(searchDate.getUTCDate() - 1);
+        cycleIndex = CONFIG.SSCOFS_CYCLES.length - 1;
+      }
+      
+      // Analyze which models are actually needed for coverage
+      logger.info('================================================');
+      logger.info('=== Coverage Analysis ===');
+      
+      const availableModels = results.filter(r => r.maxHour >= 0);
+      
+      // Sort by how far into the future they reach
+      const futureModels = availableModels
+        .filter(r => r.futureEnd > 0)
+        .sort((a, b) => b.futureEnd - a.futureEnd);
+      
+      let maxCoverage = 0;
+      const neededModels = [];
+      const redundantModels = [];
+      
+      if (futureModels.length > 0) {
+        for (const model of futureModels) {
+          if (model.futureEnd > maxCoverage) {
+            neededModels.push(model);
+            logger.info(`✅ NEEDED: ${formatTimeLocal(model.time)} (${model.cycle}z) extends coverage to +${Math.round(model.futureEnd)}h`);
+            maxCoverage = model.futureEnd;
+          } else {
+            redundantModels.push(model);
+            logger.info(`⏭️  REDUNDANT: ${formatTimeLocal(model.time)} (${model.cycle}z) only reaches +${Math.round(model.futureEnd)}h`);
+          }
+        }
+        state.modelAvailability = neededModels;
+      } else if (availableModels.length > 0) {
+        // No future coverage, but we have stale data — use the newest model
+        const newest = availableModels.sort((a, b) => b.time - a.time)[0];
+        logger.warn(`⏳ All data is stale. Newest model: ${formatTimeLocal(newest.time)} (expired ${Math.round(-newest.futureEnd)}h ago)`);
+        state.modelAvailability = [newest];
+        state.isStaleData = true;
+      }
+      
+      // Summary
+      logger.info('================================================');
+      logger.info(`Models for coverage: ${state.modelAvailability.length}`);
+      logger.info(`Redundant models: ${redundantModels.length}`);
+      if (state.isStaleData) {
+        logger.info('⚠️ Using stale data — upstream model pipeline may be delayed');
+      } else {
+        logger.info(`Maximum future coverage: +${Math.round(maxCoverage)} hours`);
+      }
+      
+      return results;
+    }
+    
+    // Find the best (newest) model that has data for a specific forecast hour
+    function getBestModelForForecast(targetDate) {
+      if (!state.modelAvailability || state.modelAvailability.length === 0) {
+        return null;
+      }
+      
+      const now = new Date();
+      
+      // Find the newest model that can provide this forecast
+      for (const model of state.modelAvailability) {
+        if (model.maxHour < 0) continue; // Skip models with no data
+        
+        // Calculate what forecast hour this would be for this model
+        const modelTime = new Date(model.time);
+        const hoursSinceModel = (targetDate - modelTime) / (1000 * 60 * 60);
+        
+        // Check if this model covers the requested time
+        if (hoursSinceModel >= 0 && hoursSinceModel <= model.maxHour) {
+          logger.info(`Using model from ${formatTimeLocal(modelTime)} (${model.cycle}z) for F${Math.round(hoursSinceModel).toString().padStart(3,'0')}`);
+          return {
+            cycleDate: model.time,
+            cycleHour: model.cycle,
+            forecastHour: Math.round(hoursSinceModel),
+            maxHour: model.maxHour,
+            targetTime: targetDate
+          };
+        }
+      }
+      
+      logger.warn('No model available for requested time:', formatTimeLocal(targetDate));
+      return null;
+    }
+    
+    // ========== INITIALIZATION ==========
+    
+    // Monitor online/offline status
+    window.addEventListener('online', () => {
+      state.isOffline = false;
+      logger.info('Back online');
+      // Optionally refresh model data
+    });
+    
+    window.addEventListener('offline', () => {
+      state.isOffline = true;
+      logger.warn('App is offline - using cached data');
+      showOfflineIndicator();
+    });
+    
+    function showOfflineIndicator() {
+      const indicator = document.createElement('div');
+      indicator.id = 'offline-indicator';
+      indicator.style.cssText = `
+        position: fixed;
+        top: 40px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #ff9800;
+        color: white;
+        padding: 8px 16px;
+        border-radius: 4px;
+        font-size: 13px;
+        z-index: 1000;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+      `;
+      indicator.textContent = '📵 Offline - Using cached data';
+      document.body.appendChild(indicator);
+      
+      // Remove when back online
+      const checkOnline = setInterval(() => {
+        if (!state.isOffline) {
+          indicator.remove();
+          clearInterval(checkOnline);
+        }
+      }, 1000);
+    }
+    
+    async function initialize() {
+      try {
+        showLoading('Loading current data...');
+        
+        const now = new Date();
+        now.setMinutes(0, 0, 0);
+        
+      logger.info('=== Model Initialization ===');
+      logger.info('App Version:', CONFIG.APP_VERSION);
+      
+      document.getElementById('version-label').textContent = CONFIG.APP_VERSION;
+      
+      // Try Canvas renderer first (self-hosted data)
+      if (CONFIG.USE_CANVAS_RENDERER) {
+        try {
+          const renderer = new CurrentDataRenderer(map);
+          const manifest = await renderer.initialize(CONFIG.CURRENT_DATA_URL);
+          state.canvasRenderer = renderer;
+          state.useCanvasRenderer = true;
+          
+          const modelRun = new Date(manifest.model_run);
+          const hours = manifest.forecast_hours;
+          const maxHour = Math.max(...hours);
+          
+          // Compute hours-from-now for each forecast hour
+          const modelAgeHours = (now - modelRun) / 3600000;
+          const futureHoursAvail = maxHour - Math.ceil(modelAgeHours);
+          
+          const slider = document.getElementById('time-slider');
+          
+          if (futureHoursAvail > 0) {
+            // Normal mode: slider from 0 to maxFutureHours
+            slider.min = 0;
+            slider.max = Math.min(futureHoursAvail, maxHour);
+            slider.value = 0;
+            document.getElementById('slider-label').textContent = `Hours from now (0 to +${Math.round(futureHoursAvail)})`;
+            
+            // Load the initial forecast hour (closest to "now")
+            const initialFH = Math.max(0, Math.min(Math.round(modelAgeHours), maxHour));
+            await renderer.loadHour(initialFH);
+            document.getElementById('forecast-time').textContent = formatTimeLocal(now);
+            updateTideChart(now);
+            
+            // Preload adjacent hours in background (fetch-only, don't switch display)
+            for (const h of [initialFH - 1, initialFH + 1]) {
+              if (hours.includes(h) && h !== initialFH) {
+                renderer._prefetchHour(h);
+              }
+            }
+          } else {
+            // All data is historical
+            state.isStaleData = true;
+            state.staleModelStart = modelRun;
+            slider.min = 0;
+            slider.max = maxHour;
+            slider.value = 0;
+            
+            const modelEnd = new Date(modelRun.getTime() + maxHour * 3600000);
+            document.getElementById('slider-label').textContent =
+              `${formatTimeShort(modelRun)} — ${formatTimeShort(modelEnd)}`;
+            showStaleDataWarning(modelRun);
+            await renderer.loadHour(0);
+          }
+          
+          logger.info(`Canvas renderer active: ${manifest.num_elements.toLocaleString()} elements, ${hours.length} hours`);
+          logger.info(`Model run: ${manifest.model_run}, age: ${modelAgeHours.toFixed(1)}h`);
+          showLoading('', false);
+          return;
+        } catch (err) {
+          logger.warn('Canvas renderer failed, falling back to EIS tiles:', err.message);
+          state.useCanvasRenderer = false;
+        }
+      }
+      
+      // ---- Fallback: EIS tile-based rendering ----
+      logger.info('Using EIS tile-based rendering');
+      logger.info('Proxy URL:', CONFIG.PROXY_HOST);
+        
+        if (!navigator.onLine) {
+          state.isOffline = true;
+          logger.warn('Starting in offline mode');
+          const cachedModels = localStorage.getItem('model_availability');
+          if (cachedModels) {
+            const parsed = JSON.parse(cachedModels);
+            state.modelAvailability = parsed.map(m => ({
+              ...m,
+              time: new Date(m.time)
+            }));
+            state.isStaleData = !!parsed[0]?.isStaleData;
+            logger.info('Using cached model availability');
+          } else {
+            showError('No cached data available. Please connect to internet.');
+            return;
+          }
+        } else {
+          const apiResults = await fetchDataAvailability();
+          if (apiResults && apiResults.length > 0) {
+            const availableModels = apiResults.filter(r => r.maxHour >= 0);
+            const futureModels = availableModels.filter(r => r.futureEnd > 0)
+              .sort((a, b) => b.futureEnd - a.futureEnd);
+            
+            if (futureModels.length > 0) {
+              let maxCov = 0;
+              state.modelAvailability = [];
+              for (const model of futureModels) {
+                if (model.futureEnd > maxCov) {
+                  state.modelAvailability.push(model);
+                  maxCov = model.futureEnd;
+                }
+              }
+            } else if (availableModels.length > 0) {
+              const newest = availableModels.sort((a, b) => b.time - a.time)[0];
+              logger.warn('All data is stale. Newest:', formatTimeLocal(newest.time));
+              state.modelAvailability = [newest];
+              state.isStaleData = true;
+            }
+          } else {
+            await exploreRecentModels(35);
+          }
+          
+          const toCache = state.modelAvailability.map(m => ({
+            ...m,
+            isStaleData: state.isStaleData || false
+          }));
+          localStorage.setItem('model_availability', JSON.stringify(toCache));
+        }
+        
+        if (!state.modelAvailability || state.modelAvailability.length === 0 || state.modelAvailability.every(m => m.maxHour < 0)) {
+          logger.error('No available models found!');
+          if (state.isOffline) {
+            showError('Cannot load model data while offline.');
+          } else {
+            showError('No ocean current data available. Please try again later.');
+          }
+          return;
+        }
+      
+      const slider = document.getElementById('time-slider');
+      
+      if (state.isStaleData) {
+        const model = state.modelAvailability[0];
+        const modelStart = new Date(model.time);
+        const modelEnd = new Date(modelStart.getTime() + model.maxHour * 60 * 60 * 1000);
+        
+        state.staleModelStart = modelStart;
+        slider.min = 0;
+        slider.max = model.maxHour;
+        slider.value = 0;
+        
+        document.getElementById('slider-label').textContent = 
+          `${formatTimeShort(modelStart)} — ${formatTimeShort(modelEnd)}`;
+        
+        showStaleDataWarning(modelStart);
+        updateCurrentsLayerStale(0);
+      } else {
+        const maxFutureCoverage = Math.max(...state.modelAvailability.map(m => m.futureEnd));
+        
+        slider.min = 0;
+        slider.max = Math.round(maxFutureCoverage);
+        slider.value = 0;
+        
+        document.getElementById('slider-label').textContent = `Hours from now (0 to +${Math.round(maxFutureCoverage)})`;
+        updateCurrentsLayer(0);
+      }
+      
+      showLoading('', false);
+      } catch (error) {
+        logger.error('Initialization error:', error);
+        showError('Failed to initialize app. Please check your connection and try again.');
+      }
+    }
+    
+    function showStaleDataWarning(modelDate) {
+      const hoursAgo = Math.round((new Date() - modelDate) / (1000 * 60 * 60));
+      const daysAgo = Math.round(hoursAgo / 24);
+      const ageStr = daysAgo >= 1 ? `${daysAgo} day${daysAgo > 1 ? 's' : ''} ago` : `${hoursAgo}h ago`;
+      
+      const banner = document.createElement('div');
+      banner.id = 'stale-data-banner';
+      banner.style.cssText = `
+        position: fixed;
+        top: calc(28px + env(safe-area-inset-top, 0px));
+        left: 0;
+        right: 0;
+        background: #ff9800;
+        color: white;
+        padding: 6px 12px;
+        font-size: 12px;
+        text-align: center;
+        z-index: 500;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+      `;
+      banner.textContent = `⚠️ Showing historical data from ${ageStr} — upstream model delayed`;
+      document.body.appendChild(banner);
+    }
+    
+    function updateCurrentsLayerStale(forecastHour) {
+      const model = state.modelAvailability[0];
+      const modelStart = new Date(model.time);
+      const targetTime = new Date(modelStart.getTime() + forecastHour * 60 * 60 * 1000);
+      
+      const startTime = toIsoUTC(modelStart);
+      const endTime = toIsoUTC(targetTime);
+      
+      const tileUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${startTime}/${endTime}/Surface/v2/ValueLocList/{z}/{y}/{x}.png`;
+      
+      logger.info(`[Stale] Model: ${formatTimeLocal(modelStart)} | Target: ${formatTimeLocal(targetTime)} | F${String(forecastHour).padStart(3,'0')}`);
+      
+      state.currentModelInfo = {
+        cycleDate: modelStart,
+        cycleHour: model.cycle,
+        forecastHour: forecastHour,
+        maxHour: model.maxHour,
+        targetTime: targetTime
+      };
+      
+      updateTimeDisplay(state.currentModelInfo);
+      
+      if (map.getSource('currents')) {
+        map.removeLayer('currents');
+        map.removeSource('currents');
+      }
+      
+      map.addSource('currents', {
+        type: 'raster',
+        tiles: [tileUrl],
+        tileSize: 256,
+        maxzoom: 18
+      });
+      
+      map.addLayer({
+        id: 'currents',
+        type: 'raster',
+        source: 'currents',
+        paint: { 'raster-opacity': 0.7 }
+      });
+    }
+    
+    // ========== EVENT HANDLERS ==========
+    
+    document.getElementById('time-slider').addEventListener('input', (e) => {
+      if (state.isUpdating) return;
+      
+      const sliderVal = parseInt(e.target.value);
+      
+      if (state.useCanvasRenderer && state.canvasRenderer) {
+        // Canvas renderer mode
+        const manifest = state.canvasRenderer.manifest;
+        const modelRun = new Date(manifest.model_run);
+        const modelAgeHours = (new Date() - modelRun) / 3600000;
+        
+        if (state.isStaleData) {
+          const targetTime = new Date(modelRun.getTime() + sliderVal * 3600000);
+          document.getElementById('slider-label').textContent =
+            `F${String(sliderVal).padStart(3,'0')} — ${formatTimeShort(targetTime)}`;
+          const forecastHour = sliderVal;
+          clearTimeout(window.updateTimer);
+          window.updateTimer = setTimeout(() => {
+            state.canvasRenderer.loadHour(forecastHour);
+            document.getElementById('forecast-time').textContent = formatTimeLocal(targetTime);
+            updateTideChart(targetTime);
+          }, 50);
+        } else {
+          const forecastHour = Math.round(modelAgeHours) + sliderVal;
+          const targetTime = new Date();
+          targetTime.setMinutes(0, 0, 0);
+          targetTime.setHours(targetTime.getHours() + sliderVal);
+          
+          const timeStr = sliderVal === 0 ? 'Now' : `+${sliderVal}h (${formatTimeShort(targetTime)})`;
+          document.getElementById('slider-label').textContent = timeStr;
+          document.getElementById('forecast-time').textContent = formatTimeLocal(targetTime);
+          
+          clearTimeout(window.updateTimer);
+          window.updateTimer = setTimeout(() => {
+            const fh = Math.max(0, Math.min(forecastHour, Math.max(...manifest.forecast_hours)));
+            state.canvasRenderer.loadHour(fh);
+            state.canvasRenderer._prefetchHour(fh + 1);
+            state.canvasRenderer._prefetchHour(fh - 1);
+            updateTideChart(targetTime);
+          }, 50);
+        }
+      } else if (state.isStaleData) {
+        const model = state.modelAvailability[0];
+        const modelStart = new Date(model.time);
+        const targetTime = new Date(modelStart.getTime() + sliderVal * 60 * 60 * 1000);
+        
+        document.getElementById('slider-label').textContent = 
+          `F${String(sliderVal).padStart(3,'0')} — ${formatTimeShort(targetTime)}`;
+        
+        clearTimeout(window.updateTimer);
+        window.updateTimer = setTimeout(() => {
+          updateCurrentsLayerStale(sliderVal);
+        }, 100);
+      } else {
+        const targetTime = new Date();
+        targetTime.setMinutes(0, 0, 0);
+        targetTime.setHours(targetTime.getHours() + sliderVal);
+        
+        const timeStr = sliderVal === 0 ? 'Now' : `+${sliderVal}h (${formatTimeShort(targetTime)})`;
+        document.getElementById('slider-label').textContent = timeStr;
+        
+        clearTimeout(window.updateTimer);
+        window.updateTimer = setTimeout(() => {
+          updateCurrentsLayer(sliderVal);
+        }, 100);
+      }
+    });
+    
+    // Hour adjustment buttons
+    document.getElementById('hour-prev').addEventListener('click', (e) => {
+      const slider = document.getElementById('time-slider');
+      const currentValue = parseInt(slider.value);
+      const newValue = Math.max(parseInt(slider.min), currentValue - 1);
+      slider.value = newValue;
+      
+      // Trigger the input event
+      const event = new Event('input', { bubbles: true });
+      slider.dispatchEvent(event);
+    });
+    
+    document.getElementById('hour-next').addEventListener('click', (e) => {
+      const slider = document.getElementById('time-slider');
+      const currentValue = parseInt(slider.value);
+      const newValue = Math.min(parseInt(slider.max), currentValue + 1);
+      slider.value = newValue;
+      
+      // Trigger the input event
+      const event = new Event('input', { bubbles: true });
+      slider.dispatchEvent(event);
+    });
+    
+    document.getElementById('time-slider').addEventListener('change', (e) => {
+      // Reset label after interaction
+      if (!state.isStaleData) {
+        const maxHours = parseInt(e.target.max);
+        setTimeout(() => {
+          document.getElementById('slider-label').textContent = `Hours from now (0 to +${maxHours})`;
+        }, 2000);
+      }
+    });
+    
+    // ========== TOUCH HANDLERS FOR MAGNITUDE ==========
+    
+    // Handle tap for showing magnitude
+    map.on('click', async (e) => {
+      logger.debug('👆 Click/tap event fired', {
+        lngLat: e.lngLat,
+        point: e.point,
+        timestamp: new Date().toISOString()
+      });
+      
+      // Get the click position
+      const lngLat = e.lngLat;
+      const point = e.point;
+      
+      // Calculate screen position
+      const mapContainer = map.getContainer();
+      const rect = mapContainer.getBoundingClientRect();
+      const screenPoint = {
+        x: point.x + rect.left,
+        y: point.y + rect.top
+      };
+      
+      logger.debug('📍 Click position:', {
+        screen: screenPoint,
+        mapRelative: point,
+        lngLat: { lat: lngLat.lat, lng: lngLat.lng }
+      });
+      
+      // Vibrate if available (haptic feedback)
+      if (navigator.vibrate) {
+        logger.debug('📳 Triggering haptic feedback');
+        navigator.vibrate(10);
+      }
+      
+      // Fetch and show magnitude
+      if (state.useCanvasRenderer && state.canvasRenderer) {
+        const result = state.canvasRenderer.getNearestCurrent(lngLat.lng, lngLat.lat);
+        if (result && result.distDeg < 0.01) {
+          showMagnitudeMarker(screenPoint.x, screenPoint.y, result.speedKnots, lngLat.lat, lngLat.lng);
+        }
+      } else {
+        if (state.isOffline) return;
+        const result = await fetchCurrentMagnitude(lngLat.lat, lngLat.lng);
+        if (result) {
+          showMagnitudeMarker(screenPoint.x, screenPoint.y, result.value, lngLat.lat, lngLat.lng);
+        }
+      }
+    });
+    
+    // Prevent context menu on right-click
+    map.on('contextmenu', (e) => {
+      e.preventDefault();
+    });
+    
+    // Hide marker when starting to pan
+    map.on('movestart', () => {
+      logger.debug('🗺️ Map movestart - hiding marker');
+      hideMagnitudeMarker();
+    });
+    
+    // Initialize when map loads
+    map.on('load', async () => {
+      await initialize();
+    });
+    
+    // Handle errors gracefully
+    map.on('error', (e) => {
+      if (e.error && e.error.status === 404) {
+        // Tile not found is common at edges, ignore
+      } else if (e.error) {
+        logger.error('Map error:', e.error);
+      }
+    });
+    
+  </script>
+</body>
+</html>

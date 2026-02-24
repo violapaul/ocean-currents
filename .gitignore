@@ -1,0 +1,5 @@
+OceanCurrents/Python_SSCOFS/current_data/
+OceanCurrents/Python_SSCOFS/current_data_fast_test/
+OceanCurrents/Python_SSCOFS/current_data_fast_test2/
+__pycache__/
+*.pyc

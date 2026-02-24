@@ -1,0 +1,22 @@
+name: currents
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - matplotlib
+  - xarray
+  - netcdf4
+  - h5netcdf
+  - s3fs
+  - pandas
+  - requests
+  - pyproj
+  - scipy
+  # Basemap support (optional but recommended)
+  - geopandas
+  - contextily
+  - pip
+  - pip:
+    - cmocean  # Better colormaps for oceanography
