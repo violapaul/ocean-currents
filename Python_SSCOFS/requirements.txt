@@ -1,0 +1,6 @@
+numpy
+xarray
+h5netcdf
+s3fs
+boto3
+requests
