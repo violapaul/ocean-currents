@@ -659,7 +659,7 @@
       ARROWS_PER_TILE: isLowPowerDevice ? 12 : 16,
       // High-res local Puget shoreline overlay (drawn above currents).
       COASTLINE_GEOJSON_URLS: [
-        `${location.origin}/Python_SSCOFS/data/shoreline_puget.geojson`,
+        new URL('Python_SSCOFS/data/shoreline_puget.geojson', location.href).toString(),
       ],
     };
     
