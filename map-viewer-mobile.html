@@ -736,17 +736,17 @@
         
         // Lazily build a 256-entry color LUT on first render
         // Scale: basemap water → saturated blue → cyan → green → yellow → orange → red
-        // Key: quick saturation increase at low speeds, then clear hue progression
+        // Range: 0-2 knots. 1.0 kt = green, 2.0+ kt = red
         if (!this._colorStrings) {
           const stops = [
-            [0.00, 170, 211, 223],  // basemap water (no current)
-            [0.10,  50, 110, 210],  // saturated blue (obvious change)
-            [0.25,  20, 170, 220],  // cyan
-            [0.40,  20, 190, 110],  // teal
-            [0.55,  60, 195,  45],  // green
-            [0.70, 210, 195,  35],  // yellow
-            [0.85, 245, 115,  30],  // orange
-            [1.00, 215,  45,  45],  // red (3+ knots)
+            [0.00, 170, 211, 223],  // basemap water (0 kt)
+            [0.08,  50, 110, 210],  // saturated blue (~0.16 kt)
+            [0.20,  20, 170, 220],  // cyan (0.4 kt)
+            [0.35,  20, 190, 130],  // teal (0.7 kt)
+            [0.50,  50, 195,  45],  // green (1.0 kt)
+            [0.65, 180, 200,  35],  // yellow-green (1.3 kt)
+            [0.80, 240, 160,  30],  // orange (1.6 kt)
+            [1.00, 215,  45,  45],  // red (2.0+ kt)
           ];
           this._colorStrings = new Array(256);
           this._colorRGB = new Array(256);
@@ -809,7 +809,7 @@
         // Virtual tile-based arrow grid for consistent density at all zoom levels
         // Each 256px tile gets a 12×12 grid of arrows (144 arrows per tile)
         const TILE_SIZE = 256;
-        const ARROWS_PER_TILE = 12;  // 12×12 = 144 arrows per tile
+        const ARROWS_PER_TILE = 16;  // 16×16 = 256 arrows per tile
         const arrowPitch = TILE_SIZE / ARROWS_PER_TILE;  // ~21px spacing
         const baseLen = arrowPitch * 0.55;  // arrow length ~12px
         
@@ -1205,7 +1205,7 @@
               if (!isWater(sx, sy)) continue;
               
               const speedKnots = arrow.speed * 1.94384;
-              const ci = Math.min(255, Math.round(Math.min(speedKnots / 3.0, 1.0) * 255));
+              const ci = Math.min(255, Math.round(Math.min(speedKnots / 2.0, 1.0) * 255));
               const rgb = colorsRGB[ci];
               
               ctx.beginPath();
