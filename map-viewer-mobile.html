@@ -813,7 +813,8 @@
         // Scale by fractional zoom so arrows stay same size relative to map tiles
         const intZoom = Math.floor(zoom);
         const zoomScale = Math.pow(2, zoom - intZoom);  // 1.0 at integer zoom, ~1.41 at +0.5
-        const baseLen = arrowPitch * 0.55 * zoomScale;
+        const baseLen = arrowPitch * 0.55 * zoomScale;  // For heatmap bubbles
+        const arrowLen = baseLen * 0.65;  // Arrows shorter than bubbles
         
         // Precompute arrowhead trig constants (half-angle = 0.45 rad ≈ 26°)
         const cosHA = Math.cos(0.45);
@@ -1245,7 +1246,7 @@
               // Skip if not over water
               if (!isWater(sx, sy)) continue;
               
-              this._drawArrow(ctx, sx, sy, arrow.nx, arrow.ny, arrow.speed, baseLen, colors, cosHA, sinHA);
+              this._drawArrow(ctx, sx, sy, arrow.nx, arrow.ny, arrow.speed, arrowLen, colors, cosHA, sinHA);
               drawn++;
             }
           }
@@ -1641,6 +1642,27 @@
       state.magnitudeMarker = null;
     }
     
+    function updateMagnitudeMarker() {
+      if (!state.magnitudeMarker || !state.canvasRenderer) return;
+      
+      const { lat, lng } = state.magnitudeMarker;
+      const result = state.canvasRenderer.getNearestCurrent(lng, lat);
+      if (result && result.distDeg < 0.01) {
+        // Update values without repositioning
+        const valueEl = document.getElementById('magnitude-value');
+        const arrowEl = document.getElementById('magnitude-arrow');
+        valueEl.textContent = result.speedKnots.toFixed(1);
+        
+        const angleDeg = Math.atan2(result.u, result.v) * 180 / Math.PI;
+        arrowEl.style.transform = `rotate(${angleDeg}deg)`;
+        
+        // Update stored values
+        state.magnitudeMarker.magnitude = result.speedKnots;
+        state.magnitudeMarker.u = result.u;
+        state.magnitudeMarker.v = result.v;
+      }
+    }
+    
     function formatTimeLocal(date) {
       const options = {
         weekday: 'short',
@@ -1889,10 +1911,11 @@ window.addEventListener('resize', handleViewportChange);
           `F${String(sliderVal).padStart(3,'0')} — ${formatTimeShort(targetTime)}`;
         
         clearTimeout(window.updateTimer);
-        window.updateTimer = setTimeout(() => {
-          state.canvasRenderer.loadHour(sliderVal);
+        window.updateTimer = setTimeout(async () => {
+          await state.canvasRenderer.loadHour(sliderVal);
           document.getElementById('forecast-time').textContent = formatTimeLocal(targetTime);
           updateTideChart(targetTime);
+          updateMagnitudeMarker();
         }, 50);
       } else {
         // Normal forecast mode
@@ -1906,12 +1929,13 @@ window.addEventListener('resize', handleViewportChange);
         document.getElementById('forecast-time').textContent = formatTimeLocal(targetTime);
         
         clearTimeout(window.updateTimer);
-        window.updateTimer = setTimeout(() => {
+        window.updateTimer = setTimeout(async () => {
           const fh = Math.max(0, Math.min(forecastHour, Math.max(...manifest.forecast_hours)));
-          state.canvasRenderer.loadHour(fh);
+          await state.canvasRenderer.loadHour(fh);
           state.canvasRenderer._prefetchHour(fh + 1);
           state.canvasRenderer._prefetchHour(fh - 1);
           updateTideChart(targetTime);
+          updateMagnitudeMarker();
         }, 50);
       }
     });
@@ -1997,10 +2021,15 @@ window.addEventListener('resize', handleViewportChange);
       e.preventDefault();
     });
     
-    // Hide marker when starting to pan
-    map.on('movestart', () => {
-      logger.debug('🗺️ Map movestart - hiding marker');
-      hideMagnitudeMarker();
+    // Update marker position when map moves
+    map.on('move', () => {
+      if (!state.magnitudeMarker) return;
+      const { lat, lng } = state.magnitudeMarker;
+      const point = map.project([lng, lat]);
+      const rect = map.getContainer().getBoundingClientRect();
+      const marker = document.getElementById('magnitude-marker');
+      marker.style.left = (point.x + rect.left) + 'px';
+      marker.style.top = (point.y + rect.top) + 'px';
     });
     
     // Initialize when map loads
