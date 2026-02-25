@@ -1,9 +1,9 @@
 // Ocean Currents PWA Service Worker
 // Enables offline functionality by caching tiles and assets
 
-const CACHE_VERSION = 'ocean-currents-v1';
-const TILE_CACHE = 'tiles-v1';
-const STATIC_CACHE = 'static-v1';
+const CACHE_VERSION = 'ocean-currents-v2';
+const TILE_CACHE = `${CACHE_VERSION}-tiles`;
+const STATIC_CACHE = `${CACHE_VERSION}-static`;
 
 // Files to cache immediately on install
 const STATIC_FILES = [
@@ -21,35 +21,61 @@ const STATIC_FILES = [
 
 // Install event - cache static assets
 self.addEventListener('install', (event) => {
-  event.waitUntil(
-    caches.open(STATIC_CACHE).then((cache) => {
-      console.log('Caching static assets');
-      return cache.addAll(STATIC_FILES);
-    })
-  );
-  self.skipWaiting();
+  event.waitUntil((async () => {
+    const cache = await caches.open(STATIC_CACHE);
+    console.log('Caching static assets');
+    await Promise.allSettled(
+      STATIC_FILES.map((url) => cache.add(url))
+    );
+    await self.skipWaiting();
+  })());
 });
 
 // Activate event - clean up old caches
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
-        cacheNames.map((cacheName) => {
-          if (cacheName !== STATIC_CACHE && cacheName !== TILE_CACHE) {
-            console.log('Deleting old cache:', cacheName);
-            return caches.delete(cacheName);
-          }
-        })
-      );
-    })
-  );
-  self.clients.claim();
+  event.waitUntil((async () => {
+    const cacheNames = await caches.keys();
+    await Promise.all(
+      cacheNames.map((cacheName) => {
+        if (cacheName !== STATIC_CACHE && cacheName !== TILE_CACHE) {
+          console.log('Deleting old cache:', cacheName);
+          return caches.delete(cacheName);
+        }
+        return Promise.resolve();
+      })
+    );
+    await self.clients.claim();
+  })());
 });
 
 // Fetch event - serve from cache when possible
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
+  
+  // Navigation requests should be network-first so users get new app shells quickly.
+  if (event.request.mode === 'navigate') {
+    event.respondWith(
+      fetch(event.request).then((response) => {
+        if (response && response.ok) {
+          const responseToCache = response.clone();
+          caches.open(STATIC_CACHE).then((cache) => {
+            cache.put(event.request, responseToCache);
+          });
+        }
+        return response;
+      }).catch(async () => {
+        const cachedNav = await caches.match(event.request);
+        if (cachedNav) return cachedNav;
+        const cachedAppShell = await caches.match('./map-viewer-mobile.html');
+        if (cachedAppShell) return cachedAppShell;
+        return new Response('Offline', {
+          status: 503,
+          headers: { 'Content-Type': 'text/plain' }
+        });
+      })
+    );
+    return;
+  }
   
   // Handle tile requests - cache by exact URL (includes model time AND forecast hour)
   // URL format: /tiles/salish-currents-vec/{startTime}/{endTime}/Surface/v2/ValueLocList/{z}/{y}/{x}.png
@@ -137,6 +163,11 @@ self.addEventListener('fetch', (event) => {
 
 // Clean up old tiles periodically (keep last 7 days)
 self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+    return;
+  }
+
   if (event.data === 'cleanup') {
     caches.open(TILE_CACHE).then((cache) => {
       cache.keys().then((requests) => {

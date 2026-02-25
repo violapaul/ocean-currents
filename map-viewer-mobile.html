@@ -264,6 +264,57 @@
     .loading.hidden {
       display: none;
     }
+
+    .update-banner {
+      position: fixed;
+      top: calc(34px + env(safe-area-inset-top, 0px));
+      left: 10px;
+      right: 10px;
+      background: rgba(0, 119, 190, 0.96);
+      color: #fff;
+      border-radius: 10px;
+      padding: 10px 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+      z-index: 120;
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      pointer-events: auto;
+    }
+
+    .update-banner.visible {
+      display: flex;
+    }
+
+    .update-banner-text {
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 1.3;
+    }
+
+    .update-banner-actions {
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .update-banner-btn {
+      border: 1px solid rgba(255, 255, 255, 0.8);
+      background: rgba(255, 255, 255, 0.2);
+      color: #fff;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+
+    .update-banner-btn.primary {
+      background: #fff;
+      color: #0066cc;
+      border-color: #fff;
+    }
     
     /* Current magnitude marker */
     .magnitude-marker {
@@ -487,6 +538,14 @@
     </div>
     
     <div class="loading" id="loading">Searching for model data...</div>
+
+    <div class="update-banner" id="update-banner" role="status" aria-live="polite">
+      <div class="update-banner-text">New version available.</div>
+      <div class="update-banner-actions">
+        <button class="update-banner-btn" id="update-later-btn" type="button">Later</button>
+        <button class="update-banner-btn primary" id="update-now-btn" type="button">Refresh</button>
+      </div>
+    </div>
     
     <!-- Magnitude marker (hidden by default) -->
     <div class="magnitude-marker" id="magnitude-marker" style="display: none;">
@@ -498,11 +557,75 @@
 
   <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
   <script>
-    // Register service worker for offline support
+    let waitingServiceWorker = null;
+    const updateBannerEl = document.getElementById('update-banner');
+    const updateNowBtn = document.getElementById('update-now-btn');
+    const updateLaterBtn = document.getElementById('update-later-btn');
+
+    function showUpdateBanner(worker) {
+      waitingServiceWorker = worker;
+      if (updateBannerEl) updateBannerEl.classList.add('visible');
+    }
+
+    function hideUpdateBanner() {
+      if (updateBannerEl) updateBannerEl.classList.remove('visible');
+    }
+
+    function activateWaitingWorker() {
+      if (waitingServiceWorker) {
+        waitingServiceWorker.postMessage({ type: 'SKIP_WAITING' });
+      }
+    }
+
+    if (updateNowBtn) {
+      updateNowBtn.addEventListener('click', () => {
+        activateWaitingWorker();
+      });
+    }
+
+    if (updateLaterBtn) {
+      updateLaterBtn.addEventListener('click', () => {
+        hideUpdateBanner();
+      });
+    }
+
+    // Register service worker for offline support and reliable updates
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./service-worker.js')
-        .then(reg => console.log('Service Worker registered'))
+      navigator.serviceWorker.register('./service-worker.js', { updateViaCache: 'none' })
+        .then((reg) => {
+          console.log('Service Worker registered');
+          
+          // Check for updates on page load.
+          reg.update();
+          
+          // If a new worker is found, show update prompt.
+          reg.addEventListener('updatefound', () => {
+            const newWorker = reg.installing;
+            if (!newWorker) return;
+            newWorker.addEventListener('statechange', () => {
+              if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                showUpdateBanner(newWorker);
+              }
+            });
+          });
+
+          // If an update is already waiting (e.g., after background check), show it.
+          if (reg.waiting) {
+            showUpdateBanner(reg.waiting);
+          }
+
+          // Periodically check for updates while app stays open.
+          setInterval(() => reg.update(), 5 * 60 * 1000);
+        })
         .catch(err => console.warn('Service Worker registration failed:', err));
+
+      // Reload exactly once when the updated worker takes control.
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (window.__swRefreshing) return;
+        window.__swRefreshing = true;
+        hideUpdateBanner();
+        window.location.reload();
+      });
     }
     
     // Simple production logging - errors only by default
@@ -517,7 +640,7 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
-      APP_VERSION: 'v2.2.0', // Cleaned up, Canvas-only rendering
+      APP_VERSION: 'v2.2.1', // Service worker update reliability improvements
       S3_BUCKET_URL: 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
