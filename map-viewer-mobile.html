@@ -517,38 +517,27 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
-      APP_VERSION: 'v2.1.0', // Direct S3 + NOAA API (no proxy)
+      APP_VERSION: 'v2.2.0', // Cleaned up, Canvas-only rendering
       S3_BUCKET_URL: 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
-      SSCOFS_CYCLES: [0, 3, 9, 15, 21],
       TIDE_STATION_ID: '9447130', // Seattle
-      TILE_MIN_SIZE: 5000,
       MAX_FORECAST_HOURS: 72,
-      // Self-hosted current data (Canvas rendering)
       CURRENT_DATA_URL: location.hostname === 'localhost' || location.hostname === '127.0.0.1'
         ? `${location.origin}/Python_SSCOFS/current_data`
         : 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
-      USE_CANVAS_RENDERER: true,
     };
-    
-    const PROXY_BASE = `${CONFIG.PROXY_HOST}/tiles/eis-live`;
     
     // ========== APPLICATION STATE ==========
     const state = {
-      currentModelInfo: null,
-      isUpdating: false,
-      modelAvailability: [],
       magnitudeMarker: null,
       tideData: null,
       currentDisplayTime: null,
-      isOffline: false,
+      canvasRenderer: null,
       isStaleData: false,
       staleModelStart: null,
-      // Canvas renderer state
-      canvasRenderer: null,
-      useCanvasRenderer: false,
+      isOffline: false,
     };
     
     // ========== CANVAS CURRENT RENDERER ==========
@@ -1354,46 +1343,6 @@
       }
     }
     
-    // ========== MODEL FUNCTIONS ==========
-    
-    function getLatestCycle(utcDate) {
-      const date = new Date(utcDate);
-      const hour = date.getUTCHours();
-      
-      for (let i = CONFIG.SSCOFS_CYCLES.length - 1; i >= 0; i--) {
-        if (hour >= CONFIG.SSCOFS_CYCLES[i]) {
-          return {
-            date: new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())),
-            cycle: CONFIG.SSCOFS_CYCLES[i]
-          };
-        }
-      }
-      
-      const prevDate = new Date(date);
-      prevDate.setUTCDate(prevDate.getUTCDate() - 1);
-      return {
-        date: new Date(Date.UTC(prevDate.getUTCFullYear(), prevDate.getUTCMonth(), prevDate.getUTCDate())),
-        cycle: CONFIG.SSCOFS_CYCLES[CONFIG.SSCOFS_CYCLES.length - 1]
-      };
-    }
-    
-    function calculateForecastHour(cycleDate, cycleHour, targetDate) {
-      const cycleStart = new Date(cycleDate);
-      cycleStart.setUTCHours(cycleHour, 0, 0, 0);
-      const hoursDiff = (targetDate - cycleStart) / (1000 * 60 * 60);
-      return Math.max(0, Math.min(CONFIG.MAX_FORECAST_HOURS, Math.round(hoursDiff)));
-    }
-    
-    // ========== UTILITY FUNCTIONS ==========
-    
-    function toIsoUTC(d) {
-      const pad = (n) => String(n).padStart(2, "0");
-      return d.getUTCFullYear() + "-" + 
-             pad(d.getUTCMonth()+1) + "-" + 
-             pad(d.getUTCDate()) + "T" + 
-             pad(d.getUTCHours()) + ":00:00Z";
-    }
-    
     // ========== TIDE FUNCTIONS ==========
     
     // Cache tide data in localStorage with expiration
@@ -1656,74 +1605,6 @@
     
     // ========== MAGNITUDE FUNCTIONS ==========
     
-    async function fetchCurrentMagnitude(lat, lon) {
-      logger.debug('🎯 fetchCurrentMagnitude called:', { lat, lon });
-      
-      if (!state.currentModelInfo) {
-        logger.warn('❌ No model info available');
-        return null;
-      }
-      
-      // Build the time strings for the API
-      const cycleStart = new Date(state.currentModelInfo.cycleDate);
-      cycleStart.setUTCHours(state.currentModelInfo.cycleHour, 0, 0, 0);
-      const startTime = toIsoUTC(cycleStart);
-      const endTime = toIsoUTC(state.currentModelInfo.targetTime);
-      
-      logger.debug('📊 Model info:', {
-        cycleStart: formatTimeLocal(cycleStart),
-        targetTime: formatTimeLocal(state.currentModelInfo.targetTime),
-        startTime,
-        endTime
-      });
-      
-      // Call NVS API through proxy to avoid CORS issues
-      const layer = `salish-currents-vec/${startTime}/${endTime}/Surface`;
-      
-      // Always use proxy - NVS doesn't provide CORS headers
-      const baseUrl = `${CONFIG.PROXY_HOST}/nvs/get_values`;
-      
-      const url = `${baseUrl}?` +
-        `sid=${Math.random()}&` +
-        `layer1=${encodeURIComponent(layer)}&` +
-        `var1=H1_CurrSpeed&` +
-        `num_layers=1&` +
-        `location_mode=interpolate&` +
-        `lat=${lat}&` +
-        `lon=${lon}`;
-      
-      logger.debug('🌐 API URL:', url);
-      logger.debug('🔀 Using proxy:', baseUrl.includes(CONFIG.PROXY_HOST));
-      
-      try {
-        logger.debug('📡 Fetching from NVS API...');
-        const response = await fetch(url);
-        logger.debug('📡 Response status:', response.status);
-        
-        if (!response.ok) {
-          throw new Error(`API returned ${response.status}`);
-        }
-        
-        const data = await response.json();
-        logger.debug('📦 API Response:', data);
-        
-        if (data.success && data.values && data.values.length > 0) {
-          // Convert from m/s to knots (1 m/s = 1.94384 knots)
-          const result = {
-            value: data.values[0].value * 1.94384,
-            direction: data.values[0].direction
-          };
-          logger.debug('✅ Magnitude data (converted to knots):', result);
-          return result;
-        } else {
-          logger.warn('⚠️ No valid data in response');
-        }
-      } catch (error) {
-        logger.error('❌ Error fetching magnitude:', error);
-        return null;
-      }
-    }
-    
     function showMagnitudeMarker(x, y, magnitude, lat, lng, u, v) {
       const marker = document.getElementById('magnitude-marker');
       const valueEl = document.getElementById('magnitude-value');
@@ -1809,16 +1690,11 @@
       loadingEl.className = 'loading';
     }
     
-    function updateTimeDisplay(modelInfo) {
-      // Only show forecast time (what time we're showing)
-      document.getElementById('forecast-time').textContent = formatTimeLocal(modelInfo.targetTime);
-    }
-    
     // ========== MAP FUNCTIONS ==========
     
     const map = new maplibregl.Map({
       container: "map",
-      preserveDrawingBuffer: true,  // Required for pixel sampling
+      preserveDrawingBuffer: true,
       style: {
         version: 8,
         sources: {
@@ -1827,12 +1703,6 @@
             tiles: ["https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}"],
             tileSize: 256,
             attribution: "© Esri"
-          },
-          shoreline: {
-            type: "raster",
-            tiles: [`${PROXY_BASE}/tiles/us_west_shoreline/v2/ValueLocList/{z}/{y}/{x}.png`],
-            tileSize: 256,
-            maxzoom: 18
           }
         },
         layers: [
@@ -1840,18 +1710,12 @@
             id: "basemap",
             type: "raster",
             source: "basemap"
-          },
-          {
-            id: "shoreline",
-            type: "raster",
-            source: "shoreline",
-            paint: { "raster-opacity": 1.0 }
           }
         ]
       },
       center: CONFIG.CENTER,
       zoom: CONFIG.ZOOM,
-      attributionControl: false // Clean mobile view
+      attributionControl: false
     });
 
 // Simplified viewport handling - just resize map when needed
@@ -1869,333 +1733,6 @@ window.addEventListener('load', handleViewportChange);
 window.addEventListener('orientationchange', handleViewportChange);
 window.addEventListener('resize', handleViewportChange);
 
-    
-    function updateCurrentsLayer(hoursFromNow) {
-      // Calculate target time based on hours from current time
-      const now = new Date();
-      now.setMinutes(0, 0, 0);
-      const targetTime = new Date(now.getTime() + hoursFromNow * 60 * 60 * 1000); // Hours into the future
-      
-      // Find the best model for this target time
-      const bestModel = getBestModelForForecast(targetTime);
-      
-      if (!bestModel) {
-        logger.warn('No model available for forecast hour', hoursFromNow);
-        return;
-      }
-      
-      // Update current model info
-      state.currentModelInfo = bestModel;
-      
-      // Get the model cycle start time for this specific model
-      const thisCycleStart = new Date(bestModel.cycleDate);
-      thisCycleStart.setUTCHours(bestModel.cycleHour, 0, 0, 0);
-      
-      // Update display
-      updateTimeDisplay(bestModel);
-      
-      // Update tide chart for the current display time
-      updateTideChart(targetTime);
-      
-      // Update magnitude marker if one is displayed
-      if (state.magnitudeMarker && state.magnitudeMarker.lat && state.magnitudeMarker.lng) {
-        // Fetch updated magnitude for the same location
-        fetchCurrentMagnitude(state.magnitudeMarker.lat, state.magnitudeMarker.lng).then(result => {
-          if (result) {
-            // Update just the value, keep the same position
-            const valueEl = document.getElementById('magnitude-value');
-            if (valueEl) {
-              valueEl.textContent = result.value.toFixed(1);
-              state.magnitudeMarker.magnitude = result.value;
-            }
-          }
-        });
-      }
-      
-      // CRITICAL: Always use the MODEL CYCLE START as the tile start time
-      // The end time determines which forecast hour we get
-      const startTime = toIsoUTC(thisCycleStart);
-      const endTime = toIsoUTC(targetTime);
-      
-      const tileUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${startTime}/${endTime}/Surface/v2/ValueLocList/{z}/{y}/{x}.png`;
-      
-      logger.info(`Target: ${formatTimeLocal(targetTime)} | Model: ${formatTimeLocal(thisCycleStart)} (${bestModel.cycleHour}z) | F${bestModel.forecastHour.toString().padStart(3,'0')}`);
-      logger.debug('🗺️ Tile URL pattern:', tileUrl);
-      
-      if (!map.getSource("currents")) {
-        map.addSource("currents", {
-          type: "raster",
-          tiles: [tileUrl],
-          tileSize: 256,
-          maxzoom: 18
-        });
-        map.addLayer({
-          id: "currents",
-          type: "raster",
-          source: "currents",
-          paint: { "raster-opacity": 1.0 }
-        }, "shoreline");
-      } else {
-        const source = map.getSource("currents");
-        source.tiles = [tileUrl];
-        // Clear MapLibre's internal tile cache to force re-fetch
-        // (Service worker will still cache the HTTP responses)
-        map.style.sourceCaches['currents'].clearTiles();
-        map.style.sourceCaches['currents'].update(map.transform);
-        map.triggerRepaint();
-      }
-    }
-    
-    // ========== MODEL EXPLORATION ==========
-    
-    async function fetchDataAvailability() {
-      const url = `${CONFIG.PROXY_HOST}/eis-info/info/salish-currents-vec/get_data_availability`;
-      logger.info('📡 Fetching data availability from EIS API...');
-      
-      try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        
-        if (!Array.isArray(data) || data.length === 0) {
-          logger.warn('No model runs in availability response');
-          return null;
-        }
-        
-        const now = new Date();
-        const results = [];
-        
-        for (const run of data) {
-          const cycleTime = new Date(run.model_run);
-          const layers = run.layers || [];
-          if (layers.length === 0) continue;
-          
-          const lastLayer = new Date(layers[layers.length - 1].layer_end_time);
-          const maxHour = Math.round((lastLayer - cycleTime) / (1000 * 60 * 60));
-          const hoursOld = (now - cycleTime) / (1000 * 60 * 60);
-          const futureEnd = maxHour - hoursOld;
-          
-          const cycle = cycleTime.getUTCHours();
-          const status = maxHour >= 72 ? '✅ FULL' : maxHour >= 0 ? '⚠️  PARTIAL' : '❌ NOT FOUND';
-          const details = `F000-F${String(maxHour).padStart(3,'0')}` +
-            (futureEnd > 0 ? ` | Future: +${Math.round(futureEnd)}h` : ` | Expired ${Math.round(-futureEnd)}h ago`);
-          
-          logger.info(`${status} | ${formatTimeLocal(cycleTime)} (${String(cycle).padStart(2,'0')}z) | ${hoursOld.toFixed(1)}h old | ${details}`);
-          
-          results.push({
-            time: cycleTime,
-            cycle: cycle,
-            hoursOld: hoursOld,
-            maxHour: maxHour,
-            futureEnd: futureEnd,
-            available: maxHour >= 72,
-            partial: maxHour >= 0 && maxHour < 72
-          });
-        }
-        
-        return results;
-      } catch (err) {
-        logger.warn('Data availability API failed, falling back to binary search:', err.message);
-        return null;
-      }
-    }
-    
-    // Binary search to find the maximum available forecast hour for a model
-    async function findMaxForecastHour(cycleTime) {
-      const testStartTime = toIsoUTC(cycleTime);
-      let low = 0;
-      let high = CONFIG.MAX_FORECAST_HOURS;
-      let maxAvailable = -1;
-      
-      // Helper to test if a specific forecast hour is available
-      async function testHour(hour) {
-        const endTime = new Date(cycleTime.getTime() + hour * 60 * 60 * 1000);
-        const testEndTime = toIsoUTC(endTime);
-        const testUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${testStartTime}/${testEndTime}/Surface/v2/ValueLocList/8/90/39.png`;
-        
-        try {
-          const response = await fetch(testUrl);
-          if (response.ok) {
-            const blob = await response.blob();
-            return blob.size >= CONFIG.TILE_MIN_SIZE; // Real data vs placeholder
-          }
-        } catch (err) {
-          // Ignore errors
-        }
-        return false;
-      }
-      
-      // Binary search for the maximum available hour
-      while (low <= high) {
-        const mid = Math.floor((low + high) / 2);
-        const isAvailable = await testHour(mid);
-        
-        if (isAvailable) {
-          maxAvailable = mid;
-          low = mid + 1; // Look for higher hours
-        } else {
-          high = mid - 1; // Look for lower hours
-        }
-      }
-      
-      return maxAvailable;
-    }
-    
-    async function exploreRecentModels(count = 10) {
-      logger.info('📊 Exploring recent model cycles (stopping at first full 72h model)...');
-      logger.info('================================================');
-      
-      const now = new Date();
-      const results = [];
-      let foundFull72 = false;
-      
-      // Get the latest theoretical cycle
-      const latestCycle = getLatestCycle(now);
-      let searchDate = new Date(latestCycle.date);
-      let cycleIndex = CONFIG.SSCOFS_CYCLES.indexOf(latestCycle.cycle);
-      let modelsChecked = 0;
-      
-      // Check the last N model cycles, but stop once we find a full 72h model
-      for (let daysBack = 0; daysBack <= 7 && modelsChecked < count && !foundFull72; daysBack++) {
-        for (let i = cycleIndex; i >= 0 && modelsChecked < count && !foundFull72; i--) {
-          const testCycle = CONFIG.SSCOFS_CYCLES[i];
-          const cycleTime = new Date(searchDate);
-          cycleTime.setUTCHours(testCycle, 0, 0, 0);
-          
-          const hoursOld = (now - cycleTime) / (1000 * 60 * 60);
-          
-          // Use binary search to find max available forecast hour
-          const maxHour = await findMaxForecastHour(cycleTime);
-          
-          // Calculate the future coverage (hours from now that this model covers)
-          const futureStart = Math.max(0, -hoursOld); // When this model starts covering the future
-          const futureEnd = maxHour - hoursOld; // How far into the future this model reaches
-          
-          // Determine status
-          let status, details;
-          if (maxHour >= 72) {
-            status = '✅ FULL';
-            details = `F000-F072`;
-            foundFull72 = true; // Found a full model, will stop after this
-          } else if (maxHour >= 0) {
-            status = '⚠️  PARTIAL';
-            details = `F000-F${String(maxHour).padStart(3,'0')}`;
-          } else {
-            status = '❌ NOT FOUND';
-            details = '';
-          }
-          
-          // Add future coverage info
-          if (futureEnd > 0) {
-            details += ` | Future: +${Math.round(futureEnd)}h`;
-          } else {
-            details += ' | Past only';
-          }
-          
-          logger.info(`${status} | ${formatTimeLocal(cycleTime)} (${String(testCycle).padStart(2,'0')}z) | ${hoursOld.toFixed(1)}h old | ${details}`);
-          
-          results.push({
-            time: cycleTime,
-            cycle: testCycle,
-            hoursOld: hoursOld,
-            maxHour: maxHour,
-            futureEnd: futureEnd,
-            available: maxHour >= 72,
-            partial: maxHour >= 0 && maxHour < 72
-          });
-          
-          modelsChecked++;
-          
-          if (foundFull72) {
-            logger.info('🛑 Stopping exploration - found full 72h model');
-          }
-        }
-        
-        searchDate.setUTCDate(searchDate.getUTCDate() - 1);
-        cycleIndex = CONFIG.SSCOFS_CYCLES.length - 1;
-      }
-      
-      // Analyze which models are actually needed for coverage
-      logger.info('================================================');
-      logger.info('=== Coverage Analysis ===');
-      
-      const availableModels = results.filter(r => r.maxHour >= 0);
-      
-      // Sort by how far into the future they reach
-      const futureModels = availableModels
-        .filter(r => r.futureEnd > 0)
-        .sort((a, b) => b.futureEnd - a.futureEnd);
-      
-      let maxCoverage = 0;
-      const neededModels = [];
-      const redundantModels = [];
-      
-      if (futureModels.length > 0) {
-        for (const model of futureModels) {
-          if (model.futureEnd > maxCoverage) {
-            neededModels.push(model);
-            logger.info(`✅ NEEDED: ${formatTimeLocal(model.time)} (${model.cycle}z) extends coverage to +${Math.round(model.futureEnd)}h`);
-            maxCoverage = model.futureEnd;
-          } else {
-            redundantModels.push(model);
-            logger.info(`⏭️  REDUNDANT: ${formatTimeLocal(model.time)} (${model.cycle}z) only reaches +${Math.round(model.futureEnd)}h`);
-          }
-        }
-        state.modelAvailability = neededModels;
-      } else if (availableModels.length > 0) {
-        // No future coverage, but we have stale data — use the newest model
-        const newest = availableModels.sort((a, b) => b.time - a.time)[0];
-        logger.warn(`⏳ All data is stale. Newest model: ${formatTimeLocal(newest.time)} (expired ${Math.round(-newest.futureEnd)}h ago)`);
-        state.modelAvailability = [newest];
-        state.isStaleData = true;
-      }
-      
-      // Summary
-      logger.info('================================================');
-      logger.info(`Models for coverage: ${state.modelAvailability.length}`);
-      logger.info(`Redundant models: ${redundantModels.length}`);
-      if (state.isStaleData) {
-        logger.info('⚠️ Using stale data — upstream model pipeline may be delayed');
-      } else {
-        logger.info(`Maximum future coverage: +${Math.round(maxCoverage)} hours`);
-      }
-      
-      return results;
-    }
-    
-    // Find the best (newest) model that has data for a specific forecast hour
-    function getBestModelForForecast(targetDate) {
-      if (!state.modelAvailability || state.modelAvailability.length === 0) {
-        return null;
-      }
-      
-      const now = new Date();
-      
-      // Find the newest model that can provide this forecast
-      for (const model of state.modelAvailability) {
-        if (model.maxHour < 0) continue; // Skip models with no data
-        
-        // Calculate what forecast hour this would be for this model
-        const modelTime = new Date(model.time);
-        const hoursSinceModel = (targetDate - modelTime) / (1000 * 60 * 60);
-        
-        // Check if this model covers the requested time
-        if (hoursSinceModel >= 0 && hoursSinceModel <= model.maxHour) {
-          logger.info(`Using model from ${formatTimeLocal(modelTime)} (${model.cycle}z) for F${Math.round(hoursSinceModel).toString().padStart(3,'0')}`);
-          return {
-            cycleDate: model.time,
-            cycleHour: model.cycle,
-            forecastHour: Math.round(hoursSinceModel),
-            maxHour: model.maxHour,
-            targetTime: targetDate
-          };
-        }
-      }
-      
-      logger.warn('No model available for requested time:', formatTimeLocal(targetDate));
-      return null;
-    }
-    
     // ========== INITIALIZATION ==========
     
     // Monitor online/offline status
@@ -2246,168 +1783,67 @@ window.addEventListener('resize', handleViewportChange);
         const now = new Date();
         now.setMinutes(0, 0, 0);
         
-      logger.info('=== Model Initialization ===');
-      logger.info('App Version:', CONFIG.APP_VERSION);
-      
-      document.getElementById('version-label').textContent = CONFIG.APP_VERSION;
-      
-      // Try Canvas renderer first (self-hosted data)
-      if (CONFIG.USE_CANVAS_RENDERER) {
-        try {
-          const renderer = new CurrentDataRenderer(map);
-          const manifest = await renderer.initialize(CONFIG.CURRENT_DATA_URL);
-          state.canvasRenderer = renderer;
-          state.useCanvasRenderer = true;
-          
-          const modelRun = new Date(manifest.model_run);
-          const hours = manifest.forecast_hours;
-          const maxHour = Math.max(...hours);
-          
-          // Compute hours-from-now for each forecast hour
-          const modelAgeHours = (now - modelRun) / 3600000;
-          const futureHoursAvail = maxHour - Math.ceil(modelAgeHours);
-          
-          const slider = document.getElementById('time-slider');
-          
-          if (futureHoursAvail > 0) {
-            // Normal mode: slider from 0 to maxFutureHours
-            slider.min = 0;
-            slider.max = Math.min(futureHoursAvail, maxHour);
-            slider.value = 0;
-            document.getElementById('slider-label').textContent = `Hours from now (0 to +${Math.round(futureHoursAvail)})`;
-            
-            // Load the initial forecast hour (closest to "now")
-            const initialFH = Math.max(0, Math.min(Math.round(modelAgeHours), maxHour));
-            await renderer.loadHour(initialFH);
-            document.getElementById('forecast-time').textContent = formatTimeLocal(now);
-            updateTideChart(now);
-            
-            // Preload adjacent hours in background (fetch-only, don't switch display)
-            for (const h of [initialFH - 1, initialFH + 1]) {
-              if (hours.includes(h) && h !== initialFH) {
-                renderer._prefetchHour(h);
-              }
-            }
-          } else {
-            // All data is historical
-            state.isStaleData = true;
-            state.staleModelStart = modelRun;
-            slider.min = 0;
-            slider.max = maxHour;
-            slider.value = 0;
-            
-            const modelEnd = new Date(modelRun.getTime() + maxHour * 3600000);
-            document.getElementById('slider-label').textContent =
-              `${formatTimeShort(modelRun)} — ${formatTimeShort(modelEnd)}`;
-            showStaleDataWarning(modelRun);
-            await renderer.loadHour(0);
-          }
-          
-          logger.info(`Canvas renderer active: ${manifest.num_elements.toLocaleString()} elements, ${hours.length} hours`);
-          logger.info(`Model run: ${manifest.model_run}, age: ${modelAgeHours.toFixed(1)}h`);
-          showLoading('', false);
-          return;
-        } catch (err) {
-          logger.warn('Canvas renderer failed, falling back to EIS tiles:', err.message);
-          state.useCanvasRenderer = false;
-        }
-      }
-      
-      // ---- Fallback: EIS tile-based rendering ----
-      logger.info('Using EIS tile-based rendering');
-      logger.info('Proxy URL:', CONFIG.PROXY_HOST);
+        logger.info('=== Ocean Currents Viewer ===');
+        logger.info('App Version:', CONFIG.APP_VERSION);
         
-        if (!navigator.onLine) {
-          state.isOffline = true;
-          logger.warn('Starting in offline mode');
-          const cachedModels = localStorage.getItem('model_availability');
-          if (cachedModels) {
-            const parsed = JSON.parse(cachedModels);
-            state.modelAvailability = parsed.map(m => ({
-              ...m,
-              time: new Date(m.time)
-            }));
-            state.isStaleData = !!parsed[0]?.isStaleData;
-            logger.info('Using cached model availability');
-          } else {
-            showError('No cached data available. Please connect to internet.');
-            return;
+        document.getElementById('version-label').textContent = CONFIG.APP_VERSION;
+        
+        // Initialize Canvas renderer with self-hosted S3 data
+        const renderer = new CurrentDataRenderer(map);
+        const manifest = await renderer.initialize(CONFIG.CURRENT_DATA_URL);
+        state.canvasRenderer = renderer;
+        
+        const modelRun = new Date(manifest.model_run);
+        const hours = manifest.forecast_hours;
+        const maxHour = Math.max(...hours);
+        
+        // Compute hours-from-now for each forecast hour
+        const modelAgeHours = (now - modelRun) / 3600000;
+        const futureHoursAvail = maxHour - Math.ceil(modelAgeHours);
+        
+        const slider = document.getElementById('time-slider');
+        
+        if (futureHoursAvail > 0) {
+          // Normal mode: slider from 0 to maxFutureHours
+          slider.min = 0;
+          slider.max = Math.min(futureHoursAvail, maxHour);
+          slider.value = 0;
+          document.getElementById('slider-label').textContent = `Hours from now (0 to +${Math.round(futureHoursAvail)})`;
+          
+          // Load the initial forecast hour (closest to "now")
+          const initialFH = Math.max(0, Math.min(Math.round(modelAgeHours), maxHour));
+          await renderer.loadHour(initialFH);
+          document.getElementById('forecast-time').textContent = formatTimeLocal(now);
+          updateTideChart(now);
+          
+          // Preload adjacent hours in background
+          for (const h of [initialFH - 1, initialFH + 1]) {
+            if (hours.includes(h) && h !== initialFH) {
+              renderer._prefetchHour(h);
+            }
           }
         } else {
-          const apiResults = await fetchDataAvailability();
-          if (apiResults && apiResults.length > 0) {
-            const availableModels = apiResults.filter(r => r.maxHour >= 0);
-            const futureModels = availableModels.filter(r => r.futureEnd > 0)
-              .sort((a, b) => b.futureEnd - a.futureEnd);
-            
-            if (futureModels.length > 0) {
-              let maxCov = 0;
-              state.modelAvailability = [];
-              for (const model of futureModels) {
-                if (model.futureEnd > maxCov) {
-                  state.modelAvailability.push(model);
-                  maxCov = model.futureEnd;
-                }
-              }
-            } else if (availableModels.length > 0) {
-              const newest = availableModels.sort((a, b) => b.time - a.time)[0];
-              logger.warn('All data is stale. Newest:', formatTimeLocal(newest.time));
-              state.modelAvailability = [newest];
-              state.isStaleData = true;
-            }
-          } else {
-            await exploreRecentModels(35);
-          }
+          // All data is historical (stale)
+          state.isStaleData = true;
+          state.staleModelStart = modelRun;
+          slider.min = 0;
+          slider.max = maxHour;
+          slider.value = 0;
           
-          const toCache = state.modelAvailability.map(m => ({
-            ...m,
-            isStaleData: state.isStaleData || false
-          }));
-          localStorage.setItem('model_availability', JSON.stringify(toCache));
+          const modelEnd = new Date(modelRun.getTime() + maxHour * 3600000);
+          document.getElementById('slider-label').textContent =
+            `${formatTimeShort(modelRun)} — ${formatTimeShort(modelEnd)}`;
+          showStaleDataWarning(modelRun);
+          await renderer.loadHour(0);
         }
         
-        if (!state.modelAvailability || state.modelAvailability.length === 0 || state.modelAvailability.every(m => m.maxHour < 0)) {
-          logger.error('No available models found!');
-          if (state.isOffline) {
-            showError('Cannot load model data while offline.');
-          } else {
-            showError('No ocean current data available. Please try again later.');
-          }
-          return;
-        }
-      
-      const slider = document.getElementById('time-slider');
-      
-      if (state.isStaleData) {
-        const model = state.modelAvailability[0];
-        const modelStart = new Date(model.time);
-        const modelEnd = new Date(modelStart.getTime() + model.maxHour * 60 * 60 * 1000);
+        logger.info(`Renderer active: ${manifest.num_elements.toLocaleString()} elements, ${hours.length} hours`);
+        logger.info(`Model run: ${manifest.model_run}, age: ${modelAgeHours.toFixed(1)}h`);
+        showLoading('', false);
         
-        state.staleModelStart = modelStart;
-        slider.min = 0;
-        slider.max = model.maxHour;
-        slider.value = 0;
-        
-        document.getElementById('slider-label').textContent = 
-          `${formatTimeShort(modelStart)} — ${formatTimeShort(modelEnd)}`;
-        
-        showStaleDataWarning(modelStart);
-        updateCurrentsLayerStale(0);
-      } else {
-        const maxFutureCoverage = Math.max(...state.modelAvailability.map(m => m.futureEnd));
-        
-        slider.min = 0;
-        slider.max = Math.round(maxFutureCoverage);
-        slider.value = 0;
-        
-        document.getElementById('slider-label').textContent = `Hours from now (0 to +${Math.round(maxFutureCoverage)})`;
-        updateCurrentsLayer(0);
-      }
-      
-      showLoading('', false);
       } catch (error) {
         logger.error('Initialization error:', error);
-        showError('Failed to initialize app. Please check your connection and try again.');
+        showError('Failed to load ocean current data. Please try again later.');
       }
     }
     
@@ -2435,115 +1871,47 @@ window.addEventListener('resize', handleViewportChange);
       document.body.appendChild(banner);
     }
     
-    function updateCurrentsLayerStale(forecastHour) {
-      const model = state.modelAvailability[0];
-      const modelStart = new Date(model.time);
-      const targetTime = new Date(modelStart.getTime() + forecastHour * 60 * 60 * 1000);
-      
-      const startTime = toIsoUTC(modelStart);
-      const endTime = toIsoUTC(targetTime);
-      
-      const tileUrl = `${PROXY_BASE}/tiles/salish-currents-vec/${startTime}/${endTime}/Surface/v2/ValueLocList/{z}/{y}/{x}.png`;
-      
-      logger.info(`[Stale] Model: ${formatTimeLocal(modelStart)} | Target: ${formatTimeLocal(targetTime)} | F${String(forecastHour).padStart(3,'0')}`);
-      
-      state.currentModelInfo = {
-        cycleDate: modelStart,
-        cycleHour: model.cycle,
-        forecastHour: forecastHour,
-        maxHour: model.maxHour,
-        targetTime: targetTime
-      };
-      
-      updateTimeDisplay(state.currentModelInfo);
-      
-      if (map.getSource('currents')) {
-        map.removeLayer('currents');
-        map.removeSource('currents');
-      }
-      
-      map.addSource('currents', {
-        type: 'raster',
-        tiles: [tileUrl],
-        tileSize: 256,
-        maxzoom: 18
-      });
-      
-      map.addLayer({
-        id: 'currents',
-        type: 'raster',
-        source: 'currents',
-        paint: { 'raster-opacity': 0.7 }
-      });
-    }
-    
     // ========== EVENT HANDLERS ==========
     
     document.getElementById('time-slider').addEventListener('input', (e) => {
-      if (state.isUpdating) return;
+      if (!state.canvasRenderer) return;
       
       const sliderVal = parseInt(e.target.value);
+      const manifest = state.canvasRenderer.manifest;
+      const modelRun = new Date(manifest.model_run);
+      const modelAgeHours = (new Date() - modelRun) / 3600000;
       
-      if (state.useCanvasRenderer && state.canvasRenderer) {
-        // Canvas renderer mode
-        const manifest = state.canvasRenderer.manifest;
-        const modelRun = new Date(manifest.model_run);
-        const modelAgeHours = (new Date() - modelRun) / 3600000;
-        
-        if (state.isStaleData) {
-          const targetTime = new Date(modelRun.getTime() + sliderVal * 3600000);
-          document.getElementById('slider-label').textContent =
-            `F${String(sliderVal).padStart(3,'0')} — ${formatTimeShort(targetTime)}`;
-          const forecastHour = sliderVal;
-          clearTimeout(window.updateTimer);
-          window.updateTimer = setTimeout(() => {
-            state.canvasRenderer.loadHour(forecastHour);
-            document.getElementById('forecast-time').textContent = formatTimeLocal(targetTime);
-            updateTideChart(targetTime);
-          }, 50);
-        } else {
-          const forecastHour = Math.round(modelAgeHours) + sliderVal;
-          const targetTime = new Date();
-          targetTime.setMinutes(0, 0, 0);
-          targetTime.setHours(targetTime.getHours() + sliderVal);
-          
-          const timeStr = sliderVal === 0 ? 'Now' : `+${sliderVal}h (${formatTimeShort(targetTime)})`;
-          document.getElementById('slider-label').textContent = timeStr;
-          document.getElementById('forecast-time').textContent = formatTimeLocal(targetTime);
-          
-          clearTimeout(window.updateTimer);
-          window.updateTimer = setTimeout(() => {
-            const fh = Math.max(0, Math.min(forecastHour, Math.max(...manifest.forecast_hours)));
-            state.canvasRenderer.loadHour(fh);
-            state.canvasRenderer._prefetchHour(fh + 1);
-            state.canvasRenderer._prefetchHour(fh - 1);
-            updateTideChart(targetTime);
-          }, 50);
-        }
-      } else if (state.isStaleData) {
-        const model = state.modelAvailability[0];
-        const modelStart = new Date(model.time);
-        const targetTime = new Date(modelStart.getTime() + sliderVal * 60 * 60 * 1000);
-        
-        document.getElementById('slider-label').textContent = 
+      if (state.isStaleData) {
+        // Historical data mode
+        const targetTime = new Date(modelRun.getTime() + sliderVal * 3600000);
+        document.getElementById('slider-label').textContent =
           `F${String(sliderVal).padStart(3,'0')} — ${formatTimeShort(targetTime)}`;
         
         clearTimeout(window.updateTimer);
         window.updateTimer = setTimeout(() => {
-          updateCurrentsLayerStale(sliderVal);
-        }, 100);
+          state.canvasRenderer.loadHour(sliderVal);
+          document.getElementById('forecast-time').textContent = formatTimeLocal(targetTime);
+          updateTideChart(targetTime);
+        }, 50);
       } else {
+        // Normal forecast mode
+        const forecastHour = Math.round(modelAgeHours) + sliderVal;
         const targetTime = new Date();
         targetTime.setMinutes(0, 0, 0);
         targetTime.setHours(targetTime.getHours() + sliderVal);
         
         const timeStr = sliderVal === 0 ? 'Now' : `+${sliderVal}h (${formatTimeShort(targetTime)})`;
         document.getElementById('slider-label').textContent = timeStr;
+        document.getElementById('forecast-time').textContent = formatTimeLocal(targetTime);
         
         clearTimeout(window.updateTimer);
         window.updateTimer = setTimeout(() => {
-          updateCurrentsLayer(sliderVal);
-        }, 100);
+          const fh = Math.max(0, Math.min(forecastHour, Math.max(...manifest.forecast_hours)));
+          state.canvasRenderer.loadHour(fh);
+          state.canvasRenderer._prefetchHour(fh + 1);
+          state.canvasRenderer._prefetchHour(fh - 1);
+          updateTideChart(targetTime);
+        }, 50);
       }
     });
     
@@ -2614,17 +1982,11 @@ window.addEventListener('resize', handleViewportChange);
         navigator.vibrate(10);
       }
       
-      // Fetch and show magnitude
-      if (state.useCanvasRenderer && state.canvasRenderer) {
+      // Show magnitude from Canvas renderer data
+      if (state.canvasRenderer) {
         const result = state.canvasRenderer.getNearestCurrent(lngLat.lng, lngLat.lat);
         if (result && result.distDeg < 0.01) {
           showMagnitudeMarker(screenPoint.x, screenPoint.y, result.speedKnots, lngLat.lat, lngLat.lng, result.u, result.v);
-        }
-      } else {
-        if (state.isOffline) return;
-        const result = await fetchCurrentMagnitude(lngLat.lat, lngLat.lng);
-        if (result) {
-          showMagnitudeMarker(screenPoint.x, screenPoint.y, result.value, lngLat.lat, lngLat.lng);
         }
       }
     });
