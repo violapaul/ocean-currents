@@ -10,6 +10,7 @@ A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current
 - **Speed heatmap** - Color-coded water showing current speed
 - **Tide integration** - Seattle tide chart with current time indicator
 - **Mobile-first PWA** - Installable on iOS and Android
+- **No proxy needed** - Direct fetch from S3 and NOAA APIs (both support CORS)
 
 ## Architecture
 
@@ -32,29 +33,28 @@ A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current
                               │ Upload (boto3)
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  AWS S3 (viola-ocean-currents)                                  │
+│  AWS S3 (viola-ocean-currents) - public read, CORS enabled     │
 │  └── ocean-currents/                                            │
-│      ├── latest.json          (5min cache)                      │
+│      ├── latest.json                                            │
 │      ├── {run_tag}/manifest.json                                │
 │      ├── {run_tag}/geometry.bin   (1.5MB, gzipped)             │
 │      └── {run_tag}/f000-f072.bin  (~1.1MB each, gzipped)       │
 └─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ Proxy with CORS + caching
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Cloudflare Worker (ocean-currents-proxy)                       │
-│  └── /current-data/* → S3 bucket                               │
-│  └── /noaa/tides    → NOAA CO-OPS API                          │
-│  └── /tiles/*       → coral.apl.uw.edu (fallback)              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
+          │                                           │
+          │ Direct fetch (CORS)                       │
+          ▼                                           │
 ┌─────────────────────────────────────────────────────────────────┐
 │  Browser (map-viewer-mobile.html)                               │
 │  └── Canvas renderer draws 310K vectors                         │
 │  └── Speed heatmap + direction arrows                           │
 │  └── Spatial indexing for fast queries                          │
+└─────────────────────────────────────────────────────────────────┘
+          │
+          │ Direct fetch (CORS)
+          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  NOAA Tides API (api.tidesandcurrents.noaa.gov)                │
+│  └── Seattle tide predictions (Station 9447130)                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -98,8 +98,6 @@ python generate_current_data.py --mode cache --upload --s3-bucket viola-ocean-cu
 ```
 OceanCurrents/
 ├── map-viewer-mobile.html    # Main PWA with Canvas renderer
-├── proxy-worker.js           # Cloudflare Worker proxy
-├── wrangler.toml             # Cloudflare config
 ├── manifest.json             # PWA manifest
 ├── service-worker.js         # Offline caching
 ├── app-icon.svg              # App icon
@@ -131,20 +129,12 @@ Add `?debug` to URL for verbose logging:
 http://localhost:8080/map-viewer-mobile.html?debug
 ```
 
-### Deploy Proxy Changes
-
-```bash
-cd OceanCurrents
-wrangler deploy  # Deploys proxy-worker.js to Cloudflare
-```
-
 ## URLs
 
 | Component | URL |
 |-----------|-----|
-| **Live App** | Host on GitHub Pages or any static server |
-| **Proxy** | https://ocean-currents-proxy.violapaul.workers.dev |
 | **S3 Data** | https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents/ |
+| **NOAA Tides** | https://api.tidesandcurrents.noaa.gov/api/prod/datagetter |
 | **Actions** | https://github.com/violapaul/WaysWaterMoves/actions |
 
 ## Deployment
@@ -176,6 +166,6 @@ See [../DEPLOYMENT.md](../DEPLOYMENT.md) for AWS credentials, GitHub Actions set
 ## Credits
 
 - **Ocean Data**: NOAA/NOS/CO-OPS SSCOFS
+- **Tides**: NOAA CO-OPS (Station 9447130 - Seattle)
 - **Map Library**: MapLibre GL JS
-- **Proxy**: Cloudflare Workers
 - **Storage**: AWS S3

@@ -310,13 +310,47 @@
       color: #ff0000;
       font-size: 14px;
       font-weight: bold;
-      text-shadow: 
+      text-shadow:
         -1px -1px 0 #fff,
         1px -1px 0 #fff,
         -1px 1px 0 #fff,
         1px 1px 0 #fff,
         0 0 2px #fff;
       white-space: nowrap;
+    }
+
+    .magnitude-arrow {
+      position: absolute;
+      width: 0;
+      height: 0;
+      top: 50%;
+      left: 50%;
+      transform-origin: center center;
+    }
+
+    .magnitude-arrow::before {
+      content: '';
+      position: absolute;
+      width: 4px;
+      height: 30px;
+      background: #ff0000;
+      left: -2px;
+      bottom: 0;
+      border-radius: 2px;
+      box-shadow: 0 0 3px #fff, 0 0 3px #fff;
+    }
+
+    .magnitude-arrow::after {
+      content: '';
+      position: absolute;
+      width: 0;
+      height: 0;
+      border-left: 8px solid transparent;
+      border-right: 8px solid transparent;
+      border-bottom: 14px solid #ff0000;
+      left: -8px;
+      bottom: 26px;
+      filter: drop-shadow(0 0 2px #fff);
     }
     
     /* Tide chart - floats over map */
@@ -456,6 +490,7 @@
     
     <!-- Magnitude marker (hidden by default) -->
     <div class="magnitude-marker" id="magnitude-marker" style="display: none;">
+      <div class="magnitude-arrow" id="magnitude-arrow"></div>
       <div class="magnitude-cross"></div>
       <div class="magnitude-value" id="magnitude-value">0.0</div>
     </div>
@@ -482,8 +517,9 @@
     
     // ========== CONFIGURATION ==========
     const CONFIG = {
-      APP_VERSION: 'v2.0.0', // Self-hosted current data with Canvas rendering
-      PROXY_HOST: 'https://ocean-currents-proxy.violapaul.workers.dev',
+      APP_VERSION: 'v2.1.0', // Direct S3 + NOAA API (no proxy)
+      S3_BUCKET_URL: 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
+      NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
       SSCOFS_CYCLES: [0, 3, 9, 15, 21],
@@ -493,7 +529,7 @@
       // Self-hosted current data (Canvas rendering)
       CURRENT_DATA_URL: location.hostname === 'localhost' || location.hostname === '127.0.0.1'
         ? `${location.origin}/Python_SSCOFS/current_data`
-        : 'https://ocean-currents-proxy.violapaul.workers.dev/current-data',
+        : 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
       USE_CANVAS_RENDERER: true,
     };
     
@@ -531,6 +567,10 @@
         this.spatialIndex = null; // { cellSize, cols, rows, cells: Map<cellKey, [indices]> }
         this._renderScheduled = false;
         this._boundRender = () => this._doRender();
+        
+        // Arrow caching - per-tile on-demand caching
+        this._cachedArrowZoom = -1;
+        this._cachedArrowTiles = new Map();  // tile key -> array of arrows
       }
       
       async initialize(baseUrl) {
@@ -652,6 +692,8 @@
         if (this.velocityCache[hour]) {
           this.currentVelocity = this.velocityCache[hour];
           this.currentHour = hour;
+          this._cachedArrowZoom = -1;  // Invalidate arrow cache for new data
+          this._cachedArrowTiles = new Map();  // Clear cached tiles
           this.scheduleRender();
           return;
         }
@@ -671,6 +713,8 @@
         this.velocityCache[hour] = f32;
         this.currentVelocity = f32;
         this.currentHour = hour;
+        this._cachedArrowZoom = -1;  // Invalidate arrow cache for new data
+        this._cachedArrowTiles = new Map();  // Clear cached tiles
         this.scheduleRender();
       }
       
@@ -773,16 +817,12 @@
           }
         }
         
-        // Screen grid for consistent arrow density at all zoom levels
-        // Divide screen into fixed-size cells, one arrow per cell max
-        const arrowSpacing = 30;  // pixels between arrows
-        const gridCols = Math.ceil(w / arrowSpacing);
-        const gridRows = Math.ceil(h / arrowSpacing);
-        const gridSize = gridCols * gridRows;
-        
-        // Arrow size scaling based on zoom
-        const arrowScale = Math.min(2.0, Math.max(0.5, (zoom - 8) * 0.25 + 0.5));
-        const baseLen = 12 * arrowScale;
+        // Virtual tile-based arrow grid for consistent density at all zoom levels
+        // Each 256px tile gets a 12×12 grid of arrows (144 arrows per tile)
+        const TILE_SIZE = 256;
+        const ARROWS_PER_TILE = 12;  // 12×12 = 144 arrows per tile
+        const arrowPitch = TILE_SIZE / ARROWS_PER_TILE;  // ~21px spacing
+        const baseLen = arrowPitch * 0.55;  // arrow length ~12px
         
         // Precompute arrowhead trig constants (half-angle = 0.45 rad ≈ 26°)
         const cosHA = Math.cos(0.45);
@@ -796,44 +836,386 @@
         
         ctx.lineCap = 'round';
         
-        // === HEATMAP PASS: Draw colored dots for ALL visible elements ===
-        // Dot radius must scale EXPONENTIALLY with zoom (screen distance doubles per zoom level).
-        // At zoom 10, grid points are ~2px apart. Radius scales as 2^(zoom-10).
-        const dotRadius = Math.max(1.5, Math.min(60, 1.8 * Math.pow(2, zoom - 10)));
+        // Heatmap is now drawn from virtual tile arrows (below, after arrow caching)
+        
+        // === DEBUG: Draw original data vectors in red ===
+        if (false && IS_DEBUG) {  // disabled
+          const debugArrowLen = 16;  // 2x longer for visibility
+          ctx.strokeStyle = 'red';
+          ctx.fillStyle = 'red';
+          ctx.lineWidth = 1.5;
+          
+          for (let row = rowMin; row <= rowMax; row++) {
+            for (let col = colMin; col <= colMax; col++) {
+              const key = row * si.cols + col;
+              const indices = si.cells.get(key);
+              if (!indices) continue;
+              
+              for (let ii = 0; ii < indices.length; ii++) {  // draw ALL
+                const idx = indices[ii];
+                const u = vel[idx * 2];
+                const v = vel[idx * 2 + 1];
+                const speed = Math.sqrt(u * u + v * v);
+                if (speed < 0.001) continue;
+                
+                const lon = geom[idx * 2];
+                const lat = geom[idx * 2 + 1];
+                
+                let sx, sy;
+                if (useFastProj) {
+                  const pxX = (lon + 180) * lngScale;
+                  const latRad = lat * DEG2RAD;
+                  const pxY = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * worldSize;
+                  sx = pxX - centerPxX + halfW;
+                  sy = pxY - centerPxY + halfH;
+                } else {
+                  const pt = this.map.project([lon, lat]);
+                  sx = pt.x;
+                  sy = pt.y;
+                }
+                
+                if (sx < 0 || sx > w || sy < 0 || sy > h) continue;
+                
+                const invSpd = 1 / speed;
+                const nx = u * invSpd;
+                const ny = -v * invSpd;
+                const tipX = sx + nx * debugArrowLen;
+                const tipY = sy + ny * debugArrowLen;
+                
+                // Shaft
+                ctx.beginPath();
+                ctx.moveTo(sx, sy);
+                ctx.lineTo(tipX, tipY);
+                ctx.stroke();
+                
+                // Arrowhead
+                const headLen = 5;
+                const headAngle = 0.4;
+                const cosA = Math.cos(headAngle);
+                const sinA = Math.sin(headAngle);
+                ctx.beginPath();
+                ctx.moveTo(tipX, tipY);
+                ctx.lineTo(tipX - headLen * (nx * cosA + ny * sinA),
+                           tipY - headLen * (ny * cosA - nx * sinA));
+                ctx.moveTo(tipX, tipY);
+                ctx.lineTo(tipX - headLen * (nx * cosA - ny * sinA),
+                           tipY - headLen * (ny * cosA + nx * sinA));
+                ctx.stroke();
+              }
+            }
+          }
+        }
+        
+        // === ARROW PASS: Virtual tile-based sampling with on-demand caching ===
+        const intZoom = Math.floor(zoom);
+        const tileCount = Math.pow(2, intZoom + 2);
+        
+        // Clear cache if zoom level changed
+        if (intZoom !== this._cachedArrowZoom) {
+          this._cachedArrowTiles = new Map();  // tile key -> array of arrows
+          this._cachedArrowZoom = intZoom;
+        }
+        
+        // Tile coordinate helpers
+        const tileYToLat = (ty) => {
+          const n = PI * (1 - 2 * ty / tileCount);
+          return Math.atan(Math.sinh(n)) / DEG2RAD;
+        };
+        const lonToTileX = (lon) => (lon + 180) / 360 * tileCount;
+        const latToTileY = (lat) => {
+          const latRad = lat * DEG2RAD;
+          return (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * tileCount;
+        };
+        
+        // Visible tile range
+        const tileXMin = Math.floor(lonToTileX(vLonMin));
+        const tileXMax = Math.ceil(lonToTileX(vLonMax));
+        const tileYMin = Math.floor(latToTileY(vLatMax));
+        const tileYMax = Math.ceil(latToTileY(vLatMin));
+        
+        // Delta = distance between adjacent arrows (one grid cell)
+        // Search with larger radius but require data in 2+ quadrants
+        // Use max of 5*delta or 0.003° (~300m) to ensure we find enough data
+        const delta = 360 / (tileCount * ARROWS_PER_TILE);
+        const searchRadius = Math.max(delta * 5, 0.003);
+        const maxDistSq = searchRadius * searchRadius;
+        const bounds = si.bounds;
+        
+        let newTilesCached = 0;
+        
+        // Cache arrows for visible tiles that aren't cached yet
+        for (let ty = tileYMin; ty <= tileYMax; ty++) {
+          for (let tx = tileXMin; tx <= tileXMax; tx++) {
+            const tileKey = `${tx},${ty}`;
+            if (this._cachedArrowTiles.has(tileKey)) continue;
+            
+            // Compute arrows for this tile using IDW interpolation (two-pass for gap filling)
+            const tileArrows = [];
+            const N = ARROWS_PER_TILE;
+            
+            // First pass: compute IDW for all cells, track which have tight neighbors
+            const cellData = new Array(N * N);  // stores {u, v, wSum} or null
+            
+            for (let ay = 0; ay < N; ay++) {
+              for (let ax = 0; ax < N; ax++) {
+                const tileXFrac = tx + (ax + 0.5) / N;
+                const tileYFrac = ty + (ay + 0.5) / N;
+                const aLon = tileXFrac / tileCount * 360 - 180;
+                const aLat = tileYToLat(tileYFrac);
+                
+                if (aLon < bounds.lon_min || aLon > bounds.lon_max ||
+                    aLat < bounds.lat_min || aLat > bounds.lat_max) continue;
+                
+                const siCol = Math.floor((aLon - bounds.lon_min) / si.cellSize);
+                const siRow = Math.floor((aLat - bounds.lat_min) / si.cellSize);
+                if (siCol < 0 || siCol >= si.cols || siRow < 0 || siRow >= si.rows) continue;
+                
+                let uSum = 0, vSum = 0, wSum = 0;
+                let hasNE = false, hasNW = false, hasSE = false, hasSW = false;
+                
+                // Search enough SI cells to cover the search radius
+                const siCellsNeeded = Math.ceil(searchRadius / si.cellSize) + 1;
+                for (let dr = -siCellsNeeded; dr <= siCellsNeeded; dr++) {
+                  for (let dc = -siCellsNeeded; dc <= siCellsNeeded; dc++) {
+                    const r = siRow + dr, c = siCol + dc;
+                    if (r < 0 || r >= si.rows || c < 0 || c >= si.cols) continue;
+                    const indices = si.cells.get(r * si.cols + c);
+                    if (!indices) continue;
+                    for (const idx of indices) {
+                      const dlon = geom[idx * 2] - aLon;
+                      const dlat = geom[idx * 2 + 1] - aLat;
+                      const distSq = dlon * dlon + dlat * dlat;
+                      if (distSq > maxDistSq) continue;
+                      
+                      // Track which quadrants have data
+                      if (dlon >= 0 && dlat >= 0) hasNE = true;
+                      if (dlon < 0 && dlat >= 0) hasNW = true;
+                      if (dlon >= 0 && dlat < 0) hasSE = true;
+                      if (dlon < 0 && dlat < 0) hasSW = true;
+                      
+                      const w = 1 / (Math.sqrt(distSq) + 0.0001);
+                      uSum += vel[idx * 2] * w;
+                      vSum += vel[idx * 2 + 1] * w;
+                      wSum += w;
+                    }
+                  }
+                }
+                
+                // Require data not clustered on just one side (half)
+                // At land edge: data only on water side - one half is empty - skip
+                // In water: data distributed - no half is empty - include
+                const northEmpty = !hasNE && !hasNW;
+                const southEmpty = !hasSE && !hasSW;
+                const eastEmpty = !hasNE && !hasSE;
+                const westEmpty = !hasNW && !hasSW;
+                if (northEmpty || southEmpty || eastEmpty || westEmpty) continue;
+                
+                cellData[ay * N + ax] = { aLon, aLat, uSum, vSum, wSum };
+              }
+            }
+            
+            // Second pass: emit arrows for cells that passed the quadrant check
+            for (let ay = 0; ay < N; ay++) {
+              for (let ax = 0; ax < N; ax++) {
+                const cell = cellData[ay * N + ax];
+                if (!cell || cell.wSum === 0) continue;
+                
+                const u = cell.uSum / cell.wSum;
+                const v = cell.vSum / cell.wSum;
+                const speed = Math.sqrt(u * u + v * v);
+                if (speed < 0.001) continue;
+                
+                const invSpd = 1 / speed;
+                tileArrows.push({
+                  lon: cell.aLon, lat: cell.aLat,
+                  nx: u * invSpd, ny: -v * invSpd,
+                  speed: speed
+                });
+              }
+            }
+            
+            this._cachedArrowTiles.set(tileKey, tileArrows);
+            newTilesCached++;
+            
+            if (IS_DEBUG && tileArrows.length > 0) {
+              // Count how many were direct vs surrounded
+              let directCount = 0, surroundedCount = 0;
+              // We can't easily track this without modifying above, so just log tile info
+              logger.debug(`Tile ${tileKey}: ${tileArrows.length} arrows`);
+            }
+          }
+        }
+        
+        if (IS_DEBUG && newTilesCached > 0) {
+          logger.debug(`Cached ${newTilesCached} new tiles at z${intZoom}, total tiles=${this._cachedArrowTiles.size}`);
+        }
+        
+        // DEBUG: Draw virtual tile grid boundaries
+        if (IS_DEBUG) {
+          const tileCount = Math.pow(2, intZoom + 2);
+          const tileYToLat = (ty) => {
+            const n = PI * (1 - 2 * ty / tileCount);
+            return Math.atan(Math.sinh(n)) / DEG2RAD;
+          };
+          
+          // Calculate visible tile range
+          const lonToTileX = (lon) => (lon + 180) / 360 * tileCount;
+          const latToTileY = (lat) => {
+            const latRad = lat * DEG2RAD;
+            return (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * tileCount;
+          };
+          
+          const tileXMin = Math.floor(lonToTileX(vLonMin));
+          const tileXMax = Math.ceil(lonToTileX(vLonMax));
+          const tileYMin = Math.floor(latToTileY(vLatMax));
+          const tileYMax = Math.ceil(latToTileY(vLatMin));
+          
+          // Project helper
+          const projectToScreen = (lon, lat) => {
+            if (useFastProj) {
+              const pxX = (lon + 180) * lngScale;
+              const latRad = lat * DEG2RAD;
+              const pxY = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * worldSize;
+              return { x: pxX - centerPxX + halfW, y: pxY - centerPxY + halfH };
+            } else {
+              const pt = this.map.project([lon, lat]);
+              return { x: pt.x, y: pt.y };
+            }
+          };
+          
+          // Draw tile boundaries (thick red)
+          ctx.strokeStyle = 'rgba(255, 0, 0, 0.7)';
+          ctx.lineWidth = 2;
+          for (let ty = tileYMin; ty <= tileYMax + 1; ty++) {
+            const lat = tileYToLat(ty);
+            const p1 = projectToScreen(vLonMin - 1, lat);
+            const p2 = projectToScreen(vLonMax + 1, lat);
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.stroke();
+          }
+          for (let tx = tileXMin; tx <= tileXMax + 1; tx++) {
+            const lon = tx / tileCount * 360 - 180;
+            const p1 = projectToScreen(lon, vLatMin - 1);
+            const p2 = projectToScreen(lon, vLatMax + 1);
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.stroke();
+          }
+          
+          // Draw arrow grid lines within tiles (thin blue)
+          ctx.strokeStyle = 'rgba(0, 100, 255, 0.4)';
+          ctx.lineWidth = 1;
+          for (let ty = tileYMin; ty <= tileYMax; ty++) {
+            for (let a = 1; a < ARROWS_PER_TILE; a++) {
+              const lat = tileYToLat(ty + a / ARROWS_PER_TILE);
+              const p1 = projectToScreen(vLonMin - 1, lat);
+              const p2 = projectToScreen(vLonMax + 1, lat);
+              ctx.beginPath();
+              ctx.moveTo(p1.x, p1.y);
+              ctx.lineTo(p2.x, p2.y);
+              ctx.stroke();
+            }
+          }
+          for (let tx = tileXMin; tx <= tileXMax; tx++) {
+            for (let a = 1; a < ARROWS_PER_TILE; a++) {
+              const lon = (tx + a / ARROWS_PER_TILE) / tileCount * 360 - 180;
+              const p1 = projectToScreen(lon, vLatMin - 1);
+              const p2 = projectToScreen(lon, vLatMax + 1);
+              ctx.beginPath();
+              ctx.moveTo(p1.x, p1.y);
+              ctx.lineTo(p2.x, p2.y);
+              ctx.stroke();
+            }
+          }
+        }
+        
+        // Get map canvas pixels for water/land detection
+        let mapPixels = null;
+        try {
+          const mapCanvas = this.map.getCanvas();
+          const gl = this.map.painter.context.gl;
+          const mapW = mapCanvas.width;
+          const mapH = mapCanvas.height;
+          mapPixels = new Uint8Array(mapW * mapH * 4);
+          gl.readPixels(0, 0, mapW, mapH, gl.RGBA, gl.UNSIGNED_BYTE, mapPixels);
+          // WebGL pixels are bottom-up, we'll account for this when sampling
+        } catch (e) {
+          // If we can't read pixels, fall back to drawing all arrows
+          if (IS_DEBUG) logger.debug('Could not read map pixels:', e.message);
+        }
+        
+        // Helper to check if a pixel is water using HSL hue
+        const mapCanvas = this.map.getCanvas();
+        const pixelRatio = window.devicePixelRatio || 1;
+        const canvasW = mapCanvas.width;
+        const canvasH = mapCanvas.height;
+        
+        const isWater = (sx, sy) => {
+          if (!mapPixels) return true;  // fall back to drawing
+          const px = Math.floor(sx * pixelRatio);
+          const py = canvasH - 1 - Math.floor(sy * pixelRatio);  // flip Y for WebGL (row 0 is bottom)
+          if (px < 0 || px >= canvasW || py < 0 || py >= canvasH) return true;
+          const i = (py * canvasW + px) * 4;
+          const r = mapPixels[i], g = mapPixels[i + 1], b = mapPixels[i + 2], a = mapPixels[i + 3];
+          
+          // If pixel is transparent/black (tiles not yet loaded), assume water
+          if (a < 128 || (r === 0 && g === 0 && b === 0)) return true;
+          
+          // Convert to HSL to check hue
+          const rNorm = r / 255, gNorm = g / 255, bNorm = b / 255;
+          const max = Math.max(rNorm, gNorm, bNorm);
+          const min = Math.min(rNorm, gNorm, bNorm);
+          const l = (max + min) / 2;
+          
+          if (max === min) return false; // grey = not water
+          
+          const d = max - min;
+          const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+          
+          let h;
+          if (max === rNorm) h = ((gNorm - bNorm) / d + (gNorm < bNorm ? 6 : 0)) / 6;
+          else if (max === gNorm) h = ((bNorm - rNorm) / d + 2) / 6;
+          else h = ((rNorm - gNorm) / d + 4) / 6;
+          
+          const hDeg = h * 360;
+          
+          // Water hue is typically 180-220 (cyan to blue), with some saturation
+          // Also allow the light basemap water which is ~195 hue
+          return hDeg >= 170 && hDeg <= 230 && s > 0.08;
+        };
+        
+        // === HEATMAP PASS: Draw colored dots from virtual tile arrows ===
+        // Dot radius based on arrow spacing - should overlap slightly to create continuous field
+        const dotRadius = baseLen * 0.7;
         ctx.globalAlpha = 0.55;
         
-        for (let row = rowMin; row <= rowMax; row++) {
-          for (let col = colMin; col <= colMax; col++) {
-            const key = row * si.cols + col;
-            const indices = si.cells.get(key);
-            if (!indices) continue;
+        for (let ty = tileYMin; ty <= tileYMax; ty++) {
+          for (let tx = tileXMin; tx <= tileXMax; tx++) {
+            const tileKey = `${tx},${ty}`;
+            const tileArrows = this._cachedArrowTiles.get(tileKey);
+            if (!tileArrows) continue;
             
-            for (let ii = 0; ii < indices.length; ii++) {
-              const idx = indices[ii];
-              const u = vel[idx * 2];
-              const v = vel[idx * 2 + 1];
-              const speed = Math.sqrt(u * u + v * v);
-              if (speed < 0.001) continue;
-              
-              const lon = geom[idx * 2];
-              const lat = geom[idx * 2 + 1];
-              
+            for (const arrow of tileArrows) {
               let sx, sy;
               if (useFastProj) {
-                const pxX = (lon + 180) * lngScale;
-                const latRad = lat * DEG2RAD;
+                const pxX = (arrow.lon + 180) * lngScale;
+                const latRad = arrow.lat * DEG2RAD;
                 const pxY = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * worldSize;
                 sx = pxX - centerPxX + halfW;
                 sy = pxY - centerPxY + halfH;
               } else {
-                const pt = this.map.project([lon, lat]);
+                const pt = this.map.project([arrow.lon, arrow.lat]);
                 sx = pt.x;
                 sy = pt.y;
               }
               
               if (sx < -dotRadius || sx > w + dotRadius || sy < -dotRadius || sy > h + dotRadius) continue;
+              if (!isWater(sx, sy)) continue;
               
-              const speedKnots = speed * 1.94384;
+              const speedKnots = arrow.speed * 1.94384;
               const ci = Math.min(255, Math.round(Math.min(speedKnots / 3.0, 1.0) * 255));
               const rgb = colorsRGB[ci];
               
@@ -844,76 +1226,43 @@
             }
           }
         }
-        
         ctx.globalAlpha = 1.0;
         
-        // === ARROW PASS: Grid-based sampling for uniform density ===
-        // Each screen grid cell gets at most one arrow (the highest speed element in that cell)
-        const arrowGrid = new Float32Array(gridSize * 5);  // [sx, sy, nx, ny, speed] per cell
-        for (let i = 0; i < gridSize; i++) arrowGrid[i * 5 + 4] = -1;  // mark empty
-        
-        for (let row = rowMin; row <= rowMax; row++) {
-          for (let col = colMin; col <= colMax; col++) {
-            const key = row * si.cols + col;
-            const indices = si.cells.get(key);
-            if (!indices) continue;
+        // === ARROW PASS: Draw arrows from cached visible tiles ===
+        for (let ty = tileYMin; ty <= tileYMax; ty++) {
+          for (let tx = tileXMin; tx <= tileXMax; tx++) {
+            const tileKey = `${tx},${ty}`;
+            const tileArrows = this._cachedArrowTiles.get(tileKey);
+            if (!tileArrows) continue;
             
-            for (let ii = 0; ii < indices.length; ii++) {
-              const idx = indices[ii];
-              const u = vel[idx * 2];
-              const v = vel[idx * 2 + 1];
-              const speed = Math.sqrt(u * u + v * v);
-              if (speed < 0.001) continue;
-              
-              const lon = geom[idx * 2];
-              const lat = geom[idx * 2 + 1];
-              
+            for (const arrow of tileArrows) {
+              // Project to screen
               let sx, sy;
               if (useFastProj) {
-                const pxX = (lon + 180) * lngScale;
-                const latRad = lat * DEG2RAD;
+                const pxX = (arrow.lon + 180) * lngScale;
+                const latRad = arrow.lat * DEG2RAD;
                 const pxY = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * worldSize;
                 sx = pxX - centerPxX + halfW;
                 sy = pxY - centerPxY + halfH;
               } else {
-                const pt = this.map.project([lon, lat]);
+                const pt = this.map.project([arrow.lon, arrow.lat]);
                 sx = pt.x;
                 sy = pt.y;
               }
               
-              if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+              if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
               
-              // Determine which screen grid cell this element belongs to
-              const gc = Math.floor(sx / arrowSpacing);
-              const gr = Math.floor(sy / arrowSpacing);
-              const gi = gr * gridCols + gc;
+              // Skip if not over water
+              if (!isWater(sx, sy)) continue;
               
-              // Keep the highest speed element per grid cell
-              if (speed > arrowGrid[gi * 5 + 4]) {
-                const invSpd = 1 / speed;
-                arrowGrid[gi * 5 + 0] = sx;
-                arrowGrid[gi * 5 + 1] = sy;
-                arrowGrid[gi * 5 + 2] = u * invSpd;
-                arrowGrid[gi * 5 + 3] = -v * invSpd;
-                arrowGrid[gi * 5 + 4] = speed;
-              }
+              this._drawArrow(ctx, sx, sy, arrow.nx, arrow.ny, arrow.speed, baseLen, colors, cosHA, sinHA);
+              drawn++;
             }
           }
         }
         
-        // Draw one arrow per occupied grid cell
-        for (let gi = 0; gi < gridSize; gi++) {
-          const speed = arrowGrid[gi * 5 + 4];
-          if (speed < 0) continue;
-          this._drawArrow(ctx,
-            arrowGrid[gi * 5 + 0], arrowGrid[gi * 5 + 1],
-            arrowGrid[gi * 5 + 2], arrowGrid[gi * 5 + 3],
-            speed, baseLen, colors, cosHA, sinHA);
-          drawn++;
-        }
-        
         if (IS_DEBUG) {
-          logger.debug(`Rendered ${drawn.toLocaleString()} arrows at z${zoom.toFixed(1)}, grid=${gridCols}x${gridRows}, visible=${totalVisible.toLocaleString()}`);
+          logger.debug(`Rendered ${drawn.toLocaleString()} arrows at z${zoom.toFixed(1)} (z${intZoom}), cached tiles=${this._cachedArrowTiles.size}`);
         }
       }
       
@@ -1144,8 +1493,8 @@
         `interval=6&` + // 6-minute intervals for smooth curve
         `format=json`;
       
-      // Always use proxy - NOAA doesn't provide CORS headers either
-      const url = `${CONFIG.PROXY_HOST}/noaa/tides?${noaaUrl.split('?')[1]}`;
+      // Call NOAA directly (they now support CORS)
+      const url = `${CONFIG.NOAA_TIDES_API}?${noaaUrl.split('?')[1]}`;
       
       logger.debug('🌊 Fetching tide data:', url);
       
@@ -1375,20 +1724,33 @@
       }
     }
     
-    function showMagnitudeMarker(x, y, magnitude, lat, lng) {
+    function showMagnitudeMarker(x, y, magnitude, lat, lng, u, v) {
       const marker = document.getElementById('magnitude-marker');
       const valueEl = document.getElementById('magnitude-value');
-      
+      const arrowEl = document.getElementById('magnitude-arrow');
+
       // Format magnitude to 1 decimal place
       valueEl.textContent = magnitude.toFixed(1);
-      
+
+      // Calculate arrow direction from u, v (u=east, v=north)
+      // atan2 gives angle from east, we need to rotate so arrow points in flow direction
+      // CSS rotation: 0=up, 90=right, 180=down, 270=left
+      // atan2(u, v) gives angle from north (0=north, 90=east)
+      if (u !== undefined && v !== undefined) {
+        const angleDeg = Math.atan2(u, v) * 180 / Math.PI;  // 0=north, 90=east
+        arrowEl.style.transform = `rotate(${angleDeg}deg)`;
+        arrowEl.style.display = 'block';
+      } else {
+        arrowEl.style.display = 'none';
+      }
+
       // Position the marker
       marker.style.left = x + 'px';
       marker.style.top = y + 'px';
       marker.style.display = 'block';
-      
+
       // Store marker info including lat/lng for updates
-      state.magnitudeMarker = { x, y, magnitude, lat, lng };
+      state.magnitudeMarker = { x, y, magnitude, lat, lng, u, v };
     }
     
     function hideMagnitudeMarker() {
@@ -1456,6 +1818,7 @@
     
     const map = new maplibregl.Map({
       container: "map",
+      preserveDrawingBuffer: true,  // Required for pixel sampling
       style: {
         version: 8,
         sources: {
@@ -2255,7 +2618,7 @@ window.addEventListener('resize', handleViewportChange);
       if (state.useCanvasRenderer && state.canvasRenderer) {
         const result = state.canvasRenderer.getNearestCurrent(lngLat.lng, lngLat.lat);
         if (result && result.distDeg < 0.01) {
-          showMagnitudeMarker(screenPoint.x, screenPoint.y, result.speedKnots, lngLat.lat, lngLat.lng);
+          showMagnitudeMarker(screenPoint.x, screenPoint.y, result.speedKnots, lngLat.lat, lngLat.lng, result.u, result.v);
         }
       } else {
         if (state.isOffline) return;
