@@ -807,11 +807,13 @@
         }
         
         // Virtual tile-based arrow grid for consistent density at all zoom levels
-        // Each 256px tile gets a 12×12 grid of arrows (144 arrows per tile)
         const TILE_SIZE = 256;
         const ARROWS_PER_TILE = 16;  // 16×16 = 256 arrows per tile
-        const arrowPitch = TILE_SIZE / ARROWS_PER_TILE;  // ~21px spacing
-        const baseLen = arrowPitch * 0.55;  // arrow length ~12px
+        const arrowPitch = TILE_SIZE / ARROWS_PER_TILE;
+        // Scale by fractional zoom so arrows stay same size relative to map tiles
+        const intZoom = Math.floor(zoom);
+        const zoomScale = Math.pow(2, zoom - intZoom);  // 1.0 at integer zoom, ~1.41 at +0.5
+        const baseLen = arrowPitch * 0.55 * zoomScale;
         
         // Precompute arrowhead trig constants (half-angle = 0.45 rad ≈ 26°)
         const cosHA = Math.cos(0.45);
@@ -896,7 +898,6 @@
         }
         
         // === ARROW PASS: Virtual tile-based sampling with on-demand caching ===
-        const intZoom = Math.floor(zoom);
         const tileCount = Math.pow(2, intZoom + 2);
         
         // Clear cache if zoom level changed
@@ -1277,8 +1278,8 @@
         ctx.lineWidth = lineW;
         ctx.stroke();
         
-        // Arrowhead using precomputed trig (larger: 0.4 head length)
-        const headLen = len * 0.4;
+        // Arrowhead using precomputed trig
+        const headLen = len * 0.5;
         ctx.beginPath();
         ctx.moveTo(tipX, tipY);
         ctx.lineTo(
