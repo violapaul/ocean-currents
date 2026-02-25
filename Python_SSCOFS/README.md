@@ -1,476 +1,217 @@
-# Python Tools for SSCOFS Current Visualization
+# SSCOFS Data Pipeline
 
-Command-line tools for downloading, analyzing, and visualizing ocean current data from NOAA's Salish Sea Coastal Ocean Forecast System (SSCOFS).
+Automated pipeline for fetching NOAA SSCOFS ocean current data and exporting it as compact binary files for web visualization.
 
 ## Quick Start
 
 ```bash
-# Setup
+# Setup environment
 conda env create -f currents_env.yml
 conda activate currents
 
-# Basic plot
-python plot_local_currents.py --lat 47.6718 --lon -122.4584 --radius 5 --save currents.png
+# Generate data for Puget Sound region (fast mode, ~2 minutes)
+python generate_current_data.py --mode fast --workers 12
 
-# Setup basemaps (one-time).  Optional.  
-python setup_basemaps.py --all
-python test_basemaps.py --all
+# Generate and upload to S3
+python generate_current_data.py --mode fast --workers 12 --upload --s3-bucket viola-ocean-currents
+```
+
+## Pipeline Modes
+
+### Fast Mode (Recommended)
+
+Uses **byte-range S3 reads** via `s3fs` to fetch only the variables needed (~3.4MB per file instead of ~200MB).
+
+```bash
+python generate_current_data.py --mode fast --workers 12 --hours 0-72
+```
+
+**Performance:**
+- 73 hours in ~2 minutes
+- ~250MB total data transfer (vs 14.6GB for full files)
+- 12 parallel workers for maximum throughput
+
+### Cache Mode (Offline/Debug)
+
+Downloads full NetCDF files to local cache. Useful for offline development or when byte-range reads fail.
+
+```bash
+python generate_current_data.py --mode cache --hours 0-72
+```
+
+**Performance:**
+- 73 hours in ~20+ minutes
+- Downloads full ~200MB files
+- Files cached in `.sscofs_cache/`
+
+## Output Files
+
+```
+current_data/
+├── latest.json                    # Points to current model run
+└── {YYYYMMDD}_{HH}z/             # e.g., 20260224_15z/
+    ├── manifest.json              # Metadata (bounds, element count, hours)
+    ├── geometry.bin               # Float32 [lon,lat,...] gzipped (~1.5MB)
+    ├── f000.bin                   # Float16 [u,v,...] for hour 0 (~1.1MB)
+    ├── f001.bin                   # Float16 [u,v,...] for hour 1
+    └── ...through f072.bin
+```
+
+### Data Format
+
+**geometry.bin** (gzipped Float32, little-endian):
+```
+[lon0, lat0, lon1, lat1, lon2, lat2, ...]
+```
+
+**f{NNN}.bin** (gzipped Float16, little-endian):
+```
+[u0, v0, u1, v1, u2, v2, ...]  // velocity in m/s
+```
+
+**manifest.json**:
+```json
+{
+  "model_run": "2026-02-24T15:00:00Z",
+  "generated_at": "2026-02-24T21:44:48Z",
+  "num_elements": 310778,
+  "bounds": {
+    "lat_min": 46.21,
+    "lat_max": 49.02,
+    "lon_min": -124.51,
+    "lon_max": -121.48
+  },
+  "forecast_hours": [0, 1, 2, ..., 72],
+  "format": {
+    "geometry": "gzipped Float32 [lon0,lat0,lon1,lat1,...] little-endian",
+    "velocity": "gzipped Float16 [u0,v0,u1,v1,...] little-endian, m/s"
+  }
+}
+```
+
+## Command Line Options
+
+```bash
+python generate_current_data.py [OPTIONS]
+
+Options:
+  --output DIR       Output directory (default: ./current_data)
+  --hours RANGE      Forecast hour range, e.g., "0-72" or "0-24" (default: 0-72)
+  --radius MILES     Radius from Seattle in miles (default: 100)
+  --mode {fast,cache} Download mode (default: fast)
+  --workers N        Parallel workers for fast mode (default: 10)
+  --upload           Upload to S3 after generation
+  --s3-bucket NAME   S3 bucket name for upload
+  --s3-prefix PREFIX S3 key prefix (default: ocean-currents)
 ```
 
 ## Core Modules
 
-### sscofs_cache.py
-Centralized caching for SSCOFS NetCDF data. All plotting scripts use this module.
-
-**Features:**
-- Downloads from NOAA S3 bucket (`noaa-nos-ofs-pds`)
-- Caches files in `.sscofs_cache/` (~200 MB each)
-- Provides cache management commands
-
-**Usage:**
-```bash
-python sscofs_cache.py --list      # List cached files
-python sscofs_cache.py --info      # Cache statistics
-python sscofs_cache.py --clear     # Clear all cache
-```
-
-**API:**
-```python
-from sscofs_cache import get_sscofs_data
-
-ds = get_sscofs_data(cycle_date='2025-10-18', cycle_hour=9, forecast_hour=12)
-```
+### generate_current_data.py
+Main pipeline script. Orchestrates data fetching, processing, and export.
 
 ### latest_cycle.py
-Determines which SSCOFS model cycle to use for a given time.
+Finds the latest available SSCOFS model cycle on NOAA S3.
 
-**Features:**
-- Finds latest available cycle (00z, 03z, 09z, 15z, 21z)
-- Calculates appropriate forecast hour (F000-F072)
-- Handles timezone conversions (UTC ↔ Pacific)
-
-**Usage:**
 ```python
-from latest_cycle import find_latest_cycle, pick_forecast_for_local_hour
+from latest_cycle import find_latest_cycle
 
-cycle_date, cycle_hour = find_latest_cycle()
-forecast_hour = pick_forecast_for_local_hour(local_hour=14, target='hour_after')
+run_date, cycle, keys = find_latest_cycle(max_days_back=3)
+# run_date: datetime.date
+# cycle: int (0, 3, 9, 15, or 21)
+# keys: list of available S3 keys
 ```
 
 ### fetch_sscofs.py
-Low-level URL construction and S3 access.
+Constructs URLs for SSCOFS NetCDF files.
 
-**Features:**
-- Builds S3 URLs for specific model runs
-- Example plotting functionality
-- Direct NetCDF file access
+```python
+from fetch_sscofs import build_sscofs_url
 
-### basemap_utils.py
-Shared utilities for basemap support across plotting scripts.
-
-**Features:**
-- Contextily (web tiles) integration
-- Natural Earth (shapefiles) support
-- Coordinate transformation helpers
-- Consistent styling across scripts
-
-## Plotting Scripts
-
-### plot_local_currents.py - Basic Visualization
-
-Simple quiver plots showing current vectors and speeds.
-
-**Best For:** Quick checks, simple visualization needs
-
-**Features:**
-- Uniform arrow grid (subsampled)
-- Two-panel layout: vectors + speed scatter
-- UTM coordinates for accuracy
-- Reference arrow showing 1 m/s scale
-
-**Example:**
-```bash
-python plot_local_currents.py --lat 47.6718 --lon -122.4584 --radius 5 \
-    --subsample 3 --vector-scale 10 --save basic.png
+url = build_sscofs_url("2026-02-24", 15, 1)
+# https://noaa-nos-ofs-pds.s3.amazonaws.com/sscofs/netcdf/2026/02/24/sscofs.t15z.20260224.fields.f001.nc
 ```
 
-**Options:**
-- `--lat`, `--lon` - Center coordinates
-- `--radius` - Search radius in miles
-- `--time-index` - Forecast hour to plot (0-72)
-- `--subsample` - Arrow density (every Nth point)
-- `--vector-scale` - Arrow length multiplier
-- `--save` - Save to file
-- `--no-cache` - Force fresh download
-
-### [Archived Scripts]
-
-*Several specialized and debugging scripts have been moved to `backup_removed_files/` to streamline the codebase:*
-- `plot_currents_simple.py` - Simplified plotting (functionality duplicated in main scripts)
-- `diagnose_currents.py` - Data diagnostics and statistics
-- `extract_sscofs_metadata.py` - Metadata extraction (output saved in metadata.txt)
-- `plot_wet_nodes.py` - FVCOM grid visualization
-- `test_bulk_download.py` - Bulk download testing
-- `test_water_mask.py` - Land/water masking tests
-
-## Analysis Scripts
-
-*The core functionality remains in the main plotting scripts. Additional analysis tools are archived in `backup_removed_files/`.*
-
-## Setup & Testing Scripts
-
-### setup_basemaps.py - Automated Basemap Setup
-
-One-time setup for basemap support in enhanced plotting.
-
-**Features:**
-- Installs contextily for web tiles
-- Downloads Natural Earth coastline data (~5 MB)
-- Clips to Puget Sound region (optional)
-- Verifies installation
-
-**Usage:**
-```bash
-# Setup everything (recommended)
-python setup_basemaps.py --all
-
-# Just web tiles
-python setup_basemaps.py --contextily
-
-# Just shapefiles
-python setup_basemaps.py --natural-earth
-
-# Check what's installed
-python setup_basemaps.py --verify
-```
-
-**Output:**
-```
-data/
-├── ne_10m_coastline.shp          # Full Natural Earth
-├── ne_10m_coastline.{shx,dbf,prj}
-└── shoreline_puget.geojson       # Clipped (faster)
-```
-
-See **BASEMAP_SETUP.md** for detailed manual installation.
-
-### test_basemaps.py - Verify Basemap Setup
-
-Test basemap functionality without needing real SSCOFS data.
-
-**Features:**
-- Creates synthetic current data (vortex pattern)
-- Tests each basemap option
-- Saves test plots
-- Reports success/failure
-
-**Usage:**
-```bash
-# Test all basemaps
-python test_basemaps.py --all
-
-# Test specific one
-python test_basemaps.py --contextily
-python test_basemaps.py --natural-earth
-
-# Check availability
-python test_basemaps.py --check
-
-# Save test plots
-python test_basemaps.py --all --save
-```
-
-### Other Test Scripts
-
-*Additional test scripts have been archived in `backup_removed_files/` directory.*
-
-## Basemap Support
-
-Enhanced plotting supports two basemap types:
-
-### 1. Contextily (Web Tiles) - Recommended
-
-**Pros:**
-- ✅ Beautiful grayscale Esri WorldGrayCanvas
-- ✅ Auto-zoom to appropriate level
-- ✅ Easy setup: `pip install contextily`
-- ✅ Cached tiles for speed
-
-**Cons:**
-- ⚠️ Requires internet on first use
-- ⚠️ Coordinate transformation overhead (UTM ↔ Web Mercator)
-
-**Setup:**
-```bash
-python setup_basemaps.py --contextily
-# or manually:
-pip install contextily
-```
-
-### 2. Natural Earth (Shapefiles) - Offline
-
-**Pros:**
-- ✅ Works completely offline
-- ✅ Stays in UTM (no reprojection)
-- ✅ Fast and lightweight
-
-**Cons:**
-- ⚠️ More setup steps
-- ⚠️ Less visually detailed
-
-**Setup:**
-```bash
-python setup_basemaps.py --natural-earth
-# or manually:
-conda install geopandas
-# Download from naturalearthdata.com
-```
-
-**See BASEMAP_SETUP.md and BASEMAP_SCRIPTS_README.md for details.**
-
-## Data Management
-
-### SSCOFS Model
-- **Runs**: 00z, 03z, 09z, 15z, 21z UTC (5 times daily)
-- **Forecasts**: Up to 72 hours (F000-F072)
-- **Domain**: Salish Sea (Puget Sound, Strait of Juan de Fuca)
-- **Resolution**: ~500m unstructured FVCOM grid
-- **Availability**: 3-5 hours after cycle time
-
-### Cache Directory
-
-**Location**: `.sscofs_cache/` (auto-created in project root)
-
-**Filename Format**: `sscofs_YYYYMMDD_tCCz_fHHH.nc`
-- `YYYYMMDD`: Run date
-- `CC`: Cycle hour (00, 03, 09, 15, 21)
-- `HHH`: Forecast hour (000-072)
-
-**Size**: ~200 MB per file
-
-**Management:**
-```bash
-python sscofs_cache.py --list    # List files
-python sscofs_cache.py --info    # Statistics
-python sscofs_cache.py --clear   # Delete all
-```
-
-**Or through plotting scripts:**
-```bash
-python plot_local_currents.py --list-cache
-python plot_local_currents.py --clear-cache
-python plot_local_currents.py --no-cache  # Bypass cache
-```
-
-## Output Formats
-
-### Basic Plotting (plot_local_currents.py)
-
-Two-panel figure:
-1. **Left**: Current vectors (quiver plot)
-   - Arrows colored by speed (m/s)
-   - Uniform subsampling
-   - Reference arrow (1 m/s scale)
-   - Red circle showing search radius
-   
-2. **Right**: Current speed distribution (scatter)
-   - All points colored by speed (knots)
-   - UTM coordinates (meters)
-
-**Coordinates**: UTM Zone 10N (EPSG:32610)
-**Units**: m/s for arrows, knots for scatter
-
-### Enhanced Plotting (plot_currents_enhanced.py)
-
-**Single-panel modes** (streamline, adaptive, both):
-- Filled speed contours (background)
-- Tactical threshold contours (white lines: 0.5, 1.0, 1.5, 2.0 kt)
-- Streamlines or adaptive arrows (or both)
-- Optional basemap
-- Red center marker and radius
-
-**Diagnostic mode** (two panels):
-- **Left**: Speed + streamlines + adaptive arrows
-- **Right**: 
-  - Vorticity contours (rotation/circulation)
-  - Okubo-Weiss = 0 contour (regime boundary)
-  - Eddy cores shaded (cyan)
-  - Faded speed contours (background)
-
-**Coordinates**: UTM Zone 10N (EPSG:32610)
-**Units**: Knots (for mariners)
-
-## Environment
-
-### Dependencies (currents_env.yml)
-
-**Core:**
-- Python 3.11
-- numpy, matplotlib, scipy
-- xarray, netcdf4, h5netcdf
-- pandas, pyproj
-
-**Data access:**
-- s3fs (S3 bucket access)
-- requests
-
-**Optional (for basemaps):**
-- contextily (`pip install contextily`)
-- geopandas (`conda install geopandas`)
-- cmocean (`pip install cmocean`)
-
-### Installation
+### sscofs_cache.py
+Manages local cache of full NetCDF files (for cache mode).
 
 ```bash
+python sscofs_cache.py --list   # List cached files
+python sscofs_cache.py --info   # Cache statistics
+python sscofs_cache.py --clear  # Clear all cache
+```
+
+## SSCOFS Model Info
+
+| Property | Value |
+|----------|-------|
+| **Provider** | NOAA/NOS/CO-OPS |
+| **S3 Bucket** | `noaa-nos-ofs-pds` |
+| **Model Cycles** | 00z, 03z, 09z, 15z, 21z UTC |
+| **Forecast Range** | 0-72 hours |
+| **Grid Type** | Unstructured FVCOM |
+| **Total Elements** | 433,410 |
+| **Puget Sound Region** | ~310,778 elements (100mi from Seattle) |
+| **Variables Used** | u, v (velocity), lonc, latc (element centers) |
+| **Surface Layer** | siglay=0 |
+
+## GitHub Actions Integration
+
+The pipeline is designed to run automatically via GitHub Actions:
+
+```yaml
+# .github/workflows/update-currents.yml
+- name: Generate current data
+  run: |
+    python generate_current_data.py \
+      --mode fast \
+      --hours 0-72 \
+      --workers 8 \
+      --upload \
+      --s3-bucket viola-ocean-currents
+  env:
+    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+```
+
+## Dependencies
+
+```
+numpy
+xarray
+h5netcdf
+h5py
+s3fs
+boto3
+requests
+aiohttp
+```
+
+Install via:
+```bash
+pip install -r requirements.txt
+# or
 conda env create -f currents_env.yml
-conda activate currents
-
-# Optional basemap dependencies
-pip install contextily
-conda install geopandas
-```
-
-## Examples
-
-### Quick Current Check
-```bash
-python plot_local_currents.py --lat 47.6 --lon -122.4 --radius 5
-```
-
-### Race Planning
-```bash
-# Full diagnostic for race area
-python plot_currents_enhanced.py \
-    --lat 47.65 --lon -122.35 --radius 3 \
-    --style diagnostic --basemap contextily \
-    --save race_2025-10-18.png
-
-# Compare two time steps
-python plot_currents_enhanced.py --time-index 0 --save t0.png
-python plot_currents_enhanced.py --time-index 6 --save t6.png
-```
-
-### Different Regions
-```bash
-# Strait of Juan de Fuca
-python plot_currents_enhanced.py --lat 48.5 --lon -123.0 --radius 10
-
-# Central Puget Sound
-python plot_currents_enhanced.py --lat 47.6 --lon -122.3 --radius 5
-
-# North Sound
-python plot_currents_enhanced.py --lat 48.0 --lon -122.5 --radius 8
-```
-
-### Cache Management
-```bash
-# See what's cached
-python sscofs_cache.py --list
-
-# Cache statistics
-python sscofs_cache.py --info
-
-# Clear old data
-python sscofs_cache.py --clear
 ```
 
 ## Troubleshooting
 
-### No data showing in plot
+### "Failed hours" in output
+
+Some forecast hours may fail if NOAA hasn't published them yet. This is normal for recent model runs - the pipeline still succeeds with available hours.
+
+### Slow byte-range reads
+
+The s3fs connection can be slow initially. The pipeline uses optimized settings:
+- 8MB block size
+- Connection pooling (50 connections)
+- Fill cache enabled
+
+### Cache mode for offline work
+
+If byte-range reads fail or you need offline access:
 ```bash
-# Currents may be very weak (<0.2 knots)
-# Try different location or time
-python plot_local_currents.py --time-index 12
+python generate_current_data.py --mode cache
 ```
 
-### Download fails
-```bash
-# Model may not be available yet (wait 3-5 hours after cycle)
-# Try different time
-python plot_local_currents.py --time-index 0  # nowcast
-
-# Check internet connection
-# Verify S3 access
-```
-
-### Cache issues
-```bash
-# Clear and re-download
-python sscofs_cache.py --clear
-python plot_local_currents.py --no-cache
-```
-
-### Basemap not showing
-```bash
-# Verify setup
-python test_basemaps.py --check
-
-# Test specific basemap
-python test_basemaps.py --contextily --save
-
-# Re-run setup
-python setup_basemaps.py --all
-```
-
-### Import errors
-```bash
-# Verify environment
-conda activate currents
-conda list | grep xarray
-
-# Reinstall if needed
-conda env remove -n currents
-conda env create -f currents_env.yml
-```
-
-## Documentation
-
-- **BASEMAP_SETUP.md** - Detailed basemap installation guide (manual steps)
-- **BASEMAP_SCRIPTS_README.md** - Quick reference for setup_basemaps.py and test_basemaps.py
-- **ENHANCEMENTS.md** - Technical details on enhanced plotting features and algorithms
-
-## Coordinate Systems
-
-All Python scripts use **UTM Zone 10N (EPSG:32610)**:
-- Origin: Center of zone at equator
-- Units: Meters
-- Suitable for Puget Sound region (122°W - 126°W)
-- Accurate distances up to ~50 miles from zone center
-
-**Why UTM?**
-- ✅ Accurate distance representation
-- ✅ No distortion for local areas
-- ✅ Meters are intuitive for marine work
-- ✅ Compatible with nautical charts
-
-## Performance
-
-**First download**: 5-10 seconds (200 MB NetCDF from S3)
-**Cached plot**: 2-5 seconds
-**Enhanced diagnostic**: 5-10 seconds (includes interpolation)
-
-**Optimization tips:**
-- Use cache (`--no-cache` only when needed)
-- Smaller radius = faster (fewer points)
-- Basic plotting faster than enhanced
-- Contextily basemap adds 1-2 seconds
-
-## Notes
-
-- Currents in Puget Sound typically weak (0.1-0.6 knots) vs tidal areas
-- FVCOM grid is unstructured with higher resolution near shore
-- Model runs available ~3-5 hours after cycle time
-- Longitude in dataset uses 0-360° convention (subtract 360 for negative)
-- Coordinates are node-centered (not cell-centered)
-
-## Related
-
-- **Parent README**: `../README.md` - Project overview
-- **Web Tools**: `../Web/README.md` - Interactive map viewer
-- **SSCOFS Info**: https://tidesandcurrents.noaa.gov/ofs/sscofs/sscofs.html
-- **NOAA Data**: S3 bucket `s3://noaa-nos-ofs-pds/sscofs/`
-
----
-
-**For web-based visualization, see `../Web/README.md`**
-
+This downloads full files but takes ~10x longer.
