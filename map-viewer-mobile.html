@@ -639,8 +639,13 @@
     };
     
     // ========== CONFIGURATION ==========
+    
+    // Detect device capabilities for adaptive quality
+    const isMobileDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+    const isLowPowerDevice = isMobileDevice && window.innerWidth < 768;
+    
     const CONFIG = {
-      APP_VERSION: 'v2.2.1', // Service worker update reliability improvements
+      APP_VERSION: 'v2.3.0', // Performance improvements: tile-aware redraw, combined render pass
       S3_BUCKET_URL: 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
@@ -650,6 +655,12 @@
       CURRENT_DATA_URL: location.hostname === 'localhost' || location.hostname === '127.0.0.1'
         ? `${location.origin}/Python_SSCOFS/current_data`
         : 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
+      // Adaptive quality: fewer arrows on slower devices
+      ARROWS_PER_TILE: isLowPowerDevice ? 12 : 16,
+      // High-res local Puget shoreline overlay (drawn above currents).
+      COASTLINE_GEOJSON_URLS: [
+        `${location.origin}/Python_SSCOFS/data/shoreline_puget.geojson`,
+      ],
     };
     
     // ========== APPLICATION STATE ==========
@@ -683,6 +694,23 @@
         // Arrow caching - per-tile on-demand caching
         this._cachedArrowZoom = -1;
         this._cachedArrowTiles = new Map();  // tile key -> array of arrows
+        
+        // Water mask caching - updated on tile load, not every frame
+        this._waterMaskPixels = null;
+        this._waterMaskWidth = 0;
+        this._waterMaskHeight = 0;
+        this._waterMaskDirty = true;  // true = needs refresh on next idle
+        this._tileLoadPending = false;
+        
+        // Cancellation support for hour loading during slider scrubbing
+        this._loadAbortController = null;
+        
+        // Optional coastline overlay drawn on top of currents canvas
+        this._coastlineLoaded = false;
+        this._coastlineSegments = [];
+        this._coastlineIndex = null;
+        this._coastlineVisited = null;
+        this._coastlineVisitId = 1;
       }
       
       async initialize(baseUrl) {
@@ -720,11 +748,39 @@
         // Size canvas to device pixels
         this._resizeCanvas();
         
+        // Load optional coastline overlay (drawn above arrows/heatmap)
+        if (CONFIG.COASTLINE_GEOJSON_URLS.length > 0) {
+          await this._loadCoastlineOverlay();
+        } else {
+          this._coastlineLoaded = true;
+        }
+        
         // Listen for map events
         this.map.on('move', () => this.scheduleRender());
         this.map.on('zoom', () => this.scheduleRender());
+        // Mark mask dirty during camera motion; refresh after movement settles.
+        this.map.on('movestart', () => { this._waterMaskDirty = true; });
+        this.map.on('zoomstart', () => { this._waterMaskDirty = true; });
+        this.map.on('moveend', () => { this._tileLoadPending = true; this.scheduleRender(); });
+        this.map.on('zoomend', () => { this._tileLoadPending = true; this.scheduleRender(); });
         this.map.on('resize', () => { this._resizeCanvas(); this.scheduleRender(); });
         window.addEventListener('resize', () => { this._resizeCanvas(); this.scheduleRender(); });
+        
+        // Tile-load-aware water mask: refresh when basemap tiles arrive
+        this.map.on('sourcedata', (e) => {
+          if (e.sourceId === 'basemap' && e.isSourceLoaded) {
+            this._tileLoadPending = true;
+          }
+        });
+        
+        this.map.on('idle', () => {
+          if (this._tileLoadPending || this._waterMaskDirty) {
+            this._refreshWaterMask();
+            this._tileLoadPending = false;
+            this._waterMaskDirty = false;
+            this.scheduleRender();
+          }
+        });
         
         return this.manifest;
       }
@@ -763,6 +819,279 @@
         this.canvas.width = this.canvas.clientWidth * dpr;
         this.canvas.height = this.canvas.clientHeight * dpr;
         this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this._waterMaskDirty = true;  // need to refresh water mask after resize
+      }
+      
+      _refreshWaterMask() {
+        try {
+          const mapCanvas = this.map.getCanvas();
+          const gl = this.map.painter.context.gl;
+          const w = mapCanvas.width;
+          const h = mapCanvas.height;
+          
+          if (!this._waterMaskPixels || this._waterMaskWidth !== w || this._waterMaskHeight !== h) {
+            this._waterMaskPixels = new Uint8Array(w * h * 4);
+          }
+          
+          gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, this._waterMaskPixels);
+          this._waterMaskWidth = w;
+          this._waterMaskHeight = h;
+          
+          logger.debug('Water mask refreshed:', w, 'x', h);
+        } catch (e) {
+          logger.debug('Could not refresh water mask:', e.message);
+          this._waterMaskPixels = null;
+        }
+      }
+      
+      async _loadCoastlineOverlay() {
+        if (this._coastlineLoaded) return;
+        
+        const bounds = this.manifest?.bounds;
+        const margin = 0.8;
+        const lonMin = bounds ? bounds.lon_min - margin : -124.8;
+        const lonMax = bounds ? bounds.lon_max + margin : -121.2;
+        const latMin = bounds ? bounds.lat_min - margin : 45.8;
+        const latMax = bounds ? bounds.lat_max + margin : 49.4;
+        
+        const computeLineBBox = (coords) => {
+          let minLon = Infinity, minLat = Infinity, maxLon = -Infinity, maxLat = -Infinity;
+          for (let i = 0; i < coords.length; i++) {
+            const p = coords[i];
+            const lon = p[0], lat = p[1];
+            if (!Number.isFinite(lon) || !Number.isFinite(lat)) continue;
+            if (lon < minLon) minLon = lon;
+            if (lon > maxLon) maxLon = lon;
+            if (lat < minLat) minLat = lat;
+            if (lat > maxLat) maxLat = lat;
+          }
+          if (!Number.isFinite(minLon)) return null;
+          return [minLon, minLat, maxLon, maxLat];
+        };
+        
+        const bboxIntersectsBounds = (bbox) => {
+          if (!bbox || bbox.length !== 4) return false;
+          const minLon = bbox[0], minLat = bbox[1], maxLon = bbox[2], maxLat = bbox[3];
+          return !(maxLon < lonMin || minLon > lonMax || maxLat < latMin || minLat > latMax);
+        };
+        
+        const extractSegments = (geojson) => {
+          const segments = [];
+          const features = geojson?.features || [];
+          for (let fi = 0; fi < features.length; fi++) {
+            const geom = features[fi]?.geometry;
+            const props = features[fi]?.properties || {};
+            if (!geom) continue;
+            if (geom.type === 'LineString' && Array.isArray(geom.coordinates)) {
+              const bbox = Array.isArray(props.bbox) && props.bbox.length === 4
+                ? props.bbox
+                : computeLineBBox(geom.coordinates);
+              if (bboxIntersectsBounds(bbox)) {
+                segments.push({ coords: geom.coordinates, bbox: bbox });
+              }
+            } else if (geom.type === 'MultiLineString' && Array.isArray(geom.coordinates)) {
+              for (let i = 0; i < geom.coordinates.length; i++) {
+                const line = geom.coordinates[i];
+                if (!Array.isArray(line)) continue;
+                const bbox = computeLineBBox(line);
+                if (bboxIntersectsBounds(bbox)) {
+                  segments.push({ coords: line, bbox: bbox });
+                }
+              }
+            }
+          }
+          return segments;
+        };
+        
+        for (const url of CONFIG.COASTLINE_GEOJSON_URLS) {
+          try {
+            const resp = await fetch(url);
+            if (!resp.ok) continue;
+            const geojson = await resp.json();
+            const segments = extractSegments(geojson);
+            if (segments.length > 0) {
+              this._coastlineSegments = segments;
+              this._buildCoastlineIndex();
+              this._coastlineLoaded = true;
+              logger.info(`Loaded coastline overlay from ${url} (${segments.length} segments)`);
+              return;
+            }
+          } catch (e) {
+            logger.debug('Coastline overlay load failed:', url, e.message);
+          }
+        }
+        
+        this._coastlineLoaded = true; // prevent repeated attempts
+        logger.warn('No local coastline overlay found. Add Python_SSCOFS/data/shoreline_puget.geojson for high-res coastline rendering.');
+      }
+      
+      _buildCoastlineIndex() {
+        const segs = this._coastlineSegments || [];
+        if (segs.length === 0) {
+          this._coastlineIndex = null;
+          this._coastlineVisited = null;
+          return;
+        }
+        
+        const b = this.manifest?.bounds || {
+          lon_min: -124.8, lon_max: -121.2, lat_min: 45.8, lat_max: 49.4
+        };
+        const pad = 0.5;
+        const lonMin = b.lon_min - pad;
+        const lonMax = b.lon_max + pad;
+        const latMin = b.lat_min - pad;
+        const latMax = b.lat_max + pad;
+        const cellSize = 0.08; // ~8km latitude chunks
+        const cols = Math.max(1, Math.ceil((lonMax - lonMin) / cellSize));
+        const rows = Math.max(1, Math.ceil((latMax - latMin) / cellSize));
+        const cells = new Map();
+        
+        const add = (r, c, idx) => {
+          const key = r * cols + c;
+          let arr = cells.get(key);
+          if (!arr) {
+            arr = [];
+            cells.set(key, arr);
+          }
+          arr.push(idx);
+        };
+        
+        for (let i = 0; i < segs.length; i++) {
+          const bb = segs[i]?.bbox;
+          if (!bb || bb.length !== 4) continue;
+          const c0 = Math.max(0, Math.floor((bb[0] - lonMin) / cellSize));
+          const c1 = Math.min(cols - 1, Math.floor((bb[2] - lonMin) / cellSize));
+          const r0 = Math.max(0, Math.floor((bb[1] - latMin) / cellSize));
+          const r1 = Math.min(rows - 1, Math.floor((bb[3] - latMin) / cellSize));
+          for (let r = r0; r <= r1; r++) {
+            for (let c = c0; c <= c1; c++) add(r, c, i);
+          }
+        }
+        
+        this._coastlineIndex = { lonMin, lonMax, latMin, latMax, cellSize, cols, rows, cells };
+        this._coastlineVisited = new Uint32Array(segs.length);
+        this._coastlineVisitId = 1;
+      }
+      
+      _getVisibleCoastlineSegments(vLonMin, vLatMin, vLonMax, vLatMax, pad) {
+        const segs = this._coastlineSegments || [];
+        const idx = this._coastlineIndex;
+        if (!idx || !this._coastlineVisited) return segs;
+        
+        const qLonMin = vLonMin - pad;
+        const qLonMax = vLonMax + pad;
+        const qLatMin = vLatMin - pad;
+        const qLatMax = vLatMax + pad;
+        
+        const c0 = Math.max(0, Math.floor((qLonMin - idx.lonMin) / idx.cellSize));
+        const c1 = Math.min(idx.cols - 1, Math.floor((qLonMax - idx.lonMin) / idx.cellSize));
+        const r0 = Math.max(0, Math.floor((qLatMin - idx.latMin) / idx.cellSize));
+        const r1 = Math.min(idx.rows - 1, Math.floor((qLatMax - idx.latMin) / idx.cellSize));
+        
+        const out = [];
+        let visitId = this._coastlineVisitId + 1;
+        if (visitId === 0xffffffff) {
+          this._coastlineVisited.fill(0);
+          visitId = 1;
+        }
+        this._coastlineVisitId = visitId;
+        const seen = this._coastlineVisited;
+        
+        for (let r = r0; r <= r1; r++) {
+          for (let c = c0; c <= c1; c++) {
+            const arr = idx.cells.get(r * idx.cols + c);
+            if (!arr) continue;
+            for (let k = 0; k < arr.length; k++) {
+              const si = arr[k];
+              if (seen[si] === visitId) continue;
+              seen[si] = visitId;
+              out.push(segs[si]);
+            }
+          }
+        }
+        return out;
+      }
+      
+      _drawCoastlineOverlay(ctx, projectToScreen, zoom, vLonMin, vLatMin, vLonMax, vLatMax) {
+        if (!this._coastlineSegments || this._coastlineSegments.length === 0) return;
+        
+        // Keep very light on-the-fly thinning. Data simplification is done offline.
+        // At low zoom we avoid aggressive culling so coastlines remain visible.
+        const minPxGap = zoom < 9 ? 0.15 : (zoom < 11 ? 0.35 : 0.6);
+
+        ctx.beginPath();
+        const pad = 0.02; // small lon/lat padding to avoid edge pop
+        const qLonMin = vLonMin - pad, qLonMax = vLonMax + pad;
+        const qLatMin = vLatMin - pad, qLatMax = vLatMax + pad;
+        const visibleSegs = this._getVisibleCoastlineSegments(vLonMin, vLatMin, vLonMax, vLatMax, pad);
+        
+        for (let si = 0; si < visibleSegs.length; si++) {
+          const segObj = visibleSegs[si];
+          const bbox = segObj?.bbox;
+          if (bbox && bbox.length === 4) {
+            if (bbox[2] < qLonMin || bbox[0] > qLonMax || bbox[3] < qLatMin || bbox[1] > qLatMax) {
+              continue;
+            }
+          }
+          const seg = segObj?.coords || segObj;
+          if (!seg || seg.length < 2) continue;
+          let moved = false;
+          let drewSegment = false;
+          let prevX = 0;
+          let prevY = 0;
+          let firstX = 0;
+          let firstY = 0;
+          let lastX = 0;
+          let lastY = 0;
+          for (let i = 0; i < seg.length; i++) {
+            const lon = seg[i][0];
+            const lat = seg[i][1];
+            const p = projectToScreen(lon, lat);
+            if (!moved) {
+              ctx.moveTo(p.x, p.y);
+              firstX = p.x;
+              firstY = p.y;
+              prevX = p.x;
+              prevY = p.y;
+              moved = true;
+            } else {
+              // Always draw first edge so tiny segments still show up when zoomed out.
+              if (i === 1) {
+                ctx.lineTo(p.x, p.y);
+                drewSegment = true;
+                prevX = p.x;
+                prevY = p.y;
+                lastX = p.x;
+                lastY = p.y;
+                continue;
+              }
+              const dx = p.x - prevX;
+              const dy = p.y - prevY;
+              if ((dx * dx + dy * dy) < (minPxGap * minPxGap)) continue;
+              ctx.lineTo(p.x, p.y);
+              drewSegment = true;
+              prevX = p.x;
+              prevY = p.y;
+            }
+            lastX = p.x;
+            lastY = p.y;
+          }
+          // At low zoom, aggressive thinning can skip all interior points.
+          // Ensure each source segment still contributes a visible line.
+          if (moved && !drewSegment) {
+            const dx = lastX - firstX;
+            const dy = lastY - firstY;
+            if ((dx * dx + dy * dy) > 0.01) {
+              ctx.lineTo(lastX, lastY);
+            }
+          }
+        }
+        
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 4;
+        ctx.stroke();
       }
       
       _buildSpatialIndex() {
@@ -801,6 +1130,11 @@
       }
       
       async loadHour(hour) {
+        // Cancel any in-flight load request (slider scrubbing)
+        if (this._loadAbortController) {
+          this._loadAbortController.abort();
+        }
+        
         if (this.velocityCache[hour]) {
           this.currentVelocity = this.velocityCache[hour];
           this.currentHour = hour;
@@ -810,24 +1144,48 @@
           return;
         }
         
-        const fname = `f${String(hour).padStart(3, '0')}.bin`;
-        const resp = await fetch(`${this.runUrl}/${fname}`);
-        if (!resp.ok) throw new Error(`${fname}: HTTP ${resp.status}`);
-        const buf = await this._decompressResponse(resp);
+        // Create new abort controller for this request
+        this._loadAbortController = new AbortController();
+        const signal = this._loadAbortController.signal;
         
-        // Convert Float16 to Float32
-        const f16 = new Uint16Array(buf);
-        const f32 = new Float32Array(f16.length);
-        for (let i = 0; i < f16.length; i++) {
-          f32[i] = this._float16ToFloat32(f16[i]);
+        try {
+          const fname = `f${String(hour).padStart(3, '0')}.bin`;
+          const resp = await fetch(`${this.runUrl}/${fname}`, { signal });
+          if (!resp.ok) throw new Error(`${fname}: HTTP ${resp.status}`);
+          
+          // Check if aborted before decompression
+          if (signal.aborted) return;
+          
+          const buf = await this._decompressResponse(resp);
+          
+          // Check if aborted before decode
+          if (signal.aborted) return;
+          
+          // Convert Float16 to Float32
+          const f16 = new Uint16Array(buf);
+          const f32 = new Float32Array(f16.length);
+          for (let i = 0; i < f16.length; i++) {
+            f32[i] = this._float16ToFloat32(f16[i]);
+          }
+          
+          // Final abort check before applying results
+          if (signal.aborted) return;
+          
+          this.velocityCache[hour] = f32;
+          this.currentVelocity = f32;
+          this.currentHour = hour;
+          this._cachedArrowZoom = -1;  // Invalidate arrow cache for new data
+          this._cachedArrowTiles = new Map();  // Clear cached tiles
+          this.scheduleRender();
+        } catch (e) {
+          if (e.name === 'AbortError') {
+            logger.debug(`Hour ${hour} load cancelled (superseded)`);
+            return;
+          }
+          throw e;
+        } finally {
+          this._loadAbortController = null;
         }
-        
-        this.velocityCache[hour] = f32;
-        this.currentVelocity = f32;
-        this.currentHour = hour;
-        this._cachedArrowZoom = -1;  // Invalidate arrow cache for new data
-        this._cachedArrowTiles = new Map();  // Clear cached tiles
-        this.scheduleRender();
       }
       
       _float16ToFloat32(h) {
@@ -911,6 +1269,16 @@
         const centerPxY = (1 - Math.log(Math.tan(cLatRad) + 1 / Math.cos(cLatRad)) / PI) * 0.5 * worldSize;
         const halfW = w * 0.5;
         const halfH = h * 0.5;
+        const projectToScreen = (lon, lat) => {
+          if (useFastProj) {
+            const pxX = (lon + 180) * lngScale;
+            const latRad = lat * DEG2RAD;
+            const pxY = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * worldSize;
+            return { x: pxX - centerPxX + halfW, y: pxY - centerPxY + halfH };
+          }
+          const pt = this.map.project([lon, lat]);
+          return { x: pt.x, y: pt.y };
+        };
         
         // Determine which spatial index cells overlap the viewport
         const si = this.spatialIndex;
@@ -931,7 +1299,7 @@
         
         // Virtual tile-based arrow grid for consistent density at all zoom levels
         const TILE_SIZE = 256;
-        const ARROWS_PER_TILE = 16;  // 16×16 = 256 arrows per tile
+        const ARROWS_PER_TILE = CONFIG.ARROWS_PER_TILE;  // Adaptive: 12 on mobile, 16 on desktop
         const arrowPitch = TILE_SIZE / ARROWS_PER_TILE;
         // Scale by fractional zoom so arrows stay same size relative to map tiles
         const intZoom = Math.floor(zoom);
@@ -1184,19 +1552,6 @@
           const tileYMin = Math.floor(latToTileY(vLatMax));
           const tileYMax = Math.ceil(latToTileY(vLatMin));
           
-          // Project helper
-          const projectToScreen = (lon, lat) => {
-            if (useFastProj) {
-              const pxX = (lon + 180) * lngScale;
-              const latRad = lat * DEG2RAD;
-              const pxY = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * worldSize;
-              return { x: pxX - centerPxX + halfW, y: pxY - centerPxY + halfH };
-            } else {
-              const pt = this.map.project([lon, lat]);
-              return { x: pt.x, y: pt.y };
-            }
-          };
-          
           // Draw tile boundaries (thick red)
           ctx.strokeStyle = 'rgba(255, 0, 0, 0.7)';
           ctx.lineWidth = 2;
@@ -1246,28 +1601,16 @@
           }
         }
         
-        // Get map canvas pixels for water/land detection
-        let mapPixels = null;
-        try {
-          const mapCanvas = this.map.getCanvas();
-          const gl = this.map.painter.context.gl;
-          const mapW = mapCanvas.width;
-          const mapH = mapCanvas.height;
-          mapPixels = new Uint8Array(mapW * mapH * 4);
-          gl.readPixels(0, 0, mapW, mapH, gl.RGBA, gl.UNSIGNED_BYTE, mapPixels);
-          // WebGL pixels are bottom-up, we'll account for this when sampling
-        } catch (e) {
-          // If we can't read pixels, fall back to drawing all arrows
-          if (IS_DEBUG) logger.debug('Could not read map pixels:', e.message);
-        }
-        
-        // Helper to check if a pixel is water using HSL hue
-        const mapCanvas = this.map.getCanvas();
+        // Use cached water mask (refreshed on tile load, not every frame)
+        const mapPixels = this._waterMaskPixels;
         const pixelRatio = window.devicePixelRatio || 1;
-        const canvasW = mapCanvas.width;
-        const canvasH = mapCanvas.height;
+        const canvasW = this._waterMaskWidth;
+        const canvasH = this._waterMaskHeight;
         
         const isWater = (sx, sy) => {
+          // During map motion, avoid using stale screen-space mask.
+          // This keeps arrows visually locked to map tiles while panning/zooming.
+          if (this.map.isMoving() || this.map.isZooming() || this._waterMaskDirty) return true;
           if (!mapPixels) return true;  // fall back to drawing
           const px = Math.floor(sx * pixelRatio);
           const py = canvasH - 1 - Math.floor(sy * pixelRatio);  // flip Y for WebGL (row 0 is bottom)
@@ -1301,10 +1644,9 @@
           return hDeg >= 170 && hDeg <= 230 && s > 0.08;
         };
         
-        // === HEATMAP PASS: Draw colored dots from virtual tile arrows ===
-        // Dot radius based on arrow spacing - should overlap slightly to create continuous field
+        // === COMBINED HEATMAP + ARROW PASS: Project each arrow once, draw both ===
         const dotRadius = baseLen * 0.7;
-        ctx.globalAlpha = 0.55;
+        const margin = Math.max(dotRadius, 20);
         
         for (let ty = tileYMin; ty <= tileYMax; ty++) {
           for (let tx = tileXMin; tx <= tileXMax; tx++) {
@@ -1313,6 +1655,7 @@
             if (!tileArrows) continue;
             
             for (const arrow of tileArrows) {
+              // Project to screen ONCE per arrow
               let sx, sy;
               if (useFastProj) {
                 const pxX = (arrow.lon + 180) * lngScale;
@@ -1326,54 +1669,33 @@
                 sy = pt.y;
               }
               
-              if (sx < -dotRadius || sx > w + dotRadius || sy < -dotRadius || sy > h + dotRadius) continue;
+              // Bounds check once
+              if (sx < -margin || sx > w + margin || sy < -margin || sy > h + margin) continue;
+              
+              // Water check once
               if (!isWater(sx, sy)) continue;
               
+              // Compute color index once
               const speedKnots = arrow.speed * 1.94384;
               const ci = Math.min(255, Math.round(Math.min(speedKnots / 2.0, 1.0) * 255));
-              const rgb = colorsRGB[ci];
               
+              // Draw heatmap dot (use precomputed color string)
+              ctx.globalAlpha = 0.55;
               ctx.beginPath();
               ctx.arc(sx, sy, dotRadius, 0, 6.283185307);
-              ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+              ctx.fillStyle = colors[ci];  // Use precomputed string
               ctx.fill();
-            }
-          }
-        }
-        ctx.globalAlpha = 1.0;
-        
-        // === ARROW PASS: Draw arrows from cached visible tiles ===
-        for (let ty = tileYMin; ty <= tileYMax; ty++) {
-          for (let tx = tileXMin; tx <= tileXMax; tx++) {
-            const tileKey = `${tx},${ty}`;
-            const tileArrows = this._cachedArrowTiles.get(tileKey);
-            if (!tileArrows) continue;
-            
-            for (const arrow of tileArrows) {
-              // Project to screen
-              let sx, sy;
-              if (useFastProj) {
-                const pxX = (arrow.lon + 180) * lngScale;
-                const latRad = arrow.lat * DEG2RAD;
-                const pxY = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / PI) * 0.5 * worldSize;
-                sx = pxX - centerPxX + halfW;
-                sy = pxY - centerPxY + halfH;
-              } else {
-                const pt = this.map.project([arrow.lon, arrow.lat]);
-                sx = pt.x;
-                sy = pt.y;
-              }
+              ctx.globalAlpha = 1.0;
               
-              if (sx < -20 || sx > w + 20 || sy < -20 || sy > h + 20) continue;
-              
-              // Skip if not over water
-              if (!isWater(sx, sy)) continue;
-              
+              // Draw arrow
               this._drawArrow(ctx, sx, sy, arrow.nx, arrow.ny, arrow.speed, arrowLen, colors, cosHA, sinHA);
               drawn++;
             }
           }
         }
+        
+        // Coastline is drawn last so it remains readable above currents.
+        this._drawCoastlineOverlay(ctx, projectToScreen, zoom, vLonMin, vLatMin, vLonMax, vLatMax);
         
         if (IS_DEBUG) {
           logger.debug(`Rendered ${drawn.toLocaleString()} arrows at z${zoom.toFixed(1)} (z${intZoom}), cached tiles=${this._cachedArrowTiles.size}`);
@@ -1840,7 +2162,6 @@
     
     const map = new maplibregl.Map({
       container: "map",
-      preserveDrawingBuffer: true,
       style: {
         version: 8,
         sources: {
