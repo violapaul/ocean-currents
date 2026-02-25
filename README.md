@@ -147,14 +147,9 @@ wrangler deploy  # Deploys proxy-worker.js to Cloudflare
 | **S3 Data** | https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents/ |
 | **Actions** | https://github.com/violapaul/WaysWaterMoves/actions |
 
-## Credentials
+## Deployment
 
-### GitHub Secrets (for automatic updates)
-- `AWS_ACCESS_KEY_ID` - AWS access key with S3 write permissions
-- `AWS_SECRET_ACCESS_KEY` - AWS secret key
-
-### Local Development
-AWS credentials from `~/.aws/credentials` are used automatically.
+See [../DEPLOYMENT.md](../DEPLOYMENT.md) for AWS credentials, GitHub Actions setup, and infrastructure details.
 
 ## Data Format
 
