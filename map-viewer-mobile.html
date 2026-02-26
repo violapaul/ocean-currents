@@ -508,6 +508,59 @@
       }
     }
     
+    /* Fallback indicator */
+    .fallback-indicator {
+      position: fixed;
+      top: calc(28px + env(safe-area-inset-top, 0px));
+      left: 10px;
+      background: rgba(255, 152, 0, 0.95);
+      color: white;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 4px;
+      z-index: 11;
+      display: none;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    
+    .fallback-indicator.visible {
+      display: block;
+    }
+    
+    /* View toggle button */
+    .view-toggle {
+      position: fixed;
+      bottom: calc(60px + env(safe-area-inset-bottom, 0px));
+      left: 10px;
+      width: 44px;
+      height: 44px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.95);
+      border: 2px solid #0066cc;
+      color: #0066cc;
+      font-size: 11px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      z-index: 10;
+      transition: all 0.2s ease;
+      text-align: center;
+      line-height: 1.1;
+    }
+    
+    .view-toggle:active {
+      transform: scale(0.95);
+    }
+    
+    .view-toggle.raw-active {
+      background: #0066cc;
+      color: white;
+    }
+    
   </style>
 </head>
 <body>
@@ -517,6 +570,9 @@
         <span id="forecast-time">--</span>
       </div>
     </div>
+    
+    <!-- Fallback indicator -->
+    <div class="fallback-indicator" id="fallback-indicator">Using older model</div>
     
     <div id="map"></div>
     <canvas id="currents-canvas" style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2;"></canvas>
@@ -536,6 +592,9 @@
       <input type="range" class="time-slider" id="time-slider" min="0" max="72" value="0" step="1">
       <button class="hour-btn next" id="hour-next" aria-label="Next hour">+1</button>
     </div>
+    
+    <!-- View toggle button -->
+    <button class="view-toggle" id="view-toggle" aria-label="Toggle raw data view" title="Toggle raw data view">RAW</button>
     
     <div class="loading" id="loading">Searching for model data...</div>
 
@@ -645,7 +704,7 @@
     const isLowPowerDevice = isMobileDevice && window.innerWidth < 768;
     
     const CONFIG = {
-      APP_VERSION: 'v2.3.0', // Performance improvements: tile-aware redraw, combined render pass
+      APP_VERSION: 'v2.5.0', // Added fallback model support for extended forecasts during updates
       S3_BUCKET_URL: 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
@@ -672,6 +731,7 @@
       isStaleData: false,
       staleModelStart: null,
       isOffline: false,
+      rawViewMode: false,  // Toggle between processed (interpolated) and raw (all data points) view
     };
     
     // ========== CANVAS CURRENT RENDERER ==========
@@ -711,10 +771,51 @@
         this._coastlineIndex = null;
         this._coastlineVisited = null;
         this._coastlineVisitId = 1;
+        
+        // Raw view mode - shows all underlying data points instead of interpolated arrows
+        this.rawViewMode = false;
+        
+        // Fallback model run for hours not yet available in the primary run
+        this.fallbackRunUrl = null;
+        this.fallbackManifest = null;
+        this.fallbackHourOffset = 0;  // Hours to add to get equivalent fallback hour
+        this.fallbackVelocityCache = {};
+      }
+      
+      setRawViewMode(enabled) {
+        this.rawViewMode = enabled;
+        this.scheduleRender();
+      }
+      
+      // Compute previous run tags by subtracting 6 hours repeatedly
+      _computePreviousRunTags(currentRunTag, count = 4) {
+        // Parse current run tag: "20260224_15z" -> Date
+        const match = currentRunTag.match(/(\d{4})(\d{2})(\d{2})_(\d{2})z/);
+        if (!match) return [];
+        
+        const year = parseInt(match[1]);
+        const month = parseInt(match[2]) - 1;  // JS months are 0-indexed
+        const day = parseInt(match[3]);
+        const hour = parseInt(match[4]);
+        
+        const currentDate = new Date(Date.UTC(year, month, day, hour, 0, 0));
+        const tags = [];
+        
+        for (let i = 1; i <= count; i++) {
+          const prevDate = new Date(currentDate.getTime() - i * 6 * 3600000);
+          const y = prevDate.getUTCFullYear();
+          const m = String(prevDate.getUTCMonth() + 1).padStart(2, '0');
+          const d = String(prevDate.getUTCDate()).padStart(2, '0');
+          const h = String(prevDate.getUTCHours()).padStart(2, '0');
+          tags.push(`${y}${m}${d}_${h}z`);
+        }
+        
+        return tags;
       }
       
       async initialize(baseUrl) {
         logger.info('Canvas renderer: initializing from', baseUrl);
+        this.baseUrl = baseUrl;
         
         // Fetch latest.json to find current model run
         const latestResp = await fetch(`${baseUrl}/latest.json`);
@@ -722,6 +823,7 @@
         const latest = await latestResp.json();
         const runTag = latest.run;
         this.runUrl = `${baseUrl}/${runTag}`;
+        this.currentRunTag = runTag;
         logger.info(`Canvas renderer: using run ${runTag}`);
         
         // Fetch manifest
@@ -730,6 +832,9 @@
         this.manifest = await manifestResp.json();
         this.numElements = this.manifest.num_elements;
         logger.info(`Canvas renderer: ${this.numElements.toLocaleString()} elements, ${this.manifest.forecast_hours.length} hours`);
+        
+        // Try to discover a fallback (previous) model run
+        await this._initializeFallback(runTag);
         
         // Fetch geometry (gzipped Float32)
         const geomResp = await fetch(`${this.runUrl}/geometry.bin`);
@@ -783,6 +888,68 @@
         });
         
         return this.manifest;
+      }
+      
+      async _initializeFallback(currentRunTag) {
+        const previousRunTags = this._computePreviousRunTags(currentRunTag, 4);
+        
+        for (const prevTag of previousRunTags) {
+          try {
+            const prevUrl = `${this.baseUrl}/${prevTag}`;
+            const manifestResp = await fetch(`${prevUrl}/manifest.json`);
+            if (!manifestResp.ok) continue;
+            
+            const prevManifest = await manifestResp.json();
+            
+            // Check if fallback has more hours than primary
+            const primaryMaxHour = Math.max(...this.manifest.forecast_hours);
+            const fallbackMaxHour = Math.max(...prevManifest.forecast_hours);
+            
+            // Calculate hour offset: how many hours to add to primary forecast hour
+            // to get the equivalent fallback forecast hour
+            const primaryModelTime = new Date(this.manifest.model_run);
+            const fallbackModelTime = new Date(prevManifest.model_run);
+            const hourOffset = (primaryModelTime - fallbackModelTime) / 3600000;
+            
+            // Only use fallback if it provides additional coverage
+            if (fallbackMaxHour >= hourOffset) {
+              this.fallbackRunUrl = prevUrl;
+              this.fallbackManifest = prevManifest;
+              this.fallbackHourOffset = hourOffset;
+              logger.info(`Fallback model: ${prevTag} (offset: +${hourOffset}h, max hour: ${fallbackMaxHour})`);
+              logger.info(`Primary has hours 0-${primaryMaxHour}, fallback extends to hour ${fallbackMaxHour - hourOffset} from now`);
+              return;
+            }
+          } catch (e) {
+            logger.debug(`Fallback ${prevTag} not available:`, e.message);
+          }
+        }
+        
+        logger.info('No fallback model available');
+      }
+      
+      // Get the best source (primary or fallback) for a given forecast hour
+      _getSourceForHour(forecastHour) {
+        const primaryHours = this.manifest.forecast_hours;
+        
+        // If primary has this hour, use it
+        if (primaryHours.includes(forecastHour)) {
+          return { source: 'primary', hour: forecastHour, url: this.runUrl };
+        }
+        
+        // Try fallback
+        if (this.fallbackManifest) {
+          const fallbackHour = forecastHour + this.fallbackHourOffset;
+          if (this.fallbackManifest.forecast_hours.includes(fallbackHour)) {
+            return { source: 'fallback', hour: fallbackHour, url: this.fallbackRunUrl };
+          }
+        }
+        
+        // No source available - use closest available primary hour
+        const closestPrimary = primaryHours.reduce((prev, curr) => 
+          Math.abs(curr - forecastHour) < Math.abs(prev - forecastHour) ? curr : prev
+        );
+        return { source: 'primary', hour: closestPrimary, url: this.runUrl };
       }
       
       async _decompressResponse(resp) {
@@ -1116,16 +1283,21 @@
       }
       
       async _prefetchHour(hour) {
-        if (this.velocityCache[hour]) return;
+        const sourceInfo = this._getSourceForHour(hour);
+        const cacheKey = sourceInfo.source === 'fallback' 
+          ? `fallback_${sourceInfo.hour}` 
+          : `primary_${sourceInfo.hour}`;
+        
+        if (this.velocityCache[cacheKey]) return;
         try {
-          const fname = `f${String(hour).padStart(3, '0')}.bin`;
-          const resp = await fetch(`${this.runUrl}/${fname}`);
+          const fname = `f${String(sourceInfo.hour).padStart(3, '0')}.bin`;
+          const resp = await fetch(`${sourceInfo.url}/${fname}`);
           if (!resp.ok) return;
           const buf = await this._decompressResponse(resp);
           const f16 = new Uint16Array(buf);
           const f32 = new Float32Array(f16.length);
           for (let i = 0; i < f16.length; i++) f32[i] = this._float16ToFloat32(f16[i]);
-          this.velocityCache[hour] = f32;
+          this.velocityCache[cacheKey] = f32;
         } catch(e) { /* ignore prefetch failures */ }
       }
       
@@ -1135,9 +1307,17 @@
           this._loadAbortController.abort();
         }
         
-        if (this.velocityCache[hour]) {
-          this.currentVelocity = this.velocityCache[hour];
+        // Determine best source for this hour (primary or fallback)
+        const sourceInfo = this._getSourceForHour(hour);
+        const cacheKey = sourceInfo.source === 'fallback' 
+          ? `fallback_${sourceInfo.hour}` 
+          : `primary_${sourceInfo.hour}`;
+        
+        // Check cache first (using composite key to distinguish sources)
+        if (this.velocityCache[cacheKey]) {
+          this.currentVelocity = this.velocityCache[cacheKey];
           this.currentHour = hour;
+          this.currentSource = sourceInfo.source;
           this._cachedArrowZoom = -1;  // Invalidate arrow cache for new data
           this._cachedArrowTiles = new Map();  // Clear cached tiles
           this.scheduleRender();
@@ -1149,8 +1329,8 @@
         const signal = this._loadAbortController.signal;
         
         try {
-          const fname = `f${String(hour).padStart(3, '0')}.bin`;
-          const resp = await fetch(`${this.runUrl}/${fname}`, { signal });
+          const fname = `f${String(sourceInfo.hour).padStart(3, '0')}.bin`;
+          const resp = await fetch(`${sourceInfo.url}/${fname}`, { signal });
           if (!resp.ok) throw new Error(`${fname}: HTTP ${resp.status}`);
           
           // Check if aborted before decompression
@@ -1171,12 +1351,17 @@
           // Final abort check before applying results
           if (signal.aborted) return;
           
-          this.velocityCache[hour] = f32;
+          this.velocityCache[cacheKey] = f32;
           this.currentVelocity = f32;
           this.currentHour = hour;
+          this.currentSource = sourceInfo.source;
           this._cachedArrowZoom = -1;  // Invalidate arrow cache for new data
           this._cachedArrowTiles = new Map();  // Clear cached tiles
           this.scheduleRender();
+          
+          if (sourceInfo.source === 'fallback') {
+            logger.info(`Using fallback model for hour ${hour} (fallback hour ${sourceInfo.hour})`);
+          }
         } catch (e) {
           if (e.name === 'AbortError') {
             logger.debug(`Hour ${hour} load cancelled (superseded)`);
@@ -1321,20 +1506,21 @@
         
         // Heatmap is now drawn from virtual tile arrows (below, after arrow caching)
         
-        // === DEBUG: Draw original data vectors in red ===
-        if (false && IS_DEBUG) {  // disabled
-          const debugArrowLen = 16;  // 2x longer for visibility
-          ctx.strokeStyle = 'red';
-          ctx.fillStyle = 'red';
-          ctx.lineWidth = 1.5;
+        // === RAW VIEW MODE: Draw all original data vectors ===
+        if (this.rawViewMode) {
+          const rawArrowLen = Math.max(10, baseLen * 0.65);
+          const rawDotRadius = rawArrowLen * 1.5;  // Bubble diameter = 3x arrow length
+          ctx.lineCap = 'round';
           
+          // Collect visible raw data points for two-pass rendering
+          const rawVisible = [];
           for (let row = rowMin; row <= rowMax; row++) {
             for (let col = colMin; col <= colMax; col++) {
               const key = row * si.cols + col;
               const indices = si.cells.get(key);
               if (!indices) continue;
               
-              for (let ii = 0; ii < indices.length; ii++) {  // draw ALL
+              for (let ii = 0; ii < indices.length; ii++) {
                 const idx = indices[ii];
                 const u = vel[idx * 2];
                 const v = vel[idx * 2 + 1];
@@ -1359,34 +1545,69 @@
                 
                 if (sx < 0 || sx > w || sy < 0 || sy > h) continue;
                 
+                const speedKnots = speed * 1.94384;
+                const ci = Math.min(255, Math.round(Math.min(speedKnots / 2.0, 1.0) * 255));
+                
                 const invSpd = 1 / speed;
                 const nx = u * invSpd;
                 const ny = -v * invSpd;
-                const tipX = sx + nx * debugArrowLen;
-                const tipY = sy + ny * debugArrowLen;
                 
-                // Shaft
-                ctx.beginPath();
-                ctx.moveTo(sx, sy);
-                ctx.lineTo(tipX, tipY);
-                ctx.stroke();
-                
-                // Arrowhead
-                const headLen = 5;
-                const headAngle = 0.4;
-                const cosA = Math.cos(headAngle);
-                const sinA = Math.sin(headAngle);
-                ctx.beginPath();
-                ctx.moveTo(tipX, tipY);
-                ctx.lineTo(tipX - headLen * (nx * cosA + ny * sinA),
-                           tipY - headLen * (ny * cosA - nx * sinA));
-                ctx.moveTo(tipX, tipY);
-                ctx.lineTo(tipX - headLen * (nx * cosA - ny * sinA),
-                           tipY - headLen * (ny * cosA + nx * sinA));
-                ctx.stroke();
+                rawVisible.push({ sx, sy, ci, nx, ny });
               }
             }
           }
+          
+          // PASS 1: Draw all bubbles (below arrows)
+          ctx.globalAlpha = 0.55;
+          for (const v of rawVisible) {
+            ctx.beginPath();
+            ctx.arc(v.sx, v.sy, rawDotRadius, 0, 6.283185307);
+            ctx.fillStyle = colors[v.ci];
+            ctx.fill();
+          }
+          ctx.globalAlpha = 1.0;
+          
+          // PASS 2: Draw all black arrows on top
+          for (const v of rawVisible) {
+            const dx = v.nx * rawArrowLen;
+            const dy = v.ny * rawArrowLen;
+            const tipX = v.sx + dx * 0.5;
+            const tipY = v.sy + dy * 0.5;
+            const tailX = v.sx - dx * 0.5;
+            const tailY = v.sy - dy * 0.5;
+            const lineW = Math.max(1.2, rawArrowLen * 0.08);
+            
+            // Shaft: white halo then black stroke
+            ctx.beginPath();
+            ctx.moveTo(tailX, tailY);
+            ctx.lineTo(tipX, tipY);
+            ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+            ctx.lineWidth = lineW + 1;
+            ctx.stroke();
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = lineW;
+            ctx.stroke();
+            
+            // Black arrowhead
+            const headLen = rawArrowLen * 0.4;
+            ctx.beginPath();
+            ctx.moveTo(tipX, tipY);
+            ctx.lineTo(tipX - headLen * (v.nx * cosHA + v.ny * sinHA),
+                       tipY - headLen * (v.ny * cosHA - v.nx * sinHA));
+            ctx.lineTo(tipX - headLen * (v.nx * cosHA - v.ny * sinHA),
+                       tipY - headLen * (v.ny * cosHA + v.nx * sinHA));
+            ctx.closePath();
+            ctx.fillStyle = '#000';
+            ctx.fill();
+          }
+          
+          // Draw coastline overlay on top
+          this._drawCoastlineOverlay(ctx, projectToScreen, zoom, vLonMin, vLatMin, vLonMax, vLatMax);
+          
+          if (IS_DEBUG) {
+            logger.debug(`Raw view: ${rawVisible.length.toLocaleString()} data points rendered`);
+          }
+          return;  // Skip the normal interpolated rendering
         }
         
         // === ARROW PASS: Virtual tile-based sampling with on-demand caching ===
@@ -2140,6 +2361,15 @@
       }
     }
     
+    function updateFallbackIndicator(usingFallback) {
+      const indicator = document.getElementById('fallback-indicator');
+      if (usingFallback) {
+        indicator.classList.add('visible');
+      } else {
+        indicator.classList.remove('visible');
+      }
+    }
+    
     function showError(message) {
       const loadingEl = document.getElementById('loading');
       loadingEl.innerHTML = `
@@ -2272,22 +2502,32 @@ window.addEventListener('resize', handleViewportChange);
         
         if (futureHoursAvail > 0) {
           // Normal mode: slider from 0 to maxFutureHours
+          // Extend range if fallback model provides additional coverage
+          let maxSliderHours = Math.min(futureHoursAvail, maxHour);
+          if (renderer.fallbackManifest) {
+            const fallbackMaxHour = Math.max(...renderer.fallbackManifest.forecast_hours);
+            const fallbackFutureHours = fallbackMaxHour - renderer.fallbackHourOffset - Math.ceil(modelAgeHours);
+            if (fallbackFutureHours > maxSliderHours) {
+              maxSliderHours = fallbackFutureHours;
+              logger.info(`Extended slider to +${Math.round(maxSliderHours)}h using fallback model`);
+            }
+          }
+          
           slider.min = 0;
-          slider.max = Math.min(futureHoursAvail, maxHour);
+          slider.max = Math.round(maxSliderHours);
           slider.value = 0;
-          document.getElementById('slider-label').textContent = `Hours from now (0 to +${Math.round(futureHoursAvail)})`;
+          document.getElementById('slider-label').textContent = `Hours from now (0 to +${Math.round(maxSliderHours)})`;
           
           // Load the initial forecast hour (closest to "now")
           const initialFH = Math.max(0, Math.min(Math.round(modelAgeHours), maxHour));
           await renderer.loadHour(initialFH);
           document.getElementById('forecast-time').textContent = formatTimeLocal(now);
           updateTideChart(now);
+          updateFallbackIndicator(renderer.currentSource === 'fallback');
           
           // Preload adjacent hours in background
           for (const h of [initialFH - 1, initialFH + 1]) {
-            if (hours.includes(h) && h !== initialFH) {
-              renderer._prefetchHour(h);
-            }
+            renderer._prefetchHour(h);
           }
         } else {
           // All data is historical (stale)
@@ -2360,6 +2600,7 @@ window.addEventListener('resize', handleViewportChange);
           document.getElementById('forecast-time').textContent = formatTimeLocal(targetTime);
           updateTideChart(targetTime);
           updateMagnitudeMarker();
+          updateFallbackIndicator(state.canvasRenderer.currentSource === 'fallback');
         }, 50);
       } else {
         // Normal forecast mode
@@ -2380,6 +2621,7 @@ window.addEventListener('resize', handleViewportChange);
           state.canvasRenderer._prefetchHour(fh - 1);
           updateTideChart(targetTime);
           updateMagnitudeMarker();
+          updateFallbackIndicator(state.canvasRenderer.currentSource === 'fallback');
         }, 50);
       }
     });
@@ -2414,6 +2656,31 @@ window.addEventListener('resize', handleViewportChange);
         setTimeout(() => {
           document.getElementById('slider-label').textContent = `Hours from now (0 to +${maxHours})`;
         }, 2000);
+      }
+    });
+    
+    // View toggle button handler
+    document.getElementById('view-toggle').addEventListener('click', () => {
+      state.rawViewMode = !state.rawViewMode;
+      const btn = document.getElementById('view-toggle');
+      
+      if (state.rawViewMode) {
+        btn.classList.add('raw-active');
+        btn.textContent = 'PROC';
+        btn.title = 'Switch to processed view';
+      } else {
+        btn.classList.remove('raw-active');
+        btn.textContent = 'RAW';
+        btn.title = 'Switch to raw data view';
+      }
+      
+      if (state.canvasRenderer) {
+        state.canvasRenderer.setRawViewMode(state.rawViewMode);
+      }
+      
+      // Haptic feedback
+      if (navigator.vibrate) {
+        navigator.vibrate(10);
       }
     });
     
