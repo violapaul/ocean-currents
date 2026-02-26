@@ -561,6 +561,91 @@
       color: white;
     }
     
+    /* Location button */
+    .locate-btn {
+      position: fixed;
+      bottom: calc(110px + env(safe-area-inset-bottom, 0px));
+      left: 10px;
+      width: 44px;
+      height: 44px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.95);
+      border: 2px solid #0066cc;
+      color: #0066cc;
+      font-size: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      z-index: 10;
+      transition: all 0.2s ease;
+    }
+    
+    .locate-btn:active {
+      transform: scale(0.95);
+    }
+    
+    .locate-btn.locating {
+      animation: pulse 1s ease-in-out infinite;
+    }
+    
+    .locate-btn.active {
+      background: #0066cc;
+      color: white;
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    
+    /* User location marker */
+    .user-location-marker {
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      pointer-events: none;
+      z-index: 5;
+      transform: translate(-50%, -50%);
+    }
+    
+    .user-location-dot {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 14px;
+      height: 14px;
+      background: #007AFF;
+      border: 3px solid white;
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    }
+    
+    .user-location-pulse {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 40px;
+      height: 40px;
+      background: rgba(0, 122, 255, 0.2);
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      animation: location-pulse 2s ease-out infinite;
+    }
+    
+    @keyframes location-pulse {
+      0% {
+        transform: translate(-50%, -50%) scale(0.5);
+        opacity: 1;
+      }
+      100% {
+        transform: translate(-50%, -50%) scale(2);
+        opacity: 0;
+      }
+    }
+    
   </style>
 </head>
 <body>
@@ -595,6 +680,19 @@
     
     <!-- View toggle button -->
     <button class="view-toggle" id="view-toggle" aria-label="Toggle raw data view" title="Toggle raw data view">RAW</button>
+    
+    <!-- Location button -->
+    <button class="locate-btn" id="locate-btn" aria-label="Show my location" title="Show my location">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zm8.94 3A8.994 8.994 0 0 0 13 3.06V1h-2v2.06A8.994 8.994 0 0 0 3.06 11H1v2h2.06A8.994 8.994 0 0 0 11 20.94V23h2v-2.06A8.994 8.994 0 0 0 20.94 13H23v-2h-2.06zM12 19c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
+      </svg>
+    </button>
+    
+    <!-- User location marker (hidden by default) -->
+    <div class="user-location-marker" id="user-location-marker" style="display: none;">
+      <div class="user-location-pulse"></div>
+      <div class="user-location-dot"></div>
+    </div>
     
     <div class="loading" id="loading">Searching for model data...</div>
 
@@ -704,7 +802,7 @@
     const isLowPowerDevice = isMobileDevice && window.innerWidth < 768;
     
     const CONFIG = {
-      APP_VERSION: 'v2.5.0', // Added fallback model support for extended forecasts during updates
+      APP_VERSION: 'v2.6.0', // Added location tracking with center button and marker
       S3_BUCKET_URL: 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
@@ -732,6 +830,9 @@
       staleModelStart: null,
       isOffline: false,
       rawViewMode: false,  // Toggle between processed (interpolated) and raw (all data points) view
+      userLocation: null,  // { lat, lng, accuracy }
+      watchId: null,       // Geolocation watch ID
+      locationActive: false,
     };
     
     // ========== CANVAS CURRENT RENDERER ==========
@@ -2681,6 +2782,174 @@ window.addEventListener('resize', handleViewportChange);
       // Haptic feedback
       if (navigator.vibrate) {
         navigator.vibrate(10);
+      }
+    });
+    
+    // ========== LOCATION FUNCTIONS ==========
+    
+    function updateUserLocationMarker() {
+      if (!state.userLocation) return;
+      
+      const marker = document.getElementById('user-location-marker');
+      const point = map.project([state.userLocation.lng, state.userLocation.lat]);
+      const rect = map.getContainer().getBoundingClientRect();
+      
+      marker.style.left = (point.x + rect.left) + 'px';
+      marker.style.top = (point.y + rect.top) + 'px';
+      marker.style.display = 'block';
+    }
+    
+    function hideUserLocationMarker() {
+      const marker = document.getElementById('user-location-marker');
+      marker.style.display = 'none';
+    }
+    
+    function handleLocationSuccess(position) {
+      const btn = document.getElementById('locate-btn');
+      btn.classList.remove('locating');
+      btn.classList.add('active');
+      
+      state.userLocation = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+        accuracy: position.coords.accuracy
+      };
+      
+      updateUserLocationMarker();
+      
+      // Center map on first location fix
+      if (!state.locationActive) {
+        state.locationActive = true;
+        map.flyTo({
+          center: [state.userLocation.lng, state.userLocation.lat],
+          zoom: Math.max(map.getZoom(), 11)
+        });
+      }
+      
+      logger.info(`Location: ${state.userLocation.lat.toFixed(5)}, ${state.userLocation.lng.toFixed(5)} (±${Math.round(state.userLocation.accuracy)}m)`);
+    }
+    
+    function handleLocationError(error) {
+      const btn = document.getElementById('locate-btn');
+      btn.classList.remove('locating');
+      btn.classList.remove('active');
+      
+      let message = 'Unable to get location';
+      switch (error.code) {
+        case error.PERMISSION_DENIED:
+          message = 'Location permission denied';
+          break;
+        case error.POSITION_UNAVAILABLE:
+          message = 'Location unavailable';
+          break;
+        case error.TIMEOUT:
+          message = 'Location request timed out';
+          break;
+      }
+      
+      logger.warn('Geolocation error:', message);
+      
+      // Show brief error toast
+      const toast = document.createElement('div');
+      toast.style.cssText = `
+        position: fixed;
+        bottom: calc(160px + env(safe-area-inset-bottom, 0px));
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0, 0, 0, 0.8);
+        color: white;
+        padding: 8px 16px;
+        border-radius: 20px;
+        font-size: 13px;
+        z-index: 1000;
+      `;
+      toast.textContent = message;
+      document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 3000);
+    }
+    
+    function startLocationTracking() {
+      if (!navigator.geolocation) {
+        handleLocationError({ code: 2, message: 'Geolocation not supported' });
+        return;
+      }
+      
+      const btn = document.getElementById('locate-btn');
+      btn.classList.add('locating');
+      
+      // Get initial position
+      navigator.geolocation.getCurrentPosition(
+        handleLocationSuccess,
+        handleLocationError,
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
+      
+      // Watch for position updates
+      state.watchId = navigator.geolocation.watchPosition(
+        handleLocationSuccess,
+        handleLocationError,
+        { enableHighAccuracy: true, timeout: 30000, maximumAge: 5000 }
+      );
+    }
+    
+    function stopLocationTracking() {
+      if (state.watchId !== null) {
+        navigator.geolocation.clearWatch(state.watchId);
+        state.watchId = null;
+      }
+      
+      state.locationActive = false;
+      state.userLocation = null;
+      
+      const btn = document.getElementById('locate-btn');
+      btn.classList.remove('locating');
+      btn.classList.remove('active');
+      
+      hideUserLocationMarker();
+    }
+    
+    // Location button handler
+    document.getElementById('locate-btn').addEventListener('click', () => {
+      if (state.locationActive) {
+        // Already tracking - center on current location
+        if (state.userLocation) {
+          map.flyTo({
+            center: [state.userLocation.lng, state.userLocation.lat],
+            zoom: Math.max(map.getZoom(), 11)
+          });
+        }
+      } else {
+        // Start tracking
+        startLocationTracking();
+      }
+      
+      // Haptic feedback
+      if (navigator.vibrate) {
+        navigator.vibrate(10);
+      }
+    });
+    
+    // Long press to stop tracking
+    let locationPressTimer = null;
+    document.getElementById('locate-btn').addEventListener('touchstart', (e) => {
+      locationPressTimer = setTimeout(() => {
+        if (state.locationActive) {
+          stopLocationTracking();
+          if (navigator.vibrate) navigator.vibrate([20, 50, 20]);
+        }
+      }, 800);
+    });
+    document.getElementById('locate-btn').addEventListener('touchend', () => {
+      clearTimeout(locationPressTimer);
+    });
+    document.getElementById('locate-btn').addEventListener('touchcancel', () => {
+      clearTimeout(locationPressTimer);
+    });
+    
+    // Update location marker when map moves
+    map.on('move', () => {
+      if (state.userLocation) {
+        updateUserLocationMarker();
       }
     });
     
