@@ -105,6 +105,34 @@ Options:
   --s3-prefix PREFIX S3 key prefix (default: ocean-currents)
 ```
 
+## Sailboat Routing
+
+`sail_routing.py` finds the time-optimal sailboat path through ocean currents,
+with optional polar-based sail performance and wind fields. `run_route.py`
+wraps that solver in a YAML-driven multi-leg workflow that can export route
+JSON, leg plots, hourly frames, and UTM position-vs-time plots.
+
+See **[ROUTING.md](ROUTING.md)** for the full algorithm description (A\* search,
+polar interpolation, heading sweep, path smoothing, etc.).
+
+```bash
+python sail_routing.py \
+    --start-lat 47.63 --start-lon -122.40 \
+    --end-lat   47.75 --end-lon   -122.42 \
+    --polar ../../../j105_polar_data_long.csv \
+    --wind-speed 12 --wind-direction 180 \
+    --depart "2026-03-10 09:00" \
+    --save route.png
+
+# Run routing tests (no SSCOFS download needed)
+python -m pytest test_sail_routing.py -v
+
+# Run a multi-leg route from YAML
+conda run -n anaconda python run_route.py routes/shilshole_alki_return.yaml
+```
+
+---
+
 ## Core Modules
 
 ### generate_current_data.py

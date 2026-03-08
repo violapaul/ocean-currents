@@ -33,12 +33,15 @@ Usage:
 """
 
 import argparse
+import csv
+import datetime as _dt
 import heapq
 import sys
 import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from pyproj import Transformer
@@ -72,7 +75,6 @@ class PolarTable:
     """
 
     def __init__(self, csv_path):
-        import csv
         csv_path = Path(csv_path)
         rows = []
         with open(csv_path, newline='') as f:
@@ -285,7 +287,17 @@ class WindField:
 
     @property
     def wind_speed_ms(self):
-        """Characteristic wind speed (m/s) for the constant/initial frame."""
+        """Characteristic wind speed (m/s).
+
+        For constant mode: the actual wind speed.
+        For temporal modes: speed of the first frame.
+        For spatial grid mode: not well-defined; returns 0.0.
+        Use ``query()`` for position/time-specific values.
+        """
+        if self._mode in ('temporal_const', 'temporal_grid'):
+            wu0 = self._wu_frames[0] if np.isscalar(self._wu_frames[0]) else float(np.nanmean(self._wu_frames[0]))
+            wv0 = self._wv_frames[0] if np.isscalar(self._wv_frames[0]) else float(np.nanmean(self._wv_frames[0]))
+            return float(np.hypot(wu0, wv0))
         return float(np.hypot(self._wu, self._wv))
 
     @property
@@ -446,7 +458,7 @@ class BoatModel:
         -------
         float (m/s)
         """
-        if self.polar is None or heading_rad is None or wind_u is None:
+        if self.polar is None or heading_rad is None or wind_u is None or wind_v is None:
             return self.base_speed_ms
 
         twa = compute_twa(heading_rad, wind_u, wind_v)
@@ -498,7 +510,8 @@ class Route:
     avg_sog_knots: float = 0.0
     boat_speed_knots: float = 0.0
     nodes_explored: int = 0
-    simulated_track: list = None  # [(x, y), ...] actual ground track
+    simulated_track: Optional[list] = None        # [(x, y), ...]
+    simulated_track_times: Optional[list] = None  # [elapsed_s, ...] parallel to simulated_track
 
     def summary(self):
         lines = [
@@ -528,6 +541,78 @@ _SWEEP_HX = np.cos(_SWEEP_RADS)   # east component (math frame)
 _SWEEP_HY = np.sin(_SWEEP_RADS)   # north component
 
 
+def _fixed_speed_sog(d_hat_x, d_hat_y, cu, cv, boat_speed_ms):
+    """Compute SOG (m/s) along d_hat for a fixed boat speed through water.
+
+    Accounts for cross-track current by crabbing.  Returns ``np.inf``
+    when the cross-current exceeds boat speed (impassable leg).
+
+    Parameters
+    ----------
+    d_hat_x, d_hat_y : float
+        Unit vector of desired ground track (east, north).
+    cu, cv : float
+        Current velocity (m/s, east/north).
+    boat_speed_ms : float
+        Boat speed through water in m/s.
+
+    Returns
+    -------
+    float : SOG in m/s along d_hat, or ``np.inf`` if impassable.
+    """
+    c_par = cu * d_hat_x + cv * d_hat_y
+    c_perp_x = cu - c_par * d_hat_x
+    c_perp_y = cv - c_par * d_hat_y
+    c_perp_mag = np.hypot(c_perp_x, c_perp_y)
+    if c_perp_mag >= boat_speed_ms:
+        return np.inf
+    v_water_along = np.sqrt(boat_speed_ms**2 - c_perp_mag**2)
+    v_sog = v_water_along + c_par
+    if v_sog <= 0.01:
+        return np.inf
+    return v_sog
+
+
+def _polar_boat_speeds(boat_model, wind_u, wind_v):
+    """Vectorised polar lookup for all sweep headings.
+
+    Returns an array of boat speeds (m/s) over water for every heading
+    in ``_SWEEP_RADS``.  Falls back to ``base_speed_ms`` if no polar or
+    if wind is negligible.
+    """
+    tws_kt = np.hypot(wind_u, wind_v) * MS_TO_KNOTS
+    if boat_model.polar is None or tws_kt <= 1e-3:
+        return np.full(len(_SWEEP_HX), boat_model.base_speed_ms)
+
+    wind_from_rad = np.arctan2(-wind_v, -wind_u)
+    delta = _SWEEP_RADS - wind_from_rad
+    delta = (delta + np.pi) % (2 * np.pi) - np.pi
+    twa_arr = np.degrees(np.abs(delta))
+
+    polar = boat_model.polar
+    twa_c = np.clip(twa_arr, polar._twas[0], polar._twas[-1])
+    tws_c = float(np.clip(tws_kt, polar._twss[0], polar._twss[-1]))
+
+    i0 = np.clip(np.searchsorted(polar._twas, twa_c, side='right') - 1,
+                 0, len(polar._twas) - 2)
+    i1 = i0 + 1
+    j0 = int(np.clip(np.searchsorted(polar._twss, tws_c, side='right') - 1,
+                     0, len(polar._twss) - 2))
+    j1 = j0 + 1
+
+    alpha = np.where(polar._twas[i1] > polar._twas[i0],
+                     (twa_c - polar._twas[i0]) / (polar._twas[i1] - polar._twas[i0]),
+                     0.0)
+    beta = float((tws_c - polar._twss[j0]) / (polar._twss[j1] - polar._twss[j0])
+                 if polar._twss[j1] > polar._twss[j0] else 0.0)
+
+    V_kt = ((1 - alpha) * (1 - beta) * polar._speeds[i0, j0] +
+            alpha       * (1 - beta) * polar._speeds[i1, j0] +
+            (1 - alpha) * beta       * polar._speeds[i0, j1] +
+            alpha       * beta       * polar._speeds[i1, j1])
+    return V_kt * KNOTS_TO_MS
+
+
 def _solve_heading(d_hat_x, d_hat_y, cu, cv, wind_u, wind_v,
                    boat_model, drift_tol=0.10):
     """Find the best speed-over-ground along a desired track.
@@ -553,72 +638,9 @@ def _solve_heading(d_hat_x, d_hat_y, cu, cv, wind_u, wind_v,
     -------
     float : best SOG in m/s along d_hat.  Returns 0.0 if impassable.
     """
-    tws_kt = np.hypot(wind_u, wind_v) * MS_TO_KNOTS
-
-    # Vectorised sweep over all candidate headings
-    if boat_model.polar is not None and tws_kt > 1e-3:
-        # Direction wind blows FROM
-        wind_from_rad = np.arctan2(-wind_v, -wind_u)
-        delta = _SWEEP_RADS - wind_from_rad
-        delta = (delta + np.pi) % (2 * np.pi) - np.pi
-        twa_arr = np.degrees(np.abs(delta))
-
-        # Vectorised bilinear lookup
-        twa_c = np.clip(twa_arr, boat_model.polar._twas[0],
-                        boat_model.polar._twas[-1])
-        tws_c = float(np.clip(tws_kt, boat_model.polar._twss[0],
-                               boat_model.polar._twss[-1]))
-
-        twas = boat_model.polar._twas
-        twss = boat_model.polar._twss
-        speeds = boat_model.polar._speeds
-
-        i0 = np.searchsorted(twas, twa_c, side='right') - 1
-        i0 = np.clip(i0, 0, len(twas) - 2)
-        i1 = i0 + 1
-
-        j0 = int(np.searchsorted(twss, tws_c, side='right')) - 1
-        j0 = int(np.clip(j0, 0, len(twss) - 2))
-        j1 = j0 + 1
-
-        ta0 = twas[i0]
-        ta1 = twas[i1]
-        ts0 = twss[j0]
-        ts1 = twss[j1]
-
-        alpha = np.where(ta1 > ta0, (twa_c - ta0) / (ta1 - ta0), 0.0)
-        beta = float((tws_c - ts0) / (ts1 - ts0)) if ts1 > ts0 else 0.0
-
-        s00 = speeds[i0, j0]
-        s10 = speeds[i1, j0]
-        s01 = speeds[i0, j1]
-        s11 = speeds[i1, j1]
-
-        V_kt = ((1 - alpha) * (1 - beta) * s00 +
-                alpha       * (1 - beta) * s10 +
-                (1 - alpha) * beta       * s01 +
-                alpha       * beta       * s11)
-        V = V_kt * KNOTS_TO_MS
-    else:
-        V = np.full(len(_SWEEP_HX), boat_model.base_speed_ms)
-
-    # Ground velocity = boat velocity + current
-    gx = V * _SWEEP_HX + cu
-    gy = V * _SWEEP_HY + cv
-
-    # Along-track and cross-track components
-    sog = gx * d_hat_x + gy * d_hat_y
-    drift = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
-
-    # Heading must make positive progress and cross-track drift must be
-    # within tolerance relative to along-track speed
-    progress = np.maximum(sog, 1e-6)
-    accept = (sog > 0.01) & (drift <= drift_tol * progress)
-
-    if not np.any(accept):
-        return 0.0
-
-    return float(np.max(sog[accept]))
+    sog, _, _, _ = _solve_heading_full(d_hat_x, d_hat_y, cu, cv,
+                                       wind_u, wind_v, boat_model, drift_tol)
+    return sog
 
 
 def _solve_heading_full(d_hat_x, d_hat_y, cu, cv, wind_u, wind_v,
@@ -631,51 +653,7 @@ def _solve_heading_full(d_hat_x, d_hat_y, cu, cv, wind_u, wind_v,
 
     Returns (0, 0, 0, 0) if impassable.
     """
-    tws_kt = np.hypot(wind_u, wind_v) * MS_TO_KNOTS
-
-    if boat_model.polar is not None and tws_kt > 1e-3:
-        wind_from_rad = np.arctan2(-wind_v, -wind_u)
-        delta = _SWEEP_RADS - wind_from_rad
-        delta = (delta + np.pi) % (2 * np.pi) - np.pi
-        twa_arr = np.degrees(np.abs(delta))
-
-        twa_c = np.clip(twa_arr, boat_model.polar._twas[0],
-                        boat_model.polar._twas[-1])
-        tws_c = float(np.clip(tws_kt, boat_model.polar._twss[0],
-                               boat_model.polar._twss[-1]))
-
-        twas = boat_model.polar._twas
-        twss = boat_model.polar._twss
-        speeds = boat_model.polar._speeds
-
-        i0 = np.searchsorted(twas, twa_c, side='right') - 1
-        i0 = np.clip(i0, 0, len(twas) - 2)
-        i1 = i0 + 1
-
-        j0 = int(np.searchsorted(twss, tws_c, side='right')) - 1
-        j0 = int(np.clip(j0, 0, len(twss) - 2))
-        j1 = j0 + 1
-
-        ta0 = twas[i0]
-        ta1 = twas[i1]
-        ts0 = twss[j0]
-        ts1 = twss[j1]
-
-        alpha = np.where(ta1 > ta0, (twa_c - ta0) / (ta1 - ta0), 0.0)
-        beta = float((tws_c - ts0) / (ts1 - ts0)) if ts1 > ts0 else 0.0
-
-        s00 = speeds[i0, j0]
-        s10 = speeds[i1, j0]
-        s01 = speeds[i0, j1]
-        s11 = speeds[i1, j1]
-
-        V_kt = ((1 - alpha) * (1 - beta) * s00 +
-                alpha       * (1 - beta) * s10 +
-                (1 - alpha) * beta       * s01 +
-                alpha       * beta       * s11)
-        V = V_kt * KNOTS_TO_MS
-    else:
-        V = np.full(len(_SWEEP_HX), boat_model.base_speed_ms)
+    V = _polar_boat_speeds(boat_model, wind_u, wind_v)
 
     gx = V * _SWEEP_HX + cu
     gy = V * _SWEEP_HY + cv
@@ -716,17 +694,26 @@ class Router:
 
     # Precomputed angle between every pair of the 8 grid directions (degrees).
     # Index 8 is a sentinel for "no incoming direction" (start node).
-    # For direction i: vector is (dc_i, dr_i) in (east, north) UTM coords.
+    # For direction i: (dr, dc) is the row/col offset.  dc > 0 = east,
+    # dr > 0 = north (ys is ascending).  arctan2(dc, dr) gives the
+    # compass-style bearing (0 = north, 90 = east) for consistent
+    # angle-difference computation.
     _N_DIRS = 9  # 0-7 grid directions + 8 start sentinel
     _DIR_ANGLES = np.array([
         np.degrees(np.arctan2(dc, dr))
         for dr, dc in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
     ])
-    _ANGLE_DIFF = np.zeros((8, 8))
-    for _i in range(8):
-        for _j in range(8):
-            _d = abs(_DIR_ANGLES[_i] - _DIR_ANGLES[_j]) % 360.0
-            _ANGLE_DIFF[_i, _j] = min(_d, 360.0 - _d)
+
+    @classmethod
+    def _build_angle_diff(cls):
+        mat = np.zeros((8, 8))
+        for i in range(8):
+            for j in range(8):
+                d = abs(cls._DIR_ANGLES[i] - cls._DIR_ANGLES[j]) % 360.0
+                mat[i, j] = min(d, 360.0 - d)
+        return mat
+
+    _ANGLE_DIFF = None  # populated below after class definition
 
     def __init__(self, current_field: CurrentField, boat: BoatModel,
                  resolution_m: float = 300.0, padding_m: float = 5000.0,
@@ -848,16 +835,9 @@ class Router:
                 if v_sog <= 0.01:
                     return np.inf, dist
             else:
-                boat_speed = self.boat.speed()
-                c_par = cu * d_hat_x + cv * d_hat_y
-                c_perp_x = cu - c_par * d_hat_x
-                c_perp_y = cv - c_par * d_hat_y
-                c_perp_mag = np.hypot(c_perp_x, c_perp_y)
-                if c_perp_mag >= boat_speed:
-                    return np.inf, dist
-                v_water_along = np.sqrt(boat_speed**2 - c_perp_mag**2)
-                v_sog = v_water_along + c_par
-                if v_sog <= 0.01:
+                v_sog = _fixed_speed_sog(d_hat_x, d_hat_y, cu, cv,
+                                         self.boat.speed())
+                if not np.isfinite(v_sog):
                     return np.inf, dist
 
             dt = seg_len / v_sog
@@ -945,7 +925,10 @@ class Router:
             new_path = [path_rc[0]]
             i = 1
             while i < len(path_rc) - 1:
-                ax, ay = xs[path_rc[i-1][1]], ys[path_rc[i-1][0]]
+                # Use the last actually-kept point as the "previous" point so
+                # that consecutive stub removals don't see a removed point as A.
+                prev = new_path[-1]
+                ax, ay = xs[prev[1]], ys[prev[0]]
                 bx, by = xs[path_rc[i][1]],   ys[path_rc[i][0]]
                 cx, cy = xs[path_rc[i+1][1]], ys[path_rc[i+1][0]]
 
@@ -1008,28 +991,17 @@ class Router:
                 return np.inf
             return dist / v_sog
 
-        boat_speed = self.boat.speed()
-        c_par = cu * d_hat_x + cv * d_hat_y
-        c_perp_x = cu - c_par * d_hat_x
-        c_perp_y = cv - c_par * d_hat_y
-        c_perp_mag = np.hypot(c_perp_x, c_perp_y)
-
-        if c_perp_mag >= boat_speed:
+        v_sog = _fixed_speed_sog(d_hat_x, d_hat_y, cu, cv, self.boat.speed())
+        if not np.isfinite(v_sog):
             return np.inf
-
-        v_water_along = np.sqrt(boat_speed**2 - c_perp_mag**2)
-        v_sog = v_water_along + c_par
-
-        if v_sog <= 0.01:
-            return np.inf
-
         return dist / v_sog
 
     # ------------------------------------------------------------------
     #  A* search
     # ------------------------------------------------------------------
 
-    def find_route(self, start_latlon, end_latlon, start_time_s=0.0):
+    def find_route(self, start_latlon, end_latlon, start_time_s=0.0,
+                   max_iterations=2_000_000):
         """Find the time-optimal route between two lat/lon points.
 
         Parameters
@@ -1038,6 +1010,9 @@ class Router:
         end_latlon : (lat, lon)
         start_time_s : float
             Elapsed seconds from the forecast reference time at departure.
+        max_iterations : int
+            Hard limit on A* iterations to prevent runaway searches.
+            Raises RuntimeError if exceeded.
 
         Returns
         -------
@@ -1111,6 +1086,11 @@ class Router:
                 continue
 
             explored += 1
+            if explored > max_iterations:
+                raise RuntimeError(
+                    f"A* exceeded {max_iterations} iterations -- "
+                    "route may be unreachable or grid too large.")
+
             arr_t = arrival_time[r, c, d_in]
 
             for d_out, (dr, dc) in enumerate(self.NEIGHBOR_OFFSETS):
@@ -1124,7 +1104,9 @@ class Router:
                 if dt == INF:
                     continue
 
-                # Tacking penalty: course change beyond threshold costs time
+                # Tacking penalty: course change beyond threshold adds planning cost.
+                # Applied to best_cost only -- NOT to arrival_time, which tracks
+                # the physical clock used for current/wind look-ups.
                 penalty = 0.0
                 if (d_in < 8 and self.tack_penalty_s > 0
                         and self._ANGLE_DIFF[d_in, d_out]
@@ -1134,7 +1116,7 @@ class Router:
                 new_cost = cost + dt + penalty
                 if new_cost < best_cost[nr, nc_, d_out]:
                     best_cost[nr, nc_, d_out] = new_cost
-                    arrival_time[nr, nc_, d_out] = arr_t + dt + penalty
+                    arrival_time[nr, nc_, d_out] = arr_t + dt  # physical time only
                     came_from[nr, nc_, d_out, 0] = r
                     came_from[nr, nc_, d_out, 1] = c
                     came_from[nr, nc_, d_out, 2] = d_in
@@ -1194,7 +1176,7 @@ class Router:
         n_raw = len(raw_path_rc)
         n_smooth = len(path_rc)
 
-        sim_track = self.simulate_track(waypoints_utm, start_time_s)
+        sim_track, sim_track_times = self.simulate_track(waypoints_utm, start_time_s)
 
         route = Route(
             waypoints_utm=waypoints_utm,
@@ -1207,6 +1189,7 @@ class Router:
             boat_speed_knots=self.boat.base_speed_knots,
             nodes_explored=explored,
             simulated_track=sim_track,
+            simulated_track_times=sim_track_times,
         )
 
         wall_s = _time.monotonic() - t_wall_0
@@ -1258,16 +1241,9 @@ class Router:
                 if v_sog <= 0.01:
                     return np.inf, total_dist
             else:
-                boat_speed = self.boat.speed()
-                c_par = cu * d_hat_x + cv * d_hat_y
-                c_perp_x = cu - c_par * d_hat_x
-                c_perp_y = cv - c_par * d_hat_y
-                c_perp_mag = np.hypot(c_perp_x, c_perp_y)
-                if c_perp_mag >= boat_speed:
-                    return np.inf, total_dist
-                v_water_along = np.sqrt(boat_speed**2 - c_perp_mag**2)
-                v_sog = v_water_along + c_par
-                if v_sog <= 0.01:
+                v_sog = _fixed_speed_sog(d_hat_x, d_hat_y, cu, cv,
+                                         self.boat.speed())
+                if not np.isfinite(v_sog):
                     return np.inf, total_dist
 
             dt = seg_len / v_sog
@@ -1281,13 +1257,13 @@ class Router:
     # ------------------------------------------------------------------
 
     def simulate_track(self, waypoints_utm, start_time_s=0.0, dt_s=10.0):
-        """Forward-integrate the actual ground track along the route.
+        """Sample the planned ground track into a dense time series.
 
-        On each leg the boat aims toward the next waypoint, picks the
-        heading that maximises along-track SOG (via _solve_heading_full),
-        and then advances by the *full* ground velocity vector (including
-        cross-track drift from current).  The result is a dense polyline
-        that curves realistically with the current.
+        The route solver already returns a polyline of feasible ground-track
+        waypoints.  For visualisation/export, we densify each segment using the
+        same travel-time model as the solver and linearly interpolate position
+        along that segment.  This keeps the exported track continuous and its
+        timing consistent with ``route.total_time_s``.
 
         Parameters
         ----------
@@ -1300,73 +1276,55 @@ class Router:
 
         Returns
         -------
-        list[(x, y)] : simulated ground track positions.
+        tuple[list[(x, y)], list[float]]
+            ``(track, track_times)`` — position list and parallel
+            list of elapsed-seconds values for each point.
         """
         if len(waypoints_utm) < 2:
-            return list(waypoints_utm)
+            pts = list(waypoints_utm)
+            return pts, [start_time_s] * len(pts)
 
         track = []
+        track_times = []
         elapsed = start_time_s
         px, py = waypoints_utm[0]
         track.append((px, py))
+        track_times.append(elapsed)
 
         for wp_idx in range(1, len(waypoints_utm)):
             tx, ty = waypoints_utm[wp_idx]
-
-            max_iters = 200_000
-            for _ in range(max_iters):
-                dx = tx - px
-                dy = ty - py
-                remaining = np.hypot(dx, dy)
-
-                if remaining < 5.0:
-                    px, py = tx, ty
-                    track.append((px, py))
-                    break
-
-                d_hat_x = dx / remaining
-                d_hat_y = dy / remaining
-
-                cu, cv = self.cf.query(px, py, elapsed_s=elapsed)
-                if np.isnan(cu) or np.isnan(cv):
-                    cu, cv = 0.0, 0.0
-
-                if self._use_polar:
-                    wu, wv = self.wind.query(px, py, elapsed_s=elapsed)
-                    _, gvx, gvy, _ = _solve_heading_full(
-                        d_hat_x, d_hat_y, cu, cv, wu, wv, self.boat)
-                else:
-                    boat_speed = self.boat.speed()
-                    c_perp_x = cu - (cu * d_hat_x + cv * d_hat_y) * d_hat_x
-                    c_perp_y = cv - (cu * d_hat_x + cv * d_hat_y) * d_hat_y
-                    c_perp_mag = np.hypot(c_perp_x, c_perp_y)
-                    if c_perp_mag >= boat_speed:
-                        gvx, gvy = cu, cv
-                    else:
-                        v_along = np.sqrt(boat_speed**2 - c_perp_mag**2)
-                        head_x = v_along * d_hat_x - c_perp_x
-                        head_y = v_along * d_hat_y - c_perp_y
-                        h_mag = np.hypot(head_x, head_y)
-                        if h_mag > 1e-9:
-                            head_x = head_x / h_mag * boat_speed
-                            head_y = head_y / h_mag * boat_speed
-                        gvx = head_x + cu
-                        gvy = head_y + cv
-
-                spd = np.hypot(gvx, gvy)
-                if spd < 0.01:
-                    track.append((tx, ty))
-                    break
-
-                step = min(dt_s, remaining / spd)
-                px += gvx * step
-                py += gvy * step
-                elapsed += step
+            seg_time, seg_dist = self._segment_travel_time(
+                px, py, tx, ty, elapsed)
+            if not np.isfinite(seg_time) or seg_dist < 1e-6:
+                px, py = tx, ty
                 track.append((px, py))
-            else:
-                track.append((tx, ty))
+                track_times.append(elapsed)
+                continue
 
-        return track
+            # Use enough samples for both temporal smoothness and spatial
+            # smoothness, while always landing exactly on the segment endpoint.
+            n_steps = max(
+                1,
+                int(np.ceil(seg_time / dt_s)),
+                int(np.ceil(seg_dist / max(self.resolution / 2.0, 1.0))),
+            )
+
+            x0, y0 = px, py
+            for step_idx in range(1, n_steps + 1):
+                alpha = step_idx / n_steps
+                px = x0 + alpha * (tx - x0)
+                py = y0 + alpha * (ty - y0)
+                t = elapsed + alpha * seg_time
+                track.append((px, py))
+                track_times.append(t)
+
+            elapsed += seg_time
+
+        return track, track_times
+
+
+# Populate the classmethod-built table now that the class is defined.
+Router._ANGLE_DIFF = Router._build_angle_diff()
 
 
 # ===================================================================
@@ -1573,21 +1531,25 @@ def load_current_field(depart_dt=None, forecast_hours=None,
             departure time.  Pass this to ``Router.find_route()``.
         depart_utc : datetime or None -- the departure time in UTC.
     """
-    import datetime as _dt
     from fetch_sscofs import build_sscofs_url
     from sscofs_cache import load_sscofs_data as _load
 
     depart_utc = None
     if depart_dt is not None:
         if depart_dt.tzinfo is None:
-            from zoneinfo import ZoneInfo
             depart_dt = depart_dt.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
         depart_utc = depart_dt.astimezone(_dt.timezone.utc)
 
-    # Always use get_latest_current_data (which picks the latest
-    # *actually-available* cycle) rather than compute_file_for_datetime
-    # which may pick a cycle that hasn't been produced yet.
-    ds, info = get_latest_current_data(use_cache=use_cache)
+    # For historical departures (more than 3 hours in the past) pass the
+    # departure time so that the correct historical model cycle is selected.
+    # For near-real-time/future departures use "latest available" to avoid
+    # picking a cycle that hasn't been published yet.
+    now_utc = _dt.datetime.now(_dt.timezone.utc)
+    if depart_utc is not None and (now_utc - depart_utc).total_seconds() > 3 * 3600:
+        ds, info = get_latest_current_data(use_cache=use_cache,
+                                           target_datetime=depart_utc)
+    else:
+        ds, info = get_latest_current_data(use_cache=use_cache)
 
     lonc = ds["lonc"].values
     latc = ds["latc"].values
@@ -1627,9 +1589,7 @@ def load_current_field(depart_dt=None, forecast_hours=None,
               f"({len(forecast_hours)} frames)")
 
     if depart_utc is not None:
-        depart_local = depart_utc.astimezone(
-            _dt.timezone(_dt.timedelta(
-                seconds=depart_dt.utcoffset().total_seconds())))
+        depart_local = depart_utc.astimezone(depart_dt.tzinfo)
         print(f"Departure (local):  {depart_local:%Y-%m-%d %H:%M}")
         print(f"Departure (UTC):    {depart_utc:%Y-%m-%d %H:%M UTC}")
 
@@ -1688,9 +1648,6 @@ def load_current_field(depart_dt=None, forecast_hours=None,
 # ===================================================================
 
 def main():
-    import datetime as _dt
-    from zoneinfo import ZoneInfo
-
     parser = argparse.ArgumentParser(
         description="Sailboat routing through ocean currents")
     parser.add_argument("--start-lat", type=float, required=True,

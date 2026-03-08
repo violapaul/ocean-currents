@@ -1,0 +1,43 @@
+# Shilshole to Alki and back — March 7 2026
+#
+# Start/end: Shilshole Bay Marina (47.6829, -122.4123)
+# Turnaround: Alki area (47.4495, -122.3843)
+#
+# Run with:
+#   conda run -n anaconda python run_route.py routes/shilshole_alki_return.yaml
+
+task:
+  name: "Shilshole → Alki → Shilshole"
+  description: >
+    Down Puget Sound from Shilshole Bay Marina to just south of Alki Point,
+    then return.  Useful for checking how tidal currents affect timing on a
+    southbound vs northbound leg.
+
+departure:
+  datetime: "2026-03-07 10:30"
+  tz: "America/Los_Angeles"
+
+waypoints:
+  - [47.682919, -122.412349]    # Shilshole Bay Marina (start/finish)
+  - [47.449485, -122.384278]    # Alki area turnaround
+  - [47.682919, -122.412349]    # Return to Shilshole
+
+boat:
+  speed_kt: 6.0             # fallback if polar isn't used
+  polar: "../../j105_polar_data_long.csv"   # relative to Python_SSCOFS/
+
+# 12-kt southerly: leg 1 (southbound) is an upwind beat, leg 2 (northbound)
+# is a downwind run — makes tacking clearly visible on the first leg.
+wind:
+  speed_kt: 12.0
+  direction_deg: 180.0      # FROM south → boat sails into it on the outbound leg
+
+routing:
+  grid_resolution_m: 300
+  padding_m: 5000
+  tack_penalty_s: 60
+  duration_hours: 10        # forecast window to load per leg
+
+output:
+  save_plots: true          # save a PNG for each leg
+  plot_dir: "routes/output" # relative to the Python_SSCOFS directory

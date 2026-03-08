@@ -138,8 +138,11 @@ def load_sscofs_data(run_info: Dict,
     elif verbose:
         print(f"Using cached file: {cache_file.name}")
     
-    # Load from the cached file
-    ds = xr.open_dataset(cache_file, engine='h5netcdf')
+    # FVCOM NetCDF files have 'siglay' as both a variable and a dimension,
+    # which newer xarray/h5netcdf reject.  Drop the coordinate variable so
+    # the dimension survives and isel(siglay=0) still works.
+    ds = xr.open_dataset(cache_file, engine='h5netcdf',
+                         drop_variables=['siglay', 'siglev'])
     return ds
 
 

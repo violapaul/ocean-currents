@@ -1418,8 +1418,10 @@ class TestTackingPenalty:
     course changes, and the algorithm should prefer routes that minimize
     the number of tacks when a penalty is applied."""
 
-    def test_penalty_zero_matches_old_behaviour(self):
-        """With tack_penalty_s=0 the result should equal the no-penalty case."""
+    def test_penalty_zero_matches_default(self):
+        """With tack_penalty_s=0 the route time should match or be close to
+        the default-penalty case (both produce valid routes; zero penalty
+        cannot be worse in time since no overhead is added)."""
         cf, tr = make_synthetic_field()
         boat = BoatModel(base_speed_knots=6.0)
 
@@ -1428,14 +1430,21 @@ class TestTackingPenalty:
 
         router_no_penalty = Router(cf, boat, resolution_m=200.0,
                                    padding_m=1000.0, tack_penalty_s=0.0)
-        router_penalty = Router(cf, boat, resolution_m=200.0,
-                                padding_m=1000.0, tack_penalty_s=0.0)
+        router_default = Router(cf, boat, resolution_m=200.0,
+                                padding_m=1000.0, tack_penalty_s=60.0)
 
         route_np, _, _, _ = router_no_penalty.find_route(start, end)
-        route_p, _, _, _ = router_penalty.find_route(start, end)
+        route_dp, _, _, _ = router_default.find_route(start, end)
 
-        assert route_np.total_time_s == pytest.approx(
-            route_p.total_time_s, rel=0.01)
+        # Without penalty the route may take more tacks but total physical
+        # travel time should not be dramatically worse (within 10%).
+        assert route_np.total_time_s <= route_dp.total_time_s * 1.10, (
+            f"No-penalty route ({route_np.total_time_s:.1f}s) should not be "
+            f"much slower than default-penalty route ({route_dp.total_time_s:.1f}s)"
+        )
+        # Both routes must be valid
+        assert np.isfinite(route_np.total_time_s)
+        assert np.isfinite(route_dp.total_time_s)
 
     def test_straight_route_no_penalty_incurred(self):
         """A straight north-south route makes no course changes so
@@ -1467,10 +1476,11 @@ class TestTackingPenalty:
         for i in range(8):
             assert angle_diff[i, i] == pytest.approx(0.0, abs=1e-9)
 
-        # Opposite directions: N vs S, E vs W, etc.
-        # N = (-1,0) idx=1, S = (1,0) idx=6
-        idx_n = offsets.index((-1, 0))
-        idx_s = offsets.index((1, 0))
+        # Opposite directions: (-1,0) vs (1,0), (0,-1) vs (0,1), etc.
+        # Note: ys is ascending so dr=+1 is north and dr=-1 is south in the grid,
+        # but what matters here is that opposite offsets differ by 180 degrees.
+        idx_n = offsets.index((-1, 0))   # dr=-1: toward lower row (south in grid)
+        idx_s = offsets.index((1, 0))    # dr=+1: toward higher row (north in grid)
         assert angle_diff[idx_n, idx_s] == pytest.approx(180.0, abs=0.1)
 
         # E = (0,1) idx=4, W = (0,-1) idx=3
@@ -1736,6 +1746,51 @@ class TestRouteQuality:
                         f"Stub at WP{i+1} (wind={wind_dir}): "
                         f"short leg {short_leg:.0f}m, "
                         f"long leg {long_leg:.0f}m, turn {angle:.0f} deg")
+
+
+class TestSimulatedTrack:
+    """The dense exported track should stay continuous and match route timing."""
+
+    def test_track_times_match_route_duration(self):
+        """The sampled track should end at the same total time as the route."""
+        cf, tr = make_synthetic_field()
+        boat = BoatModel(base_speed_knots=6.0)
+        router = Router(cf, boat, resolution_m=200.0, padding_m=1000.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+        route, _, _, _ = router.find_route(start, end)
+
+        assert route.simulated_track_times is not None
+        assert route.simulated_track is not None
+        assert route.simulated_track_times[0] == pytest.approx(0.0, abs=1e-6)
+        assert route.simulated_track_times[-1] == pytest.approx(
+            route.total_time_s, rel=0.02)
+        assert route.simulated_track[-1][0] == pytest.approx(
+            route.waypoints_utm[-1][0], abs=1e-6)
+        assert route.simulated_track[-1][1] == pytest.approx(
+            route.waypoints_utm[-1][1], abs=1e-6)
+
+    def test_polar_track_has_no_teleports(self, polar):
+        """Upwind polar tracks should have monotonic time and no km-scale jumps."""
+        cf, tr = make_synthetic_field()
+        boat = BoatModel(base_speed_knots=6.0, polar=polar)
+        wind = WindField.from_met(15, 180)
+        router = Router(cf, boat, resolution_m=200.0, padding_m=2000.0,
+                        wind=wind, tack_penalty_s=120.0)
+
+        start = _latlon_for_offset(0, -3000, tr)
+        end = _latlon_for_offset(0, 3000, tr)
+        route, _, _, _ = router.find_route(start, end)
+
+        times = np.asarray(route.simulated_track_times, dtype=float)
+        pts = np.asarray(route.simulated_track, dtype=float)
+        dt = np.diff(times)
+        step = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))
+
+        assert np.all(dt >= -1e-9), "Track time must be monotonic"
+        assert np.max(step) < 500.0, (
+            f"Track contains an implausible jump of {np.max(step):.0f} m")
 
 
 if __name__ == "__main__":
