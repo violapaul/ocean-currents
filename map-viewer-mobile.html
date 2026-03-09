@@ -814,8 +814,8 @@
         : 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
       // Adaptive quality: fewer arrows on slower devices
       ARROWS_PER_TILE: isLowPowerDevice ? 12 : 16,
-      // Water boundary bitmap resolution (degrees per pixel, ~150m at lat 48)
-      WATER_BITMAP_RES: 0.002,
+      // Water boundary bitmap resolution (degrees per pixel, ~50m at lat 48)
+      WATER_BITMAP_RES: 0.0005,
     };
     
     // ========== APPLICATION STATE ==========
@@ -1182,18 +1182,18 @@
       }
       
       isWater(lon, lat) {
-        if (!this._waterBitmap) return true;  // Default to water if no boundary loaded
+        if (!this._waterBitmap) return true;
         
         const b = this._waterBitmapBounds;
         if (lon < b.lonMin || lon > b.lonMax || lat < b.latMin || lat > b.latMax) {
-          return false;
+          return true;  // Outside bitmap = open ocean
         }
         
         const col = Math.floor((lon - b.lonMin) / this._waterBitmapRes);
-        const row = Math.floor((b.latMax - lat) / this._waterBitmapRes);  // flip Y
+        const row = Math.floor((b.latMax - lat) / this._waterBitmapRes);
         
         if (col < 0 || col >= this._waterBitmapCols || row < 0 || row >= this._waterBitmapRows) {
-          return false;
+          return true;
         }
         
         return this._waterBitmap[row * this._waterBitmapCols + col] === 1;
@@ -1665,7 +1665,7 @@
                 if (aLon < bounds.lon_min || aLon > bounds.lon_max ||
                     aLat < bounds.lat_min || aLat > bounds.lat_max) continue;
                 
-                // Skip if over land (Delaunay-based detection)
+                // Skip if over land (boundary polygon rasterized to bitmap)
                 if (!this.isWater(aLon, aLat)) continue;
                 
                 const siCol = Math.floor((aLon - bounds.lon_min) / si.cellSize);

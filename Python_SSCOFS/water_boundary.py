@@ -240,42 +240,63 @@ def refine_with_velocity(
     return valid_mask, rejected
 
 
-def _batch_intersect(edge_a: np.ndarray, edges_b: np.ndarray) -> bool:
-    """Test if segment edge_a intersects ANY segment in edges_b (vectorized).
+def load_nav_mask(path: Union[str, Path]) -> Tuple[np.ndarray, Tuple[float, float, float, float], float]:
+    """Load navigable water mask from .npz file.
     
-    edge_a: shape (4,) — [ax, ay, bx, by]
-    edges_b: shape (N, 4) — each row [cx, cy, dx, dy]
+    Parameters
+    ----------
+    path : str or Path
+        Path to nav_mask.npz created by build_nav_mask.py.
+        
+    Returns
+    -------
+    water_grid : ndarray, shape (ny, nx), dtype bool
+        True where water is navigable.
+    bounds : tuple (lon_min, lon_max, lat_min, lat_max)
+        Geographic extent of the grid.
+    res_deg : float
+        Grid resolution in degrees.
     """
-    ax, ay, bx, by = edge_a
-    cx = edges_b[:, 0]; cy = edges_b[:, 1]
-    dx = edges_b[:, 2]; dy = edges_b[:, 3]
-    
-    # Cross products for orientation tests
-    d1 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx)
-    d2 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx)
-    d3 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-    d4 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax)
-    
-    cross1 = (d1 > 0) != (d2 > 0)  # A,B on opposite sides of CD
-    cross2 = (d3 > 0) != (d4 > 0)  # C,D on opposite sides of AB
-    
-    return np.any(cross1 & cross2)
+    data = np.load(path)
+    water_grid = data['water'].astype(bool)
+    bounds = (
+        float(data['lon_min']),
+        float(data['lon_max']),
+        float(data['lat_min']),
+        float(data['lat_max']),
+    )
+    res_deg = float(data['res_deg'])
+    return water_grid, bounds, res_deg
 
 
-def refine_with_shoreline(
+def _is_water_at(lon_pts, lat_pts, water_grid, lon_min, lat_min, res_deg, ny, nx):
+    """Look up water status for arrays of lon/lat points.
+    
+    Points outside the DEM extent are treated as water (open ocean).
+    """
+    col = ((lon_pts - lon_min) / res_deg).astype(int)
+    row = ((lat_pts - lat_min) / res_deg).astype(int)
+    in_bounds = (col >= 0) & (col < nx) & (row >= 0) & (row < ny)
+    result = np.ones(len(lon_pts), dtype=bool)  # default: water
+    result[in_bounds] = water_grid[row[in_bounds], col[in_bounds]]
+    return result
+
+
+def refine_with_nav_mask(
     delaunay: Delaunay,
     valid_mask: np.ndarray,
     lon: np.ndarray,
     lat: np.ndarray,
-    shoreline_path: Union[str, Path],
-    cell_size: float = 0.01,
+    water_grid: np.ndarray,
+    bounds: Tuple[float, float, float, float],
+    res_deg: float,
 ) -> Tuple[np.ndarray, int]:
-    """Refine water mask by rejecting triangles whose edges cross the shoreline.
+    """Refine water mask by rejecting triangles whose edges cross land.
     
-    Loads a shoreline GeoJSON (LineString features) and builds a spatial grid
-    index. For each valid triangle near shoreline, checks if any of its three
-    edges intersect any shoreline segment. Uses vectorized numpy intersection
-    tests for performance.
+    Samples points along each triangle edge at DEM resolution and checks
+    against the DEM-derived water mask.  This gives a clean coastline that
+    follows the DEM depth contour while keeping the Delaunay mesh topology
+    smooth.
     
     Parameters
     ----------
@@ -285,120 +306,57 @@ def refine_with_shoreline(
         Boolean mask (modified in place).
     lon, lat : ndarray
         Element coordinates in degrees.
-    shoreline_path : str or Path
-        Path to shoreline GeoJSON with LineString features.
-    cell_size : float
-        Spatial index grid cell size in degrees (~1km at 0.01).
+    water_grid : ndarray, shape (ny, nx)
+        Boolean grid where True = navigable water.
+    bounds : tuple (lon_min, lon_max, lat_min, lat_max)
+        Geographic extent of water_grid.
+    res_deg : float
+        Grid resolution in degrees.
         
     Returns
     -------
     valid_mask : ndarray
-        Updated mask.
+        Updated mask with land-crossing triangles removed.
     rejected : int
         Number of additionally rejected triangles.
     """
-    with open(shoreline_path) as f:
-        gj = json.load(f)
+    lon_min, lon_max, lat_min, lat_max = bounds
+    ny, nx = water_grid.shape
     
-    # Extract all shoreline segments as numpy array
-    seg_list = []
-    for feat in gj.get("features", []):
-        geom = feat.get("geometry", {})
-        coords_lists = []
-        if geom.get("type") == "LineString":
-            coords_lists = [geom["coordinates"]]
-        elif geom.get("type") == "MultiLineString":
-            coords_lists = geom["coordinates"]
-        for coords in coords_lists:
-            for i in range(len(coords) - 1):
-                seg_list.append((coords[i][0], coords[i][1],
-                                 coords[i+1][0], coords[i+1][1]))
-    
-    if not seg_list:
-        return valid_mask, 0
-    
-    seg_arr = np.array(seg_list, dtype=np.float64)
-    
-    # Build grid index: map (row, col) -> numpy array of segment rows
-    grid_lon_min = seg_arr[:, [0, 2]].min() - cell_size
-    grid_lat_min = seg_arr[:, [1, 3]].min() - cell_size
-    
-    grid: Dict[tuple, List[int]] = defaultdict(list)
-    for si in range(len(seg_arr)):
-        x1, y1, x2, y2 = seg_arr[si]
-        c0 = int((min(x1, x2) - grid_lon_min) / cell_size)
-        c1 = int((max(x1, x2) - grid_lon_min) / cell_size)
-        r0 = int((min(y1, y2) - grid_lat_min) / cell_size)
-        r1 = int((max(y1, y2) - grid_lat_min) / cell_size)
-        for r in range(r0, r1 + 1):
-            for c in range(c0, c1 + 1):
-                grid[(r, c)].append(si)
-    
-    # Convert grid lists to numpy arrays for vectorized intersection
-    grid_np = {k: np.array(v, dtype=np.intp) for k, v in grid.items()}
-    populated_cells = set(grid_np.keys())
-    
-    # Pre-compute triangle vertex coordinates and grid cells
     simplices = delaunay.simplices
     valid_idx = np.where(valid_mask)[0]
     
-    v0s = simplices[valid_idx, 0]
-    v1s = simplices[valid_idx, 1]
-    v2s = simplices[valid_idx, 2]
+    if len(valid_idx) == 0:
+        return valid_mask, 0
     
-    tri_lon_min = np.minimum(np.minimum(lon[v0s], lon[v1s]), lon[v2s])
-    tri_lon_max = np.maximum(np.maximum(lon[v0s], lon[v1s]), lon[v2s])
-    tri_lat_min = np.minimum(np.minimum(lat[v0s], lat[v1s]), lat[v2s])
-    tri_lat_max = np.maximum(np.maximum(lat[v0s], lat[v1s]), lat[v2s])
-    
-    tc0 = ((tri_lon_min - grid_lon_min) / cell_size).astype(int)
-    tc1 = ((tri_lon_max - grid_lon_min) / cell_size).astype(int)
-    tr0 = ((tri_lat_min - grid_lat_min) / cell_size).astype(int)
-    tr1 = ((tri_lat_max - grid_lat_min) / cell_size).astype(int)
+    # Sample spacing: half a DEM pixel to catch every land pixel an edge crosses
+    step = res_deg * 0.5
     
     rejected = 0
-    
     for i in range(len(valid_idx)):
-        # Quick check: does this triangle overlap any populated cell?
-        has_shore = False
-        for r in range(tr0[i], tr1[i] + 1):
-            for c in range(tc0[i], tc1[i] + 1):
-                if (r, c) in populated_cells:
-                    has_shore = True
-                    break
-            if has_shore:
-                break
-        if not has_shore:
-            continue
-        
         t = valid_idx[i]
         v0, v1, v2 = simplices[t]
         
-        # Gather all shoreline segments from grid cells this triangle overlaps
-        seg_indices = set()
-        for r in range(tr0[i], tr1[i] + 1):
-            for c in range(tc0[i], tc1[i] + 1):
-                arr = grid_np.get((r, c))
-                if arr is not None:
-                    seg_indices.update(arr.tolist())
-        
-        if not seg_indices:
-            continue
-        
-        nearby = seg_arr[list(seg_indices)]
-        
-        # Test all 3 triangle edges against all nearby shoreline segments (vectorized)
-        edges = [
-            np.array([lon[v0], lat[v0], lon[v1], lat[v1]]),
-            np.array([lon[v1], lat[v1], lon[v2], lat[v2]]),
-            np.array([lon[v2], lat[v2], lon[v0], lat[v0]]),
-        ]
-        
-        for edge in edges:
-            if _batch_intersect(edge, nearby):
-                valid_mask[t] = False
-                rejected += 1
+        hit_land = False
+        for va, vb in [(v0, v1), (v1, v2), (v2, v0)]:
+            dlon = lon[vb] - lon[va]
+            dlat = lat[vb] - lat[va]
+            edge_len = max(abs(dlon), abs(dlat))
+            n_samples = max(int(edge_len / step) + 1, 2)
+            
+            ts = np.linspace(0, 1, n_samples)
+            sample_lon = lon[va] + ts * dlon
+            sample_lat = lat[va] + ts * dlat
+            
+            water = _is_water_at(sample_lon, sample_lat,
+                                 water_grid, lon_min, lat_min, res_deg, ny, nx)
+            if not water.all():
+                hit_land = True
                 break
+        
+        if hit_land:
+            valid_mask[t] = False
+            rejected += 1
     
     return valid_mask, rejected
 

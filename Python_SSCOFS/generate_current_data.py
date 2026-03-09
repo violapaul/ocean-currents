@@ -38,9 +38,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from latest_cycle import find_latest_cycle
 from fetch_sscofs import build_sscofs_url
 from sscofs_cache import load_sscofs_data, bulk_download_forecasts
-from water_boundary import build_water_mask, refine_with_velocity, refine_with_shoreline, extract_boundary, export_geojson
+from water_boundary import build_water_mask, refine_with_velocity, load_nav_mask, refine_with_nav_mask, extract_boundary, export_geojson
 
-SHORELINE_PATH = Path(__file__).parent / "data" / "shoreline_puget.geojson"
+NAV_MASK_PATH = Path(__file__).parent / "data" / "nav_mask.npz"
 
 
 # Seattle coordinates and default region
@@ -293,10 +293,11 @@ def generate_fast(output_dir, hour_range=(0, 72), radius_mi=DEFAULT_RADIUS_MI,
     if len(vel_frames) >= 3:
         valid, vel_rejected = refine_with_velocity(tri, valid, vel_frames)
 
-    shore_rejected = 0
-    if SHORELINE_PATH.exists():
-        valid, shore_rejected = refine_with_shoreline(
-            tri, valid, masked_lon, masked_lat, SHORELINE_PATH)
+    mask_rejected = 0
+    if NAV_MASK_PATH.exists():
+        water_grid, mask_bounds, mask_res = load_nav_mask(NAV_MASK_PATH)
+        valid, mask_rejected = refine_with_nav_mask(
+            tri, valid, masked_lon, masked_lat, water_grid, mask_bounds, mask_res)
 
     boundary = extract_boundary(tri, valid, masked_lon, masked_lat)
     boundary_path = run_dir / "water_boundary.geojson"
@@ -304,7 +305,7 @@ def generate_fast(output_dir, hour_range=(0, 72), radius_mi=DEFAULT_RADIUS_MI,
     n_valid = valid.sum()
     n_invalid = len(valid) - n_valid
     print(f"  water_boundary.geojson: {n_valid:,} water / {n_invalid:,} land-spanning "
-          f"({geom_invalid:,} geom + {vel_rejected:,} vel + {shore_rejected:,} shoreline), "
+          f"({geom_invalid:,} geom + {vel_rejected:,} vel + {mask_rejected:,} nav-mask), "
           f"{boundary_size/1024:.1f}KB in {time.time() - t0:.1f}s")
 
     # Step 3: Process all hours in parallel
@@ -450,10 +451,11 @@ def generate(output_dir, hour_range=(0, 72), radius_mi=DEFAULT_RADIUS_MI,
     if len(vel_frames) >= 3:
         valid, vel_rejected = refine_with_velocity(tri, valid, vel_frames)
 
-    shore_rejected = 0
-    if SHORELINE_PATH.exists():
-        valid, shore_rejected = refine_with_shoreline(
-            tri, valid, masked_lon, masked_lat, SHORELINE_PATH)
+    mask_rejected = 0
+    if NAV_MASK_PATH.exists():
+        water_grid, mask_bounds, mask_res = load_nav_mask(NAV_MASK_PATH)
+        valid, mask_rejected = refine_with_nav_mask(
+            tri, valid, masked_lon, masked_lat, water_grid, mask_bounds, mask_res)
 
     boundary = extract_boundary(tri, valid, masked_lon, masked_lat)
     boundary_path = run_dir / "water_boundary.geojson"
@@ -461,7 +463,7 @@ def generate(output_dir, hour_range=(0, 72), radius_mi=DEFAULT_RADIUS_MI,
     n_valid = valid.sum()
     n_invalid = len(valid) - n_valid
     print(f"  water_boundary.geojson: {n_valid:,} water / {n_invalid:,} land-spanning "
-          f"({geom_invalid:,} geom + {vel_rejected:,} vel + {shore_rejected:,} shoreline), "
+          f"({geom_invalid:,} geom + {vel_rejected:,} vel + {mask_rejected:,} nav-mask), "
           f"{boundary_size/1024:.1f}KB in {time.time() - t0:.1f}s")
 
     # Export velocity for hour 0 (already loaded)

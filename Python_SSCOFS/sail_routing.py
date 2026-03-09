@@ -52,7 +52,9 @@ from scipy.spatial import cKDTree, Delaunay
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent))
 from plot_local_currents import get_latest_current_data, create_utm_transformer
-from water_boundary import build_water_mask_utm
+from water_boundary import build_water_mask_utm, load_nav_mask
+
+NAV_MASK_PATH = Path(__file__).parent / "data" / "nav_mask.npz"
 
 KNOTS_TO_MS = 0.514444
 MS_TO_KNOTS = 1.0 / KNOTS_TO_MS
@@ -575,7 +577,7 @@ class CurrentField:
 
     def __init__(self, lonc, latc, u_frames, v_frames, frame_times_s,
                  transformer, k_neighbors=6, land_threshold_m=750.0,
-                 use_delaunay=True):
+                 use_delaunay=True, nav_mask_path=None):
         """
         Parameters
         ----------
@@ -595,6 +597,9 @@ class CurrentField:
         use_delaunay : bool
             If True, use Delaunay triangulation for land detection (more
             accurate). Falls back to distance threshold if Delaunay fails.
+        nav_mask_path : str or Path, optional
+            Path to nav_mask.npz for authoritative land detection. If provided,
+            supplements Delaunay-based detection.
         """
         self.transformer = transformer
         self.k = k_neighbors
@@ -615,6 +620,21 @@ class CurrentField:
                 )
             except Exception:
                 pass  # Fall back to distance-based detection
+
+        # Load nav mask for authoritative land detection (DEM-based)
+        self._nav_mask = None
+        self._nav_mask_bounds = None
+        self._nav_mask_res = None
+        self._inv_transformer = None
+        if nav_mask_path is not None and Path(nav_mask_path).exists():
+            try:
+                self._nav_mask, self._nav_mask_bounds, self._nav_mask_res = load_nav_mask(nav_mask_path)
+                # Create inverse transformer (UTM -> lon/lat) for nav mask lookups
+                self._inv_transformer = Transformer.from_crs(
+                    transformer.target_crs, transformer.source_crs, always_xy=True
+                )
+            except Exception:
+                pass  # Nav mask is optional, fall back to Delaunay only
 
         self.u_frames = [np.asarray(u, dtype=np.float64) for u in u_frames]
         self.v_frames = [np.asarray(v, dtype=np.float64) for v in v_frames]
@@ -643,6 +663,19 @@ class CurrentField:
         else:
             # Fallback to distance-based detection
             land_mask = dists[:, 0] > self.land_threshold
+
+        # Supplement with nav mask (DEM-based) if available
+        if self._nav_mask is not None and self._inv_transformer is not None:
+            lon, lat = self._inv_transformer.transform(x, y)
+            lon_min, lon_max, lat_min, lat_max = self._nav_mask_bounds
+            ny, nx = self._nav_mask.shape
+            col = ((np.asarray(lon) - lon_min) / self._nav_mask_res).astype(int)
+            row = ((np.asarray(lat) - lat_min) / self._nav_mask_res).astype(int)
+            # Out-of-DEM-bounds points are treated as water (open ocean)
+            in_bounds = (col >= 0) & (col < nx) & (row >= 0) & (row < ny)
+            nav_water = np.ones(len(x), dtype=bool)
+            nav_water[in_bounds] = self._nav_mask[row[in_bounds], col[in_bounds]]
+            land_mask = land_mask | ~nav_water
 
         weights = np.where(dists < 1e-12, 1e12, 1.0 / dists)
         w_sum = weights.sum(axis=1, keepdims=True)
@@ -2067,7 +2100,7 @@ def load_current_field(depart_dt=None, forecast_hours=None,
         frame_times.append(float((fh - base_hour) * 3600))
 
     cf = CurrentField(lonc, latc, u_frames, v_frames, frame_times,
-                      transformer)
+                      transformer, nav_mask_path=NAV_MASK_PATH)
 
     # start_time_s: offset from the first loaded frame to the departure.
     start_time_s = 0.0
