@@ -70,10 +70,19 @@ def build_water_mask(
     lon: np.ndarray,
     lat: np.ndarray,
     threshold_factor: float = 3.5,
+    max_aspect_ratio: float = 6.0,
+    max_edge_m: float = 800.0,
     use_utm: bool = False,
     utm_zone: int = 10,
 ) -> Tuple[Delaunay, np.ndarray]:
     """Build Delaunay triangulation and classify water vs land-spanning triangles.
+    
+    Three independent filters (any one triggers invalidation):
+    1. Local scale: max edge > threshold_factor * local mesh density
+    2. Aspect ratio: max_edge / min_edge > max_aspect_ratio (catches
+       elongated slivers that bridge narrow peninsulas)
+    3. Absolute edge length: max edge > max_edge_m (hard cap that catches
+       bridges between close but land-separated mesh regions)
     
     Parameters
     ----------
@@ -81,10 +90,14 @@ def build_water_mask(
         Element center coordinates in degrees.
     threshold_factor : float
         A triangle is land-spanning if its max edge exceeds this factor times
-        the local mesh scale (max of the three vertices' local scales).
+        the local mesh scale (min of the three vertices' local scales).
+    max_aspect_ratio : float
+        Reject triangles where max_edge / min_edge exceeds this value.
+    max_edge_m : float
+        Absolute maximum edge length in meters. Any triangle with an edge
+        longer than this is rejected regardless of local scale.
     use_utm : bool
         If True, convert to UTM for more accurate distance calculations.
-        Recommended for routing; optional for boundary extraction.
     utm_zone : int
         UTM zone number (default 10 for Puget Sound).
         
@@ -104,7 +117,6 @@ def build_water_mask(
         x, y = transformer.transform(lon, lat)
         points = np.column_stack([x, y])
     else:
-        # Use scaled lon/lat (approximate meters at mid-latitude)
         lat_scale = 111_000  # meters per degree latitude
         lon_scale = 111_000 * np.cos(np.radians(np.mean(lat)))
         points = np.column_stack([lon * lon_scale, lat * lat_scale])
@@ -120,24 +132,275 @@ def build_water_mask(
         v0, v1, v2 = delaunay.simplices[t]
         p0, p1, p2 = points[v0], points[v1], points[v2]
         
-        # Compute edge lengths
         e01 = np.linalg.norm(p1 - p0)
         e12 = np.linalg.norm(p2 - p1)
         e20 = np.linalg.norm(p0 - p2)
-        max_edge = max(e01, e12, e20)
+        edges = sorted([e01, e12, e20])
+        max_edge = edges[2]
+        min_edge = edges[0]
         
-        # Local scale threshold: use min of the three vertices' scales.
-        # If any vertex is in a dense part of the mesh, a long edge from
-        # that vertex is anomalous (likely spanning a land gap).
+        # Filter 1: local scale threshold
         local_thresh = threshold_factor * min(local_scale[v0], local_scale[v1], local_scale[v2])
-        
         if max_edge > local_thresh:
+            valid_mask[t] = False
+            continue
+        
+        # Filter 2: absolute max edge length
+        if max_edge > max_edge_m:
+            valid_mask[t] = False
+            continue
+        
+        # Filter 3: aspect ratio (elongated slivers bridging peninsulas)
+        if min_edge > 0 and max_edge / min_edge > max_aspect_ratio:
             valid_mask[t] = False
     
     # Store points on the delaunay object for later use
     delaunay.input_points = points
     
     return delaunay, valid_mask
+
+
+def refine_with_velocity(
+    delaunay: Delaunay,
+    valid_mask: np.ndarray,
+    velocity_frames: List[np.ndarray],
+    min_edge_m: float = 400.0,
+    angle_threshold: float = 90.0,
+    min_consistent_hours: int = 3,
+) -> np.ndarray:
+    """Refine water mask using velocity coherence across multiple hours.
+    
+    At real coastlines, adjacent elements have similar current directions
+    (no-normal-flow boundary condition). Across land peninsulas, elements
+    on opposite sides often have consistently opposing currents.
+    
+    Only examines triangles with edges longer than min_edge_m to avoid
+    rejecting small tidal-reversal triangles near the coast.
+    
+    Parameters
+    ----------
+    delaunay : Delaunay
+        Triangulation from build_water_mask().
+    valid_mask : ndarray
+        Boolean mask from build_water_mask() (modified in place).
+    velocity_frames : list of ndarray
+        Each entry is shape (n_elements, 2) with [u, v] in m/s.
+        Multiple hours provide robustness against tidal reversals.
+    min_edge_m : float
+        Only check triangles with max_edge above this length.
+    angle_threshold : float
+        Maximum allowed angle (degrees) between vertex velocity pairs.
+    min_consistent_hours : int
+        Number of hours the angle must exceed threshold to reject.
+        
+    Returns
+    -------
+    valid_mask : ndarray
+        Updated mask with velocity-inconsistent triangles removed.
+    """
+    points = delaunay.input_points
+    simplices = delaunay.simplices
+    n_frames = len(velocity_frames)
+    rejected = 0
+    
+    for t in range(len(simplices)):
+        if not valid_mask[t]:
+            continue
+        
+        v0, v1, v2 = simplices[t]
+        p0, p1, p2 = points[v0], points[v1], points[v2]
+        
+        e01 = np.linalg.norm(p1 - p0)
+        e12 = np.linalg.norm(p2 - p1)
+        e20 = np.linalg.norm(p0 - p2)
+        if max(e01, e12, e20) < min_edge_m:
+            continue
+        
+        # Count hours where max pairwise velocity angle exceeds threshold
+        bad_hours = 0
+        for uv in velocity_frames:
+            max_angle = 0.0
+            for vi, vj in [(v0, v1), (v1, v2), (v2, v0)]:
+                ui, uj = uv[vi], uv[vj]
+                si = np.sqrt(ui[0]**2 + ui[1]**2)
+                sj = np.sqrt(uj[0]**2 + uj[1]**2)
+                if si < 0.005 or sj < 0.005:
+                    continue  # near-zero speed, skip
+                dot = (ui[0]*uj[0] + ui[1]*uj[1]) / (si * sj)
+                angle = np.degrees(np.arccos(np.clip(dot, -1, 1)))
+                if angle > max_angle:
+                    max_angle = angle
+            if max_angle > angle_threshold:
+                bad_hours += 1
+        
+        if bad_hours >= min_consistent_hours:
+            valid_mask[t] = False
+            rejected += 1
+    
+    return valid_mask, rejected
+
+
+def _batch_intersect(edge_a: np.ndarray, edges_b: np.ndarray) -> bool:
+    """Test if segment edge_a intersects ANY segment in edges_b (vectorized).
+    
+    edge_a: shape (4,) — [ax, ay, bx, by]
+    edges_b: shape (N, 4) — each row [cx, cy, dx, dy]
+    """
+    ax, ay, bx, by = edge_a
+    cx = edges_b[:, 0]; cy = edges_b[:, 1]
+    dx = edges_b[:, 2]; dy = edges_b[:, 3]
+    
+    # Cross products for orientation tests
+    d1 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx)
+    d2 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx)
+    d3 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    d4 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax)
+    
+    cross1 = (d1 > 0) != (d2 > 0)  # A,B on opposite sides of CD
+    cross2 = (d3 > 0) != (d4 > 0)  # C,D on opposite sides of AB
+    
+    return np.any(cross1 & cross2)
+
+
+def refine_with_shoreline(
+    delaunay: Delaunay,
+    valid_mask: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    shoreline_path: Union[str, Path],
+    cell_size: float = 0.01,
+) -> Tuple[np.ndarray, int]:
+    """Refine water mask by rejecting triangles whose edges cross the shoreline.
+    
+    Loads a shoreline GeoJSON (LineString features) and builds a spatial grid
+    index. For each valid triangle near shoreline, checks if any of its three
+    edges intersect any shoreline segment. Uses vectorized numpy intersection
+    tests for performance.
+    
+    Parameters
+    ----------
+    delaunay : Delaunay
+        Triangulation from build_water_mask().
+    valid_mask : ndarray
+        Boolean mask (modified in place).
+    lon, lat : ndarray
+        Element coordinates in degrees.
+    shoreline_path : str or Path
+        Path to shoreline GeoJSON with LineString features.
+    cell_size : float
+        Spatial index grid cell size in degrees (~1km at 0.01).
+        
+    Returns
+    -------
+    valid_mask : ndarray
+        Updated mask.
+    rejected : int
+        Number of additionally rejected triangles.
+    """
+    with open(shoreline_path) as f:
+        gj = json.load(f)
+    
+    # Extract all shoreline segments as numpy array
+    seg_list = []
+    for feat in gj.get("features", []):
+        geom = feat.get("geometry", {})
+        coords_lists = []
+        if geom.get("type") == "LineString":
+            coords_lists = [geom["coordinates"]]
+        elif geom.get("type") == "MultiLineString":
+            coords_lists = geom["coordinates"]
+        for coords in coords_lists:
+            for i in range(len(coords) - 1):
+                seg_list.append((coords[i][0], coords[i][1],
+                                 coords[i+1][0], coords[i+1][1]))
+    
+    if not seg_list:
+        return valid_mask, 0
+    
+    seg_arr = np.array(seg_list, dtype=np.float64)
+    
+    # Build grid index: map (row, col) -> numpy array of segment rows
+    grid_lon_min = seg_arr[:, [0, 2]].min() - cell_size
+    grid_lat_min = seg_arr[:, [1, 3]].min() - cell_size
+    
+    grid: Dict[tuple, List[int]] = defaultdict(list)
+    for si in range(len(seg_arr)):
+        x1, y1, x2, y2 = seg_arr[si]
+        c0 = int((min(x1, x2) - grid_lon_min) / cell_size)
+        c1 = int((max(x1, x2) - grid_lon_min) / cell_size)
+        r0 = int((min(y1, y2) - grid_lat_min) / cell_size)
+        r1 = int((max(y1, y2) - grid_lat_min) / cell_size)
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                grid[(r, c)].append(si)
+    
+    # Convert grid lists to numpy arrays for vectorized intersection
+    grid_np = {k: np.array(v, dtype=np.intp) for k, v in grid.items()}
+    populated_cells = set(grid_np.keys())
+    
+    # Pre-compute triangle vertex coordinates and grid cells
+    simplices = delaunay.simplices
+    valid_idx = np.where(valid_mask)[0]
+    
+    v0s = simplices[valid_idx, 0]
+    v1s = simplices[valid_idx, 1]
+    v2s = simplices[valid_idx, 2]
+    
+    tri_lon_min = np.minimum(np.minimum(lon[v0s], lon[v1s]), lon[v2s])
+    tri_lon_max = np.maximum(np.maximum(lon[v0s], lon[v1s]), lon[v2s])
+    tri_lat_min = np.minimum(np.minimum(lat[v0s], lat[v1s]), lat[v2s])
+    tri_lat_max = np.maximum(np.maximum(lat[v0s], lat[v1s]), lat[v2s])
+    
+    tc0 = ((tri_lon_min - grid_lon_min) / cell_size).astype(int)
+    tc1 = ((tri_lon_max - grid_lon_min) / cell_size).astype(int)
+    tr0 = ((tri_lat_min - grid_lat_min) / cell_size).astype(int)
+    tr1 = ((tri_lat_max - grid_lat_min) / cell_size).astype(int)
+    
+    rejected = 0
+    
+    for i in range(len(valid_idx)):
+        # Quick check: does this triangle overlap any populated cell?
+        has_shore = False
+        for r in range(tr0[i], tr1[i] + 1):
+            for c in range(tc0[i], tc1[i] + 1):
+                if (r, c) in populated_cells:
+                    has_shore = True
+                    break
+            if has_shore:
+                break
+        if not has_shore:
+            continue
+        
+        t = valid_idx[i]
+        v0, v1, v2 = simplices[t]
+        
+        # Gather all shoreline segments from grid cells this triangle overlaps
+        seg_indices = set()
+        for r in range(tr0[i], tr1[i] + 1):
+            for c in range(tc0[i], tc1[i] + 1):
+                arr = grid_np.get((r, c))
+                if arr is not None:
+                    seg_indices.update(arr.tolist())
+        
+        if not seg_indices:
+            continue
+        
+        nearby = seg_arr[list(seg_indices)]
+        
+        # Test all 3 triangle edges against all nearby shoreline segments (vectorized)
+        edges = [
+            np.array([lon[v0], lat[v0], lon[v1], lat[v1]]),
+            np.array([lon[v1], lat[v1], lon[v2], lat[v2]]),
+            np.array([lon[v2], lat[v2], lon[v0], lat[v0]]),
+        ]
+        
+        for edge in edges:
+            if _batch_intersect(edge, nearby):
+                valid_mask[t] = False
+                rejected += 1
+                break
+    
+    return valid_mask, rejected
 
 
 def extract_boundary_edges(delaunay: Delaunay, valid_mask: np.ndarray) -> List[Tuple[int, int]]:
@@ -405,6 +668,8 @@ def build_water_mask_utm(
     x_utm: np.ndarray,
     y_utm: np.ndarray,
     threshold_factor: float = 3.5,
+    max_aspect_ratio: float = 6.0,
+    max_edge_m: float = 800.0,
 ) -> Tuple[Delaunay, np.ndarray]:
     """Build Delaunay triangulation from UTM coordinates directly.
     
@@ -416,6 +681,10 @@ def build_water_mask_utm(
         UTM coordinates in meters.
     threshold_factor : float
         Triangle classification threshold.
+    max_aspect_ratio : float
+        Reject triangles where max_edge / min_edge exceeds this.
+    max_edge_m : float
+        Absolute maximum edge length in meters.
         
     Returns
     -------
@@ -438,12 +707,20 @@ def build_water_mask_utm(
         e01 = np.linalg.norm(p1 - p0)
         e12 = np.linalg.norm(p2 - p1)
         e20 = np.linalg.norm(p0 - p2)
-        max_edge = max(e01, e12, e20)
+        edges = sorted([e01, e12, e20])
+        max_edge = edges[2]
+        min_edge = edges[0]
         
-        # Use min of local scales - if any vertex is in dense mesh, long edge is anomalous
         local_thresh = threshold_factor * min(local_scale[v0], local_scale[v1], local_scale[v2])
-        
         if max_edge > local_thresh:
+            valid_mask[t] = False
+            continue
+        
+        if max_edge > max_edge_m:
+            valid_mask[t] = False
+            continue
+        
+        if min_edge > 0 and max_edge / min_edge > max_aspect_ratio:
             valid_mask[t] = False
     
     return delaunay, valid_mask

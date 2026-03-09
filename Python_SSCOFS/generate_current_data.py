@@ -38,7 +38,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from latest_cycle import find_latest_cycle
 from fetch_sscofs import build_sscofs_url
 from sscofs_cache import load_sscofs_data, bulk_download_forecasts
-from water_boundary import build_water_mask, extract_boundary, export_geojson
+from water_boundary import build_water_mask, refine_with_velocity, refine_with_shoreline, extract_boundary, export_geojson
+
+SHORELINE_PATH = Path(__file__).parent / "data" / "shoreline_puget.geojson"
 
 
 # Seattle coordinates and default region
@@ -271,17 +273,39 @@ def generate_fast(output_dir, hour_range=(0, 72), radius_mi=DEFAULT_RADIUS_MI,
         "lon_max": float(masked_lon.max()),
     }
 
-    # Extract water domain boundary using Delaunay triangulation
+    # Extract water domain boundary using Delaunay triangulation + velocity refinement
     print(f"  Extracting water boundary...")
     t0 = time.time()
     tri, valid = build_water_mask(masked_lon, masked_lat)
+    geom_invalid = (~valid).sum()
+
+    # Load a few sample hours for velocity coherence refinement
+    sample_hours = [h for h in [0, 6, 12, 18, 24] if h <= hour_range[1]]
+    vel_frames = []
+    for sh in sample_hours:
+        try:
+            u_s, v_s = load_velocity_direct(run_date, cycle, sh)
+            uv = np.column_stack([u_s[mask], v_s[mask]])
+            vel_frames.append(uv)
+        except Exception:
+            pass
+    vel_rejected = 0
+    if len(vel_frames) >= 3:
+        valid, vel_rejected = refine_with_velocity(tri, valid, vel_frames)
+
+    shore_rejected = 0
+    if SHORELINE_PATH.exists():
+        valid, shore_rejected = refine_with_shoreline(
+            tri, valid, masked_lon, masked_lat, SHORELINE_PATH)
+
     boundary = extract_boundary(tri, valid, masked_lon, masked_lat)
     boundary_path = run_dir / "water_boundary.geojson"
     boundary_size = export_geojson(boundary, boundary_path)
     n_valid = valid.sum()
     n_invalid = len(valid) - n_valid
-    print(f"  water_boundary.geojson: {n_valid:,} water triangles, "
-          f"{n_invalid:,} land-spanning, {boundary_size/1024:.1f}KB in {time.time() - t0:.1f}s")
+    print(f"  water_boundary.geojson: {n_valid:,} water / {n_invalid:,} land-spanning "
+          f"({geom_invalid:,} geom + {vel_rejected:,} vel + {shore_rejected:,} shoreline), "
+          f"{boundary_size/1024:.1f}KB in {time.time() - t0:.1f}s")
 
     # Step 3: Process all hours in parallel
     hours = list(range(hour_range[0], hour_range[1] + 1))
@@ -397,17 +421,48 @@ def generate(output_dir, hour_range=(0, 72), radius_mi=DEFAULT_RADIUS_MI,
         "lon_max": float(masked_lon.max()),
     }
 
-    # Extract water domain boundary using Delaunay triangulation
+    # Extract water domain boundary using Delaunay triangulation + velocity refinement
     print(f"  Extracting water boundary...")
     t0 = time.time()
     tri, valid = build_water_mask(masked_lon, masked_lat)
+    geom_invalid = (~valid).sum()
+
+    # Use hour-0 velocity plus a few more for velocity coherence refinement
+    vel_frames = []
+    u0 = ds0["u"].isel(time=0, siglay=0).values[mask]
+    v0 = ds0["v"].isel(time=0, siglay=0).values[mask]
+    vel_frames.append(np.column_stack([np.nan_to_num(u0), np.nan_to_num(v0)]))
+    for sh in [6, 12, 18, 24]:
+        if sh > hour_range[1]:
+            break
+        try:
+            ri = {"run_date_utc": run_date.isoformat(), "cycle_utc": f"{cycle:02d}z",
+                  "forecast_hour_index": sh,
+                  "url": build_sscofs_url(run_date.isoformat(), cycle, sh)}
+            ds_s = load_sscofs_data(ri, use_cache=True, verbose=False)
+            u_s = ds_s["u"].isel(time=0, siglay=0).values[mask]
+            v_s = ds_s["v"].isel(time=0, siglay=0).values[mask]
+            vel_frames.append(np.column_stack([np.nan_to_num(u_s), np.nan_to_num(v_s)]))
+            ds_s.close()
+        except Exception:
+            pass
+    vel_rejected = 0
+    if len(vel_frames) >= 3:
+        valid, vel_rejected = refine_with_velocity(tri, valid, vel_frames)
+
+    shore_rejected = 0
+    if SHORELINE_PATH.exists():
+        valid, shore_rejected = refine_with_shoreline(
+            tri, valid, masked_lon, masked_lat, SHORELINE_PATH)
+
     boundary = extract_boundary(tri, valid, masked_lon, masked_lat)
     boundary_path = run_dir / "water_boundary.geojson"
     boundary_size = export_geojson(boundary, boundary_path)
     n_valid = valid.sum()
     n_invalid = len(valid) - n_valid
-    print(f"  water_boundary.geojson: {n_valid:,} water triangles, "
-          f"{n_invalid:,} land-spanning, {boundary_size/1024:.1f}KB in {time.time() - t0:.1f}s")
+    print(f"  water_boundary.geojson: {n_valid:,} water / {n_invalid:,} land-spanning "
+          f"({geom_invalid:,} geom + {vel_rejected:,} vel + {shore_rejected:,} shoreline), "
+          f"{boundary_size/1024:.1f}KB in {time.time() - t0:.1f}s")
 
     # Export velocity for hour 0 (already loaded)
     print(f"\n[3/4] Exporting velocity data for F{hour_range[0]:03d}-F{hour_range[1]:03d}...")
