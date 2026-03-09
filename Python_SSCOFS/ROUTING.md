@@ -100,10 +100,16 @@ w_i = 1 / dist_i          (w_i = 1e12 if exactly on an element centre)
 (u, v) = Σ w_i * (u_i, v_i) / Σ w_i
 ```
 
-**Land detection:** If the nearest element is farther than `land_threshold_m`
-(default 750 m), the point is treated as land and `(NaN, NaN)` is returned.
-This is tuned so that query points just offshore remain water-connected even
-at coarse grid resolutions.
+**Land detection:** Uses Delaunay triangulation of SSCOFS element centers.
+Triangles with edges longer than 3.5× the local mesh density are classified
+as "land-spanning" (i.e., they bridge a gap where land exists). A query point
+is water if it falls inside a valid (non-land-spanning) Delaunay triangle;
+otherwise it is treated as land and `(NaN, NaN)` is returned.
+
+This approach automatically adapts to the SSCOFS mesh density gradient — tight
+thresholds (~300 m) near the coast where elements are 50-100 m apart, loose
+thresholds (~1500 m) in open ocean where elements are 300-500 m apart. Falls
+back to distance-threshold for very small point sets (synthetic tests).
 
 ### Temporal interpolation
 
@@ -121,8 +127,23 @@ extrapolation).
 
 ## 4. Polar Performance: PolarTable
 
-The polar CSV has three columns: `TWA_deg`, `TWS_kt`, `BoatSpeed_kt`.
-The J105 table covers TWA 0–180° and TWS 0–60 kt.
+Two CSV formats are supported:
+
+**Simple format** — columns `TWA_deg`, `TWS_kt`, `BoatSpeed_kt`.  Must form
+a complete rectangular grid.  Missing grid points raise an error.
+
+**Sail-config format** — columns include `sail`, `TWS_kt`, `TWA_deg`,
+`BTV_kt`.  Only the "Best Performance" rows are used (the envelope of all
+sail configurations).  Beat/run-target TWAs vary by TWS, so the grid is
+built from the union of all TWA values; gaps are filled by linear
+interpolation within each TWS column, and angles below the minimum
+data TWA for each column are forced to zero (no-go zone).  A 0° row at
+zero speed is prepended automatically.
+
+The optional `minimum_twa` parameter forces boat speed to zero for any TWA
+below the given angle, regardless of what the polar table says.  For
+sail-config polars, this is auto-set to the global minimum beat-target angle
+if not specified.
 
 ### Bilinear interpolation
 
@@ -156,13 +177,19 @@ TWA = degrees(|delta|)                    # symmetric: port = starboard
 
 ## 5. Wind: WindField
 
-Three modes, selected by the constructor used:
+Four modes, selected by the constructor used:
 
 | Mode | Constructor | Description |
 |------|-------------|-------------|
 | Constant | `WindField.from_met(speed_kt, from_deg)` | Same wind everywhere at all times |
-| Spatial grid | `WindField.from_grid(xs, ys, wu_grid, wv_grid)` | Spatially varying, constant in time; `scipy.interpolate.RegularGridInterpolator` |
-| Temporal | `WindField.from_frames(xs, ys, wu_frames, wv_frames, times_s)` | Per-frame (optionally also spatially varying); linearly interpolated in time |
+| Spatial grid | `WindField.from_grid(xs, ys, wu_grid, wv_grid)` | Spatially varying, constant in time; `RegularGridInterpolator` |
+| Temporal grid | `WindField.from_frames(xs, ys, wu_frames, wv_frames, times_s)` | Per-frame on a regular grid; `RegularGridInterpolator` per frame, linearly interpolated in time |
+| Temporal nodes | `WindField.from_node_frames(node_x, node_y, wu_frames, wv_frames, times_s)` | Per-frame on irregular spatial nodes; nearest-node (KD-tree) spatial lookup, linearly interpolated in time |
+
+The **temporal nodes** mode is used by the ECMWF wind pipeline: Open-Meteo
+returns forecasts at snapped ECMWF native grid nodes, which are irregularly
+spaced in UTM.  A `cKDTree` on `(node_x, node_y)` provides O(log n) nearest
+lookup for each spatial query.
 
 Wind components `(wu, wv)` are in m/s and follow the oceanographic "blows
 **TO**" convention, matching `CurrentField`.  The CLI `--wind-direction`
@@ -389,7 +416,8 @@ Key flags:
 | `--boat-speed` | 6 kt | Fallback fixed speed (used without polar) |
 | `--grid-resolution` | 300 m | Routing grid cell size |
 | `--padding` | 5000 m | Grid margin beyond start/end |
-| `--polar` | — | Path to `TWA_deg, TWS_kt, BoatSpeed_kt` CSV |
+| `--polar` | — | Path to polar CSV (simple or sail-config format) |
+| `--minimum-twa` | 0 | No-go zone: zero boat speed below this TWA (degrees) |
 | `--wind-speed` | — | Constant TWS in knots (requires `--wind-direction`) |
 | `--wind-direction` | — | Met convention "from" bearing, CW from north |
 | `--tack-penalty` | 60 s | Time penalty per tack; 0 to disable |
@@ -407,8 +435,8 @@ the loaded frames.
 
 ## 12. Testing
 
-`test_sail_routing.py` has 82 pytest tests, all using **synthetic current
-fields** (no SSCOFS download required):
+`test_sail_routing.py` has 86 pytest tests across 19 test classes, all
+using **synthetic current fields** (no SSCOFS download required):
 
 | Test class | Coverage |
 |------------|----------|
@@ -419,14 +447,15 @@ fields** (no SSCOFS download required):
 | `TestRoutingLandAvoidance` | Route goes around land obstacles |
 | `TestRoutingStraightLineComparison` | A\* ≤ straight-line time (within grid noise) |
 | `TestCurrentFieldInterpolation` | IDW accuracy, land detection, time interpolation |
-| `TestPathSmoothing` | Diagonal distance near Euclidean, land preserved, stubs removed |
+| `TestPathSmoothing` | Diagonal distance near Euclidean, land preserved, stubs removed, land-crossing shortcuts rejected |
 | `TestTimeDependentRouting` | Disappearing bands, reversing currents, late-appearing bands |
-| `TestPolarTable` | Bilinear interpolation, clamping, exact lookups |
+| `TestPolarTable` | Bilinear interpolation, clamping, exact lookups, missing-grid-point rejection |
 | `TestComputeTwa` | TWA geometry for head-to-wind, beam, downwind |
 | `TestBoatModelPolar` | Polar vs fixed-speed modes |
 | `TestSolveHeading` | Heading sweep SOG, current bonus, zero-wind fallback |
 | `TestRoutingWithPolar` | Full polar routing integration (beam reach, upwind, downwind) |
-| `TestWindFieldSpatial/Temporal` | Grid and temporal wind interpolation |
+| `TestWindFieldSpatial` | Spatial grid wind interpolation |
+| `TestWindFieldTemporal` | Temporal constant, temporal grid, and temporal node wind interpolation |
 | `TestTackingPenalty` | Penalty logic, angle precomputation |
 | `TestRouteQuality` | No Y-junctions, no backward progress, no stubs |
 | `TestSimulatedTrack` | Exported track continuity, timing, no teleports |
@@ -477,12 +506,15 @@ tacks as equivalent.  Real polars are slightly asymmetric (and downwind
 gybing has a gybe penalty just like tacking).  The current model applies
 the same tacking penalty to all direction changes ≥ 90°.
 
-### Wind field is not forecast
+### Wind forecast integration
 
-The wind field is user-supplied (constant, or a manually constructed grid/
-temporal field).  There is no automatic ingestion of NWS or GFS wind
-forecast data.  Integration with a gridded wind product (e.g., HRRR or
-NAM) would make the routing significantly more realistic.
+`run_route.py` now supports automatic ECMWF wind ingestion via
+`source: "open_meteo_ecmwf"` in the YAML config, using `ecmwf_wind.py` to
+fetch 9 km IFS HRES hourly forecasts from Open-Meteo.  The wind field is
+built as `temporal_nodes` (nearest-node spatial, linearly interpolated in
+time).  For the CLI (`sail_routing.py`), wind is still user-supplied
+(constant speed/direction).  Higher-resolution wind products (HRRR, NAM)
+are not yet integrated.
 
 ### Exported track follows the solved polyline
 

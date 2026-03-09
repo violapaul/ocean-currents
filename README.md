@@ -38,6 +38,7 @@ A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current
 │      ├── latest.json                                            │
 │      ├── {run_tag}/manifest.json                                │
 │      ├── {run_tag}/geometry.bin   (1.5MB, gzipped)             │
+│      ├── {run_tag}/water_boundary.geojson (~600KB)             │
 │      └── {run_tag}/f000-f072.bin  (~1.1MB each, gzipped)       │
 └─────────────────────────────────────────────────────────────────┘
           │                                           │
@@ -101,11 +102,18 @@ OceanCurrents/
 ├── manifest.json             # PWA manifest
 ├── service-worker.js         # Offline caching
 ├── app-icon.svg              # App icon
-└── Python_SSCOFS/            # Data generation pipeline
-    ├── generate_current_data.py   # Main pipeline script
+└── Python_SSCOFS/            # Data pipeline + sailboat routing
+    ├── generate_current_data.py   # Current data pipeline
+    ├── water_boundary.py          # Delaunay-based land detection
+    ├── sail_routing.py            # A* sailboat routing engine
+    ├── run_route.py               # YAML-driven multi-leg route runner
+    ├── ecmwf_wind.py              # ECMWF 9 km wind via Open-Meteo
     ├── latest_cycle.py            # Model cycle detection
     ├── fetch_sscofs.py            # URL construction
     ├── sscofs_cache.py            # Cache management
+    ├── routes/                    # Route YAML configs + output
+    ├── test_sail_routing.py       # 86 routing tests (synthetic fields)
+    ├── test_ecmwf_wind.py         # Wind pipeline tests
     └── requirements.txt           # Python dependencies
 ```
 
@@ -152,6 +160,15 @@ See [../DEPLOYMENT.md](../DEPLOYMENT.md) for AWS credentials, GitHub Actions set
 ```
 [u0, v0, u1, v1, ...] // velocity in m/s, ~1.1MB compressed per hour
 ```
+
+### water_boundary.geojson
+GeoJSON MultiPolygon defining the water domain boundary, derived from Delaunay
+triangulation of SSCOFS element centers. Used for:
+- **Land detection** — rasterized to bitmap for O(1) `isWater(lon, lat)` lookups
+- **Coastline rendering** — polygon edges drawn as shoreline overlay
+
+Triangles with edges longer than 3.5× local mesh density are classified as
+"land-spanning" and excluded from the water domain.
 
 ### manifest.json
 ```json

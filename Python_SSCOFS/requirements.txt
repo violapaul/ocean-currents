@@ -8,3 +8,4 @@ boto3
 requests
 aiohttp
 PyYAML
+scipy

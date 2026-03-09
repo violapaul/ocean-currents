@@ -8,6 +8,7 @@ for client-side rendering in the browser.
 Output files:
   geometry.bin  - Float32 array of [lon0, lat0, lon1, lat1, ...] for element centers
   manifest.json - Metadata (model run, element count, bounds, available hours)
+  water_boundary.geojson - Water domain boundary polygon (Delaunay-derived)
   f000.bin      - Float16 array of [u0, v0, u1, v1, ...] for forecast hour 0
   f001.bin      - ... etc through f072.bin
 
@@ -37,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from latest_cycle import find_latest_cycle
 from fetch_sscofs import build_sscofs_url
 from sscofs_cache import load_sscofs_data, bulk_download_forecasts
+from water_boundary import build_water_mask, extract_boundary, export_geojson
 
 
 # Seattle coordinates and default region
@@ -269,6 +271,18 @@ def generate_fast(output_dir, hour_range=(0, 72), radius_mi=DEFAULT_RADIUS_MI,
         "lon_max": float(masked_lon.max()),
     }
 
+    # Extract water domain boundary using Delaunay triangulation
+    print(f"  Extracting water boundary...")
+    t0 = time.time()
+    tri, valid = build_water_mask(masked_lon, masked_lat)
+    boundary = extract_boundary(tri, valid, masked_lon, masked_lat)
+    boundary_path = run_dir / "water_boundary.geojson"
+    boundary_size = export_geojson(boundary, boundary_path)
+    n_valid = valid.sum()
+    n_invalid = len(valid) - n_valid
+    print(f"  water_boundary.geojson: {n_valid:,} water triangles, "
+          f"{n_invalid:,} land-spanning, {boundary_size/1024:.1f}KB in {time.time() - t0:.1f}s")
+
     # Step 3: Process all hours in parallel
     hours = list(range(hour_range[0], hour_range[1] + 1))
     print(f"\n[3/4] Processing {len(hours)} hours with {max_workers} parallel workers...")
@@ -382,6 +396,18 @@ def generate(output_dir, hour_range=(0, 72), radius_mi=DEFAULT_RADIUS_MI,
         "lon_min": float(masked_lon.min()),
         "lon_max": float(masked_lon.max()),
     }
+
+    # Extract water domain boundary using Delaunay triangulation
+    print(f"  Extracting water boundary...")
+    t0 = time.time()
+    tri, valid = build_water_mask(masked_lon, masked_lat)
+    boundary = extract_boundary(tri, valid, masked_lon, masked_lat)
+    boundary_path = run_dir / "water_boundary.geojson"
+    boundary_size = export_geojson(boundary, boundary_path)
+    n_valid = valid.sum()
+    n_invalid = len(valid) - n_valid
+    print(f"  water_boundary.geojson: {n_valid:,} water triangles, "
+          f"{n_invalid:,} land-spanning, {boundary_size/1024:.1f}KB in {time.time() - t0:.1f}s")
 
     # Export velocity for hour 0 (already loaded)
     print(f"\n[3/4] Exporting velocity data for F{hour_range[0]:03d}-F{hour_range[1]:03d}...")

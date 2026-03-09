@@ -45,13 +45,14 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 from pyproj import Transformer
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree, Delaunay
 
 # ---------------------------------------------------------------------------
 # Local imports from the existing SSCOFS pipeline
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent))
 from plot_local_currents import get_latest_current_data, create_utm_transformer
+from water_boundary import build_water_mask_utm
 
 KNOTS_TO_MS = 0.514444
 MS_TO_KNOTS = 1.0 / KNOTS_TO_MS
@@ -565,12 +566,16 @@ class CurrentField:
     Builds a KD-tree of SSCOFS element centers in UTM coordinates.
     Queries return (u, v) in m/s at any (x_utm, y_utm, time) via
     inverse-distance weighted interpolation of the K nearest elements.
-    Points farther than ``land_threshold_m`` from any element center
-    are treated as land (returns NaN).
+
+    Land detection uses Delaunay triangulation: points inside valid water
+    triangles are water; points inside land-spanning triangles (with
+    anomalously long edges) or outside the convex hull are land. Falls
+    back to a distance threshold (``land_threshold_m``) if Delaunay fails.
     """
 
     def __init__(self, lonc, latc, u_frames, v_frames, frame_times_s,
-                 transformer, k_neighbors=6, land_threshold_m=750.0):
+                 transformer, k_neighbors=6, land_threshold_m=750.0,
+                 use_delaunay=True):
         """
         Parameters
         ----------
@@ -585,14 +590,31 @@ class CurrentField:
         k_neighbors : int
             Number of neighbours for IDW interpolation.
         land_threshold_m : float
-            Max distance (m) to nearest element; beyond this -> land.
+            Fallback max distance (m) to nearest element; used when Delaunay
+            is disabled or fails to build.
+        use_delaunay : bool
+            If True, use Delaunay triangulation for land detection (more
+            accurate). Falls back to distance threshold if Delaunay fails.
         """
         self.transformer = transformer
         self.k = k_neighbors
         self.land_threshold = land_threshold_m
 
         x_utm, y_utm = transformer.transform(lonc, latc)
-        self.tree = cKDTree(np.column_stack([x_utm, y_utm]))
+        self._x_utm = np.asarray(x_utm, dtype=np.float64)
+        self._y_utm = np.asarray(y_utm, dtype=np.float64)
+        self.tree = cKDTree(np.column_stack([self._x_utm, self._y_utm]))
+
+        # Build Delaunay triangulation for land detection
+        self.delaunay = None
+        self.valid_triangle = None
+        if use_delaunay and len(lonc) >= 4:
+            try:
+                self.delaunay, self.valid_triangle = build_water_mask_utm(
+                    self._x_utm, self._y_utm
+                )
+            except Exception:
+                pass  # Fall back to distance-based detection
 
         self.u_frames = [np.asarray(u, dtype=np.float64) for u in u_frames]
         self.v_frames = [np.asarray(v, dtype=np.float64) for v in v_frames]
@@ -611,7 +633,17 @@ class CurrentField:
             dists = dists[:, np.newaxis]
             idxs = idxs[:, np.newaxis]
 
-        land_mask = dists[:, 0] > self.land_threshold
+        # Land detection: use Delaunay triangulation if available
+        if self.delaunay is not None and self.valid_triangle is not None:
+            # find_simplex returns triangle index, or -1 if outside convex hull
+            simplex_idx = self.delaunay.find_simplex(np.column_stack([x, y]))
+            land_mask = np.ones(len(x), dtype=bool)
+            in_hull = simplex_idx >= 0
+            land_mask[in_hull] = ~self.valid_triangle[simplex_idx[in_hull]]
+        else:
+            # Fallback to distance-based detection
+            land_mask = dists[:, 0] > self.land_threshold
+
         weights = np.where(dists < 1e-12, 1e12, 1.0 / dists)
         w_sum = weights.sum(axis=1, keepdims=True)
         weights /= w_sum
