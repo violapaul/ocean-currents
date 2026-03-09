@@ -68,38 +68,156 @@ class PolarTable:
     degrees 0-180) and True Wind Speed (TWS, knots).  Bilinear
     interpolation is used for intermediate values.
 
+    Supports two CSV formats:
+
+    **Simple format** — columns ``TWA_deg, TWS_kt, BoatSpeed_kt``.
+    Must form a complete rectangular grid.
+
+    **Sail-config format** — columns include ``sail, TWS_kt, TWA_deg,
+    BTV_kt``.  Only the *Best Performance* rows are used (the envelope
+    of all sail configurations).  Beat/run-target TWAs vary by TWS, so
+    the grid is built from the union of all TWA values and any gaps are
+    filled by linear interpolation within each TWS column.  A 0° row
+    at zero speed is prepended automatically.
+
     Parameters
     ----------
     csv_path : str or Path
-        CSV with columns TWA_deg, TWS_kt, BoatSpeed_kt.
+    minimum_twa : float, optional
+        No-go zone: TWAs below this angle are forced to zero speed.
+        Default 0 (use raw polar values).
+    sail_filter : str, optional
+        Which sail / row group to use from a sail-config polar.
+        Default ``"Best Performance"``.
     """
 
-    def __init__(self, csv_path):
+    def __init__(self, csv_path, minimum_twa=0.0, sail_filter="Best Performance"):
         csv_path = Path(csv_path)
-        rows = []
+        self.minimum_twa = float(minimum_twa)
+
         with open(csv_path, newline='') as f:
             reader = csv.DictReader(f)
-            for row in reader:
-                rows.append((float(row['TWA_deg']),
-                             float(row['TWS_kt']),
-                             float(row['BoatSpeed_kt'])))
+            all_rows = list(reader)
+
+        if not all_rows:
+            raise ValueError(f"Polar CSV is empty: {csv_path}")
+
+        if 'sail' in all_rows[0] and 'BTV_kt' in all_rows[0]:
+            self._load_sail_config(all_rows, sail_filter)
+        else:
+            self._load_simple(all_rows)
+
+        if self.minimum_twa > 0:
+            self._speeds[self._twas < self.minimum_twa, :] = 0.0
+
+        self.max_speed_kt = float(np.nanmax(self._speeds))
+        self.max_speed_ms = self.max_speed_kt * KNOTS_TO_MS
+
+    # ------------------------------------------------------------------
+
+    def _load_simple(self, all_rows):
+        """Load a simple TWA_deg / TWS_kt / BoatSpeed_kt grid."""
+        rows = [(float(r['TWA_deg']), float(r['TWS_kt']),
+                 float(r['BoatSpeed_kt'])) for r in all_rows]
 
         twa_vals = sorted(set(r[0] for r in rows))
         tws_vals = sorted(set(r[1] for r in rows))
         self._twas = np.array(twa_vals, dtype=np.float64)
         self._twss = np.array(tws_vals, dtype=np.float64)
 
-        n_twa = len(twa_vals)
-        n_tws = len(tws_vals)
         twa_idx = {v: i for i, v in enumerate(twa_vals)}
         tws_idx = {v: i for i, v in enumerate(tws_vals)}
 
-        self._speeds = np.zeros((n_twa, n_tws), dtype=np.float64)
+        self._speeds = np.full((len(twa_vals), len(tws_vals)),
+                               np.nan, dtype=np.float64)
         for twa, tws, spd in rows:
             self._speeds[twa_idx[twa], tws_idx[tws]] = spd
 
-        self.max_speed_kt = float(np.max(self._speeds))
-        self.max_speed_ms = self.max_speed_kt * KNOTS_TO_MS
+        missing = np.argwhere(np.isnan(self._speeds))
+        if missing.size:
+            n_missing = int(missing.shape[0])
+            examples = ", ".join(
+                f"(TWA={self._twas[i]:g},TWS={self._twss[j]:g})"
+                for i, j in missing[:5]
+            )
+            raise ValueError(
+                f"Polar table missing {n_missing} grid point(s): {examples}"
+            )
+
+    def _load_sail_config(self, all_rows, sail_filter):
+        """Load a sail-configuration polar (sail / TWS / TWA / BTV).
+
+        Speeds below the minimum data TWA for each TWS column are set
+        to zero (no-go zone) rather than interpolated.  The minimum_twa
+        is auto-set to the global minimum beat-target angle.
+        """
+        triples = []
+        for r in all_rows:
+            if r['sail'].strip() != sail_filter:
+                continue
+            triples.append((float(r['TWA_deg']),
+                            float(r['TWS_kt']),
+                            float(r['BTV_kt'])))
+
+        if not triples:
+            available = sorted(set(r['sail'].strip() for r in all_rows))
+            raise ValueError(
+                f"No rows matching sail='{sail_filter}'. "
+                f"Available: {available}"
+            )
+
+        twa_set = sorted(set(t[0] for t in triples))
+        tws_vals = sorted(set(t[1] for t in triples))
+
+        if twa_set[0] > 0.5:
+            twa_set = [0.0] + twa_set
+
+        self._twas = np.array(twa_set, dtype=np.float64)
+        self._twss = np.array(tws_vals, dtype=np.float64)
+
+        lookup = {}
+        for twa, tws, spd in triples:
+            lookup[(twa, tws)] = spd
+
+        n_twa = len(self._twas)
+        n_tws = len(self._twss)
+        self._speeds = np.full((n_twa, n_tws), np.nan, dtype=np.float64)
+
+        if self._twas[0] == 0.0:
+            self._speeds[0, :] = 0.0
+
+        for (twa, tws), spd in lookup.items():
+            i = int(np.searchsorted(self._twas, twa))
+            j = int(np.searchsorted(self._twss, tws))
+            if i < n_twa and j < n_tws:
+                self._speeds[i, j] = spd
+
+        for j in range(n_tws):
+            col = self._speeds[:, j]
+            known = np.where(~np.isnan(col))[0]
+            if len(known) < 2:
+                continue
+            min_data_twa = self._twas[known[known > 0].min() if np.any(known > 0) else 0]
+            for i in range(n_twa):
+                if np.isnan(col[i]):
+                    if self._twas[i] < min_data_twa:
+                        col[i] = 0.0
+                    else:
+                        col[i] = float(np.interp(
+                            self._twas[i],
+                            self._twas[known],
+                            col[known],
+                        ))
+            self._speeds[:, j] = col
+
+        still_nan = np.argwhere(np.isnan(self._speeds))
+        if still_nan.size:
+            for i, j in still_nan:
+                self._speeds[i, j] = 0.0
+
+        data_min_twa = min(t[0] for t in triples)
+        if self.minimum_twa < data_min_twa:
+            self.minimum_twa = data_min_twa
 
     def speed(self, twa_deg, tws_kt):
         """Interpolated boat speed in knots for given TWA and TWS.
@@ -115,6 +233,8 @@ class PolarTable:
         -------
         float  (knots)
         """
+        if self.minimum_twa > 0 and twa_deg < self.minimum_twa:
+            return 0.0
         twa_c = float(np.clip(twa_deg, self._twas[0], self._twas[-1]))
         tws_c = float(np.clip(tws_kt, self._twss[0], self._twss[-1]))
 
@@ -181,7 +301,12 @@ class WindField:
         self._wv_grid = None
         self._wu_frames = None
         self._wv_frames = None
+        self._wu_frame_means = None
+        self._wv_frame_means = None
         self._frame_times = None
+        self._node_x = None
+        self._node_y = None
+        self._node_tree = None
 
     @classmethod
     def from_met(cls, speed_kt, from_deg):
@@ -238,17 +363,106 @@ class WindField:
         wu_frames, wv_frames : list of floats or 2-D arrays
         frame_times_s : list of float
         """
+        if len(wu_frames) != len(wv_frames):
+            raise ValueError("wu_frames and wv_frames must have the same length")
+        if len(wu_frames) == 0:
+            raise ValueError("WindField.from_frames requires at least one frame")
+        frame_times = np.asarray(frame_times_s, dtype=np.float64)
+        if frame_times.size != len(wu_frames):
+            raise ValueError("frame_times_s length must match frame count")
+        if np.any(np.diff(frame_times) < 0):
+            raise ValueError("frame_times_s must be non-decreasing")
+
         if xs is None:
-            inst = cls(wu_frames[0], wv_frames[0])
+            wu_vals = [float(wu) for wu in wu_frames]
+            wv_vals = [float(wv) for wv in wv_frames]
+            inst = cls(wu_vals[0], wv_vals[0])
             inst._mode = 'temporal_const'
+            inst._wu_frames = wu_vals
+            inst._wv_frames = wv_vals
+            inst._wu_frame_means = wu_vals
+            inst._wv_frame_means = wv_vals
         else:
+            from scipy.interpolate import RegularGridInterpolator
             inst = cls(0.0, 0.0)
             inst._mode = 'temporal_grid'
             inst._xs = np.asarray(xs, dtype=np.float64)
             inst._ys = np.asarray(ys, dtype=np.float64)
-        inst._wu_frames = wu_frames
-        inst._wv_frames = wv_frames
-        inst._frame_times = np.asarray(frame_times_s, dtype=np.float64)
+            ny = inst._ys.size
+            nx = inst._xs.size
+
+            wu_interps = []
+            wv_interps = []
+            wu_means = []
+            wv_means = []
+            for wu, wv in zip(wu_frames, wv_frames):
+                wu_arr = np.asarray(wu, dtype=np.float64)
+                wv_arr = np.asarray(wv, dtype=np.float64)
+                expected_shape = (ny, nx)
+                if wu_arr.shape != expected_shape or wv_arr.shape != expected_shape:
+                    raise ValueError(
+                        f"Temporal grid frame shape must be {expected_shape}, "
+                        f"got wu={wu_arr.shape}, wv={wv_arr.shape}"
+                    )
+                wu_interps.append(RegularGridInterpolator(
+                    (inst._ys, inst._xs), wu_arr, method='linear',
+                    bounds_error=False, fill_value=None))
+                wv_interps.append(RegularGridInterpolator(
+                    (inst._ys, inst._xs), wv_arr, method='linear',
+                    bounds_error=False, fill_value=None))
+                wu_means.append(float(np.nanmean(wu_arr)))
+                wv_means.append(float(np.nanmean(wv_arr)))
+
+            inst._wu_frames = wu_interps
+            inst._wv_frames = wv_interps
+            inst._wu_frame_means = wu_means
+            inst._wv_frame_means = wv_means
+
+        inst._frame_times = frame_times
+        return inst
+
+    @classmethod
+    def from_node_frames(cls, node_x, node_y, wu_frames, wv_frames, frame_times_s):
+        """Construct a time-varying wind field on irregular spatial nodes.
+
+        Spatial query is nearest-node (no interpolation), preserving the raw
+        model node values. Time is linearly interpolated between frames.
+        """
+        if len(wu_frames) != len(wv_frames):
+            raise ValueError("wu_frames and wv_frames must have the same length")
+        if len(wu_frames) == 0:
+            raise ValueError("from_node_frames requires at least one frame")
+
+        frame_times = np.asarray(frame_times_s, dtype=np.float64)
+        if frame_times.size != len(wu_frames):
+            raise ValueError("frame_times_s length must match frame count")
+        if np.any(np.diff(frame_times) < 0):
+            raise ValueError("frame_times_s must be non-decreasing")
+
+        node_x = np.asarray(node_x, dtype=np.float64).ravel()
+        node_y = np.asarray(node_y, dtype=np.float64).ravel()
+        if node_x.size == 0 or node_x.size != node_y.size:
+            raise ValueError("node_x/node_y must be non-empty and same length")
+
+        wu_arr = np.asarray(wu_frames, dtype=np.float64)
+        wv_arr = np.asarray(wv_frames, dtype=np.float64)
+        expected = (len(wu_frames), node_x.size)
+        if wu_arr.shape != expected or wv_arr.shape != expected:
+            raise ValueError(
+                f"Node frame shape must be {expected}, got "
+                f"wu={wu_arr.shape}, wv={wv_arr.shape}"
+            )
+
+        inst = cls(0.0, 0.0)
+        inst._mode = 'temporal_nodes'
+        inst._node_x = node_x
+        inst._node_y = node_y
+        inst._node_tree = cKDTree(np.column_stack([node_x, node_y]))
+        inst._wu_frames = wu_arr
+        inst._wv_frames = wv_arr
+        inst._wu_frame_means = np.nanmean(wu_arr, axis=1)
+        inst._wv_frame_means = np.nanmean(wv_arr, axis=1)
+        inst._frame_times = frame_times
         return inst
 
     def query(self, x_utm, y_utm, elapsed_s=0.0):
@@ -257,6 +471,13 @@ class WindField:
             return self._wu, self._wv
 
         if self._mode in ('temporal_const', 'temporal_grid'):
+            if len(self._frame_times) == 1:
+                if self._mode == 'temporal_const':
+                    return float(self._wu_frames[0]), float(self._wv_frames[0])
+                pt = np.array([[y_utm, x_utm]])
+                return (float(self._wu_frames[0](pt)[0]),
+                        float(self._wv_frames[0](pt)[0]))
+
             t = np.clip(elapsed_s, self._frame_times[0],
                         self._frame_times[-1])
             idx = int(np.searchsorted(self._frame_times, t, side='right')) - 1
@@ -279,6 +500,29 @@ class WindField:
                             self._wv_frames[idx + 1](pt) * alpha)[0])
                 return wu, wv
 
+        if self._mode == 'temporal_nodes':
+            x = np.atleast_1d(np.asarray(x_utm, dtype=np.float64))
+            y = np.atleast_1d(np.asarray(y_utm, dtype=np.float64))
+            _, node_idx = self._node_tree.query(np.column_stack([x, y]), k=1)
+            node_idx = np.asarray(node_idx, dtype=np.int64)
+
+            if len(self._frame_times) == 1:
+                wu = self._wu_frames[0, node_idx]
+                wv = self._wv_frames[0, node_idx]
+            else:
+                t = np.clip(elapsed_s, self._frame_times[0], self._frame_times[-1])
+                idx = int(np.searchsorted(self._frame_times, t, side='right')) - 1
+                idx = int(np.clip(idx, 0, len(self._frame_times) - 2))
+                t0 = self._frame_times[idx]
+                t1 = self._frame_times[idx + 1]
+                alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+                wu = self._wu_frames[idx, node_idx] * (1 - alpha) + self._wu_frames[idx + 1, node_idx] * alpha
+                wv = self._wv_frames[idx, node_idx] * (1 - alpha) + self._wv_frames[idx + 1, node_idx] * alpha
+
+            if x.size == 1:
+                return float(wu[0]), float(wv[0])
+            return wu, wv
+
         if self._mode == 'grid':
             pt = np.array([[y_utm, x_utm]])
             return float(self._interp_u(pt)[0]), float(self._interp_v(pt)[0])
@@ -294,10 +538,16 @@ class WindField:
         For spatial grid mode: not well-defined; returns 0.0.
         Use ``query()`` for position/time-specific values.
         """
-        if self._mode in ('temporal_const', 'temporal_grid'):
-            wu0 = self._wu_frames[0] if np.isscalar(self._wu_frames[0]) else float(np.nanmean(self._wu_frames[0]))
-            wv0 = self._wv_frames[0] if np.isscalar(self._wv_frames[0]) else float(np.nanmean(self._wv_frames[0]))
-            return float(np.hypot(wu0, wv0))
+        if self._mode == 'temporal_const':
+            return float(np.hypot(self._wu_frames[0], self._wv_frames[0]))
+        if self._mode == 'temporal_grid':
+            if self._wu_frame_means is not None and self._wv_frame_means is not None:
+                return float(np.hypot(self._wu_frame_means[0],
+                                      self._wv_frame_means[0]))
+        if self._mode == 'temporal_nodes':
+            if self._wu_frame_means is not None and self._wv_frame_means is not None:
+                return float(np.hypot(self._wu_frame_means[0],
+                                      self._wv_frame_means[0]))
         return float(np.hypot(self._wu, self._wv))
 
     @property
@@ -354,8 +604,8 @@ class CurrentField:
 
     # ------------------------------------------------------------------
 
-    def _idw_at_points(self, x, y, values):
-        """IDW interpolation for an array of query points."""
+    def _idw_prepare(self, x, y):
+        """Precompute neighbour indices/weights for IDW interpolation."""
         dists, idxs = self.tree.query(np.column_stack([x, y]), k=self.k)
         if self.k == 1:
             dists = dists[:, np.newaxis]
@@ -365,10 +615,19 @@ class CurrentField:
         weights = np.where(dists < 1e-12, 1e12, 1.0 / dists)
         w_sum = weights.sum(axis=1, keepdims=True)
         weights /= w_sum
+        return idxs, weights, land_mask
 
+    @staticmethod
+    def _idw_apply(values, idxs, weights, land_mask):
+        """Apply precomputed IDW weights to one value field."""
         result = np.sum(weights * values[idxs], axis=1)
         result[land_mask] = np.nan
         return result
+
+    def _idw_at_points(self, x, y, values):
+        """IDW interpolation for an array of query points."""
+        idxs, weights, land_mask = self._idw_prepare(x, y)
+        return self._idw_apply(values, idxs, weights, land_mask)
 
     def query(self, x_utm, y_utm, elapsed_s=0.0):
         """Return (u, v) in m/s at given UTM position(s) and time.
@@ -387,10 +646,11 @@ class CurrentField:
         """
         x = np.atleast_1d(np.asarray(x_utm, dtype=np.float64))
         y = np.atleast_1d(np.asarray(y_utm, dtype=np.float64))
+        idxs, weights, land_mask = self._idw_prepare(x, y)
 
         if self.n_frames == 1:
-            u = self._idw_at_points(x, y, self.u_frames[0])
-            v = self._idw_at_points(x, y, self.v_frames[0])
+            u = self._idw_apply(self.u_frames[0], idxs, weights, land_mask)
+            v = self._idw_apply(self.v_frames[0], idxs, weights, land_mask)
         else:
             t = np.clip(elapsed_s, self.frame_times[0], self.frame_times[-1])
             idx = np.searchsorted(self.frame_times, t, side='right') - 1
@@ -399,10 +659,10 @@ class CurrentField:
             t1 = self.frame_times[idx + 1]
             alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
 
-            u0 = self._idw_at_points(x, y, self.u_frames[idx])
-            v0 = self._idw_at_points(x, y, self.v_frames[idx])
-            u1 = self._idw_at_points(x, y, self.u_frames[idx + 1])
-            v1 = self._idw_at_points(x, y, self.v_frames[idx + 1])
+            u0 = self._idw_apply(self.u_frames[idx], idxs, weights, land_mask)
+            v0 = self._idw_apply(self.v_frames[idx], idxs, weights, land_mask)
+            u1 = self._idw_apply(self.u_frames[idx + 1], idxs, weights, land_mask)
+            v1 = self._idw_apply(self.v_frames[idx + 1], idxs, weights, land_mask)
             u = u0 * (1 - alpha) + u1 * alpha
             v = v0 * (1 - alpha) + v1 * alpha
 
@@ -610,6 +870,8 @@ def _polar_boat_speeds(boat_model, wind_u, wind_v):
             alpha       * (1 - beta) * polar._speeds[i1, j0] +
             (1 - alpha) * beta       * polar._speeds[i0, j1] +
             alpha       * beta       * polar._speeds[i1, j1])
+    if polar.minimum_twa > 0:
+        V_kt = np.where(twa_arr < polar.minimum_twa, 0.0, V_kt)
     return V_kt * KNOTS_TO_MS
 
 
@@ -795,13 +1057,32 @@ class Router:
                 return False
         return True
 
+    # Tight drift tolerance for smoothing: ensures shortcuts that bypass
+    # tacking are evaluated at the actual pointing-limited speed, not VMG.
+    _EDGE_DRIFT_TOL = 0.10
+
+    # Relaxed drift tolerance for final route time: allows VMG-based
+    # evaluation so that upwind segments yield finite times.
+    _VMG_DRIFT_TOL = 2.0
+
     def _segment_travel_time(self, x0, y0, x1, y1, start_time_s,
-                             n_samples=None):
+                             n_samples=None, drift_tol=None):
         """Compute travel time (s) along an arbitrary straight segment
         by sampling currents (and wind if available) at multiple points.
 
+        Parameters
+        ----------
+        drift_tol : float or None
+            Override for the _solve_heading drift tolerance.  When None,
+            uses ``_VMG_DRIFT_TOL`` (relaxed, for final route timing).
+            The smoother passes ``_EDGE_DRIFT_TOL`` to prevent shortcuts
+            from erasing tacking legs.
+
         Returns (time_s, dist_m).  time_s is np.inf if impassable.
         """
+        if drift_tol is None:
+            drift_tol = self._VMG_DRIFT_TOL
+
         dx = x1 - x0
         dy = y1 - y0
         dist = np.hypot(dx, dy)
@@ -831,7 +1112,8 @@ class Router:
             if self._use_polar:
                 wu, wv = self.wind.query(mx, my, elapsed_s=elapsed)
                 v_sog = _solve_heading(d_hat_x, d_hat_y, cu, cv,
-                                       wu, wv, self.boat)
+                                       wu, wv, self.boat,
+                                       drift_tol=drift_tol)
                 if v_sog <= 0.01:
                     return np.inf, dist
             else:
@@ -855,13 +1137,21 @@ class Router:
            the original grid-path segment times it replaces.  This
            prevents collapsing beneficial detours into slower straight lines.
 
+        The raw path baseline uses relaxed drift tolerance (VMG speed) so
+        that diagonal tacking legs get their true fast time.  Shortcut
+        candidates use tight drift tolerance so that straight lines
+        through the no-go zone are penalised.
+
         Returns a new (shorter) list of (row, col) tuples.
         """
         if len(path_rc) <= 2:
             return path_rc
 
+        dt_tight = self._EDGE_DRIFT_TOL
+
         # Pre-compute cumulative travel time along the raw grid path
-        # so we can quickly get the cost of any sub-path [i..j].
+        # using relaxed drift_tol so diagonal tacking steps evaluate at
+        # their true (fast) VMG speed, not the pointing-limited speed.
         n = len(path_rc)
         cum_time = np.zeros(n)
         for k in range(1, n):
@@ -870,8 +1160,12 @@ class Router:
             x0, y0 = xs[ck0], ys[rk0]
             x1, y1 = xs[ck1], ys[rk1]
             t_k, _ = self._segment_travel_time(
-                x0, y0, x1, y1, arrival_time[rk0, ck0])
+                x0, y0, x1, y1, arrival_time[rk0, ck0],
+                drift_tol=self._VMG_DRIFT_TOL)
             cum_time[k] = cum_time[k - 1] + t_k
+
+        # Pre-compute no-go zone check data for shortcut rejection.
+        min_twa = self.boat.polar.minimum_twa if self._use_polar else 0.0
 
         smoothed = [path_rc[0]]
         i = 0
@@ -889,12 +1183,29 @@ class Router:
                 rj, cj = path_rc[j]
                 x0, y0 = xs[c0], ys[r0]
                 xj, yj = xs[cj], ys[rj]
-                t_shortcut, _ = self._segment_travel_time(
-                    x0, y0, xj, yj, arrival_time[r0, c0])
 
-                if t_shortcut >= np.inf:
+                # Reject shortcuts whose bearing falls in the no-go zone.
+                if min_twa > 0 and self.wind is not None:
+                    dx = xj - x0
+                    dy = yj - y0
+                    seg_heading = np.arctan2(dy, dx)
+                    mx = 0.5 * (x0 + xj)
+                    my = 0.5 * (y0 + yj)
+                    t_mid = arrival_time[r0, c0]
+                    wu, wv = self.wind.query(mx, my, elapsed_s=t_mid)
+                    twa = compute_twa(seg_heading, wu, wv)
+                    if twa < min_twa:
+                        continue
+
+                t_shortcut, _ = self._segment_travel_time(
+                    x0, y0, xj, yj, arrival_time[r0, c0],
+                    drift_tol=dt_tight)
+
+                if not np.isfinite(t_shortcut):
                     continue
 
+                if not (np.isfinite(cum_time[j]) and np.isfinite(cum_time[i])):
+                    continue
                 t_grid = cum_time[j] - cum_time[i]
                 if t_shortcut <= t_grid * 1.005:
                     best_j = j
@@ -905,8 +1216,7 @@ class Router:
 
         return smoothed
 
-    @staticmethod
-    def _remove_stubs(path_rc, xs, ys):
+    def _remove_stubs(self, path_rc, xs, ys, water_mask=None):
         """Remove stub waypoints that create Y-junctions.
 
         A stub is an intermediate waypoint where one adjacent leg is
@@ -915,9 +1225,14 @@ class Router:
         to the next waypoint, eliminating the visual and navigational
         artifact.  The check is purely geometric (no time comparison)
         so it runs fast.
+
+        Stubs are NOT removed when doing so would create a segment
+        whose bearing falls inside the polar no-go zone.
         """
         if len(path_rc) <= 2:
             return path_rc
+
+        min_twa = self.boat.polar.minimum_twa if self._use_polar else 0.0
 
         changed = True
         while changed:
@@ -925,8 +1240,6 @@ class Router:
             new_path = [path_rc[0]]
             i = 1
             while i < len(path_rc) - 1:
-                # Use the last actually-kept point as the "previous" point so
-                # that consecutive stub removals don't see a removed point as A.
                 prev = new_path[-1]
                 ax, ay = xs[prev[1]], ys[prev[0]]
                 bx, by = xs[path_rc[i][1]],   ys[path_rc[i][0]]
@@ -937,7 +1250,6 @@ class Router:
                 short_leg = min(leg_in, leg_out)
                 long_leg = max(leg_in, leg_out)
 
-                # Only consider stubs where one leg is much shorter
                 if short_leg > 0 and long_leg / short_leg > 3.0:
                     v1x, v1y = bx - ax, by - ay
                     v2x, v2y = cx - bx, cy - by
@@ -945,6 +1257,26 @@ class Router:
                     cross = v1x * v2y - v1y * v2x
                     turn = abs(np.degrees(np.arctan2(cross, dot)))
                     if turn > 45.0:
+                        if (water_mask is not None and not self._line_of_sight(
+                                prev[0], prev[1],
+                                path_rc[i+1][0], path_rc[i+1][1],
+                                water_mask)):
+                            new_path.append(path_rc[i])
+                            i += 1
+                            continue
+                        # Guard: don't remove if the resulting A->C
+                        # segment would enter the no-go zone.
+                        if min_twa > 0 and self.wind is not None:
+                            dx_ac = cx - ax
+                            dy_ac = cy - ay
+                            hd = np.arctan2(dy_ac, dx_ac)
+                            wu, wv = self.wind.query(
+                                0.5 * (ax + cx), 0.5 * (ay + cy))
+                            twa = compute_twa(hd, wu, wv)
+                            if twa < min_twa:
+                                new_path.append(path_rc[i])
+                                i += 1
+                                continue
                         changed = True
                         i += 1
                         continue
@@ -1146,7 +1478,7 @@ class Router:
             raw_path_rc, water_mask, xs, ys, arrival_time_2d)
 
         # Remove short stub legs that create Y-junctions
-        path_rc = self._remove_stubs(path_rc, xs, ys)
+        path_rc = self._remove_stubs(path_rc, xs, ys, water_mask=water_mask)
 
         inv_transformer = Transformer.from_crs(
             transformer.target_crs, transformer.source_crs, always_xy=True)
@@ -1237,7 +1569,8 @@ class Router:
             if self._use_polar:
                 wu, wv = self.wind.query(mx, my, elapsed_s=elapsed)
                 v_sog = _solve_heading(d_hat_x, d_hat_y, cu, cv,
-                                       wu, wv, self.boat)
+                                       wu, wv, self.boat,
+                                       drift_tol=self._VMG_DRIFT_TOL)
                 if v_sog <= 0.01:
                     return np.inf, total_dist
             else:
@@ -1504,6 +1837,103 @@ def plot_route(route, xs, ys, water_mask, current_field,
 #  Data loading helpers
 # ===================================================================
 
+_SURFACE_CACHE_DIR = Path(__file__).parent / ".sscofs_surface_cache"
+
+
+def _surface_cache_path(run_date, cycle_hour, fh):
+    return _SURFACE_CACHE_DIR / f"sscofs_{run_date.replace('-','')}_{cycle_hour:02d}z_f{fh:03d}.npz"
+
+
+def _fetch_frames_byterange(run_date, cycle_hour, fh_list, max_workers=8):
+    """Load surface u,v frames, hitting a lightweight local cache first.
+
+    Cache stores only the extracted arrays (~1.5 MB compressed .npz per
+    frame).  On a miss, fetches only the needed variables via S3
+    byte-range reads (~3 MB per file instead of 200 MB), in parallel.
+
+    Returns
+    -------
+    (lonc, latc, results)
+        results : dict  fh -> (u, v)  numpy arrays, NaN replaced with 0.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    import s3fs
+    import xarray as xr
+    from fetch_sscofs import build_sscofs_url
+
+    _SURFACE_CACHE_DIR.mkdir(exist_ok=True)
+
+    # 1. Check cache for each frame.
+    results = {}
+    lonc = latc = None
+    to_fetch = []
+
+    for fh in fh_list:
+        cache_file = _surface_cache_path(run_date, cycle_hour, fh)
+        if cache_file.exists():
+            data = np.load(cache_file)
+            results[fh] = (data["u"], data["v"])
+            if lonc is None:
+                lonc = data["lonc"]
+                latc = data["latc"]
+        else:
+            to_fetch.append(fh)
+
+    n_cached = len(fh_list) - len(to_fetch)
+    if n_cached:
+        print(f"  {n_cached} frame(s) from cache")
+    if not to_fetch:
+        return lonc, latc, results
+
+    # 2. Byte-range fetch only the misses.
+    print(f"  {len(to_fetch)} frame(s) from S3 (byte-range)...")
+
+    _fs_holder = {}
+
+    def _get_fs():
+        if "fs" not in _fs_holder:
+            _fs_holder["fs"] = s3fs.S3FileSystem(
+                anon=True,
+                default_block_size=8 * 1024 * 1024,
+                default_fill_cache=True,
+            )
+        return _fs_holder["fs"]
+
+    def _s3_key(date_str, cyc, fh):
+        url = build_sscofs_url(date_str, cyc, fh)
+        return url.replace(
+            "https://noaa-nos-ofs-pds.s3.amazonaws.com/", "noaa-nos-ofs-pds/"
+        )
+
+    def _load_and_cache(fh):
+        fs = _get_fs()
+        key = _s3_key(run_date, cycle_hour, fh)
+        with fs.open(key, "rb") as fobj:
+            ds = xr.open_dataset(fobj, engine="h5netcdf",
+                                 drop_variables=["siglay", "siglev"])
+            u = np.nan_to_num(ds["u"].isel(time=0, siglay=0).values, nan=0.0)
+            v = np.nan_to_num(ds["v"].isel(time=0, siglay=0).values, nan=0.0)
+            fc_lonc = ds["lonc"].values
+            fc_latc = ds["latc"].values
+            ds.close()
+
+        cache_file = _surface_cache_path(run_date, cycle_hour, fh)
+        np.savez_compressed(cache_file, u=u, v=v, lonc=fc_lonc, latc=fc_latc)
+        return fh, fc_lonc, fc_latc, u, v
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_load_and_cache, fh): fh for fh in to_fetch}
+        for fut in as_completed(futures):
+            fh_done, fc_lonc, fc_latc, u, v = fut.result()
+            if lonc is None:
+                lonc = fc_lonc
+                latc = fc_latc
+            results[fh_done] = (u, v)
+
+    return lonc, latc, results
+
+
 def load_current_field(depart_dt=None, forecast_hours=None,
                        duration_hours=8, use_cache=True):
     """Load SSCOFS data and build a CurrentField.
@@ -1531,8 +1961,8 @@ def load_current_field(depart_dt=None, forecast_hours=None,
             departure time.  Pass this to ``Router.find_route()``.
         depart_utc : datetime or None -- the departure time in UTC.
     """
-    from fetch_sscofs import build_sscofs_url
-    from sscofs_cache import load_sscofs_data as _load
+    from fetch_sscofs import build_sscofs_url, compute_file_for_datetime
+    from latest_cycle import latest_cycle_and_url_for_local_hour
 
     depart_utc = None
     if depart_dt is not None:
@@ -1540,30 +1970,15 @@ def load_current_field(depart_dt=None, forecast_hours=None,
             depart_dt = depart_dt.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
         depart_utc = depart_dt.astimezone(_dt.timezone.utc)
 
-    # For historical departures (more than 3 hours in the past) pass the
-    # departure time so that the correct historical model cycle is selected.
-    # For near-real-time/future departures use "latest available" to avoid
-    # picking a cycle that hasn't been published yet.
+    # Determine model cycle metadata (no data download).
     now_utc = _dt.datetime.now(_dt.timezone.utc)
     if depart_utc is not None and (now_utc - depart_utc).total_seconds() > 3 * 3600:
-        ds, info = get_latest_current_data(use_cache=use_cache,
-                                           target_datetime=depart_utc)
+        info = compute_file_for_datetime(depart_utc)
     else:
-        ds, info = get_latest_current_data(use_cache=use_cache)
-
-    lonc = ds["lonc"].values
-    latc = ds["latc"].values
-    if lonc.max() > 180:
-        lonc = np.where(lonc > 180, lonc - 360, lonc)
-
-    u0 = ds["u"].isel(time=0, siglay=0).values
-    v0 = ds["v"].isel(time=0, siglay=0).values
-    u0 = np.nan_to_num(u0, nan=0.0)
-    v0 = np.nan_to_num(v0, nan=0.0)
-    ds.close()
-
-    transformer, _, _ = create_utm_transformer(
-        float(np.mean(latc)), float(np.mean(lonc)))
+        local_now = now_utc.astimezone(ZoneInfo("America/Los_Angeles"))
+        local_hhmm = local_now.hour * 100 + local_now.minute
+        info = latest_cycle_and_url_for_local_hour(local_hhmm,
+                                                   "America/Los_Angeles")
 
     base_hour = info.get('forecast_hour_index', 0)
     run_date = info['run_date_utc']
@@ -1593,38 +2008,31 @@ def load_current_field(depart_dt=None, forecast_hours=None,
         print(f"Departure (local):  {depart_local:%Y-%m-%d %H:%M}")
         print(f"Departure (UTC):    {depart_utc:%Y-%m-%d %H:%M UTC}")
 
-    u_frames = [u0]
-    v_frames = [v0]
-    frame_times = [0.0]
+    # Collect the full list of forecast hours to fetch.
+    all_fh = sorted(set(forecast_hours)) if forecast_hours else [base_hour]
 
-    if forecast_hours and len(forecast_hours) > 1:
-        for fh in forecast_hours:
-            if fh == base_hour:
-                continue
-            extra_info = {
-                'run_date_utc': run_date,
-                'cycle_utc': cycle,
-                'forecast_hour_index': fh,
-                'url': build_sscofs_url(run_date, int(cycle.replace('z', '')), fh),
-            }
-            try:
-                ds_extra = _load(extra_info, use_cache=use_cache, verbose=True)
-                ue = ds_extra["u"].isel(time=0, siglay=0).values
-                ve = ds_extra["v"].isel(time=0, siglay=0).values
-                ue = np.nan_to_num(ue, nan=0.0)
-                ve = np.nan_to_num(ve, nan=0.0)
-                ds_extra.close()
+    # Fast path: local surface cache → S3 byte-range reads for misses.
+    t0 = _time.monotonic()
+    print(f"Loading {len(all_fh)} SSCOFS surface frames...")
+    lonc, latc, fh_data = _fetch_frames_byterange(
+        run_date, cycle_hour_int, all_fh, max_workers=min(len(all_fh), 10))
+    elapsed = _time.monotonic() - t0
+    print(f"  Done in {elapsed:.1f}s")
 
-                u_frames.append(ue)
-                v_frames.append(ve)
-                frame_times.append(float((fh - base_hour) * 3600))
-            except Exception as exc:
-                print(f"Warning: could not load forecast hour {fh}: {exc}")
+    if lonc.max() > 180:
+        lonc = np.where(lonc > 180, lonc - 360, lonc)
 
-        order = np.argsort(frame_times)
-        u_frames = [u_frames[i] for i in order]
-        v_frames = [v_frames[i] for i in order]
-        frame_times = [frame_times[i] for i in order]
+    transformer, _, _ = create_utm_transformer(
+        float(np.mean(latc)), float(np.mean(lonc)))
+
+    u_frames = []
+    v_frames = []
+    frame_times = []
+    for fh in all_fh:
+        u, v = fh_data[fh]
+        u_frames.append(u)
+        v_frames.append(v)
+        frame_times.append(float((fh - base_hour) * 3600))
 
     cf = CurrentField(lonc, latc, u_frames, v_frames, frame_times,
                       transformer)
@@ -1678,6 +2086,8 @@ def main():
                              "America/Los_Angeles)")
     parser.add_argument("--polar", type=str, default=None,
                         help="Path to polar CSV (TWA_deg, TWS_kt, BoatSpeed_kt)")
+    parser.add_argument("--minimum-twa", type=float, default=0.0,
+                        help="No-go zone: zero boat speed below this TWA (degrees)")
     parser.add_argument("--wind-speed", type=float, default=None,
                         help="Constant true wind speed in knots")
     parser.add_argument("--wind-direction", type=float, default=None,
@@ -1715,8 +2125,9 @@ def main():
     # ---- Polar / wind ----
     polar = None
     if args.polar:
-        polar = PolarTable(args.polar)
-        print(f"Polar loaded: max speed {polar.max_speed_kt:.1f} kt")
+        polar = PolarTable(args.polar, minimum_twa=args.minimum_twa)
+        nogo = f", no-go < {args.minimum_twa:.0f}°" if args.minimum_twa > 0 else ""
+        print(f"Polar loaded: max speed {polar.max_speed_kt:.1f} kt{nogo}")
 
     wind = None
     if args.wind_speed is not None and args.wind_direction is not None:

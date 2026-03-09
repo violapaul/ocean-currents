@@ -715,6 +715,34 @@ class TestPathSmoothing:
 
         assert router._line_of_sight(sr, sc, er, ec, water_mask) is False
 
+    def test_remove_stubs_does_not_cross_land(self):
+        """Stub removal should not delete a point if the shortcut crosses land."""
+        cf, _ = make_synthetic_field()
+        boat = BoatModel(base_speed_knots=6.0)
+        router = Router(cf, boat, resolution_m=1.0, padding_m=1.0)
+
+        xs = np.arange(6, dtype=np.float64)
+        ys = np.arange(6, dtype=np.float64)
+        water_mask = np.ones((6, 6), dtype=bool)
+        # Block only the A->C diagonal, leaving A->B and B->C clear.
+        water_mask[1, 1] = False
+
+        a = (0, 0)
+        b = (0, 1)  # 1-cell stub leg from A, then long turn toward C
+        c = (4, 4)
+
+        assert water_mask[a[0], a[1]]
+        assert water_mask[b[0], b[1]]
+        assert water_mask[c[0], c[1]]
+        assert router._line_of_sight(a[0], a[1], b[0], b[1], water_mask)
+        assert router._line_of_sight(b[0], b[1], c[0], c[1], water_mask)
+        assert not router._line_of_sight(a[0], a[1], c[0], c[1], water_mask)
+
+        cleaned = router._remove_stubs([a, b, c], xs, ys, water_mask=water_mask)
+        assert cleaned == [a, b, c], (
+            "Stub removal removed a waypoint even though the direct shortcut "
+            "crosses land.")
+
 
 # =====================================================================
 #  4.  Time-dependent routing tests
@@ -995,6 +1023,23 @@ class TestPolarTable:
                 best_twa = twa
         assert 90 <= best_twa <= 160, (
             f"Best TWA at TWS=20 should be broad reach, got {best_twa} deg")
+
+    def test_rejects_missing_grid_points(self, tmp_path):
+        """A sparse polar table should be rejected instead of filled with zeros."""
+        import csv
+
+        csv_path = tmp_path / "sparse_polar.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["TWA_deg", "TWS_kt", "BoatSpeed_kt"])
+            writer.writeheader()
+            writer.writerow({"TWA_deg": 0, "TWS_kt": 10, "BoatSpeed_kt": 0})
+            writer.writerow({"TWA_deg": 90, "TWS_kt": 10, "BoatSpeed_kt": 7})
+            writer.writerow({"TWA_deg": 0, "TWS_kt": 20, "BoatSpeed_kt": 0})
+            # Missing: (TWA=90, TWS=20)
+
+        with pytest.raises(ValueError, match="missing"):
+            PolarTable(csv_path)
 
 
 # =====================================================================
@@ -1382,6 +1427,65 @@ class TestWindFieldTemporal:
         u_after, _ = wf.query(0, 0, elapsed_s=5000.0)
         assert u_before == pytest.approx(1.0, rel=0.01)
         assert u_after == pytest.approx(3.0, rel=0.01)
+
+    def test_temporal_grid_interpolates_in_space_and_time(self):
+        """Temporal grid mode should accept array frames and interpolate both axes."""
+        xs = np.array([0.0, 1000.0])
+        ys = np.array([0.0, 1000.0])
+
+        wu_0 = np.array([[0.0, 0.0], [0.0, 0.0]])
+        wu_1 = np.array([[2.0, 2.0], [2.0, 2.0]])
+        wv_0 = np.array([[-1.0, -1.0], [-1.0, -1.0]])
+        wv_1 = np.array([[1.0, 1.0], [1.0, 1.0]])
+
+        wf = WindField.from_frames(
+            xs, ys,
+            wu_frames=[wu_0, wu_1],
+            wv_frames=[wv_0, wv_1],
+            frame_times_s=[0.0, 3600.0])
+
+        u0, v0 = wf.query(500.0, 500.0, elapsed_s=0.0)
+        u1, v1 = wf.query(500.0, 500.0, elapsed_s=3600.0)
+        um, vm = wf.query(500.0, 500.0, elapsed_s=1800.0)
+
+        assert u0 == pytest.approx(0.0, abs=0.01)
+        assert v0 == pytest.approx(-1.0, abs=0.01)
+        assert u1 == pytest.approx(2.0, abs=0.01)
+        assert v1 == pytest.approx(1.0, abs=0.01)
+        assert um == pytest.approx(1.0, abs=0.02)
+        assert vm == pytest.approx(0.0, abs=0.02)
+
+    def test_temporal_nodes_nearest_with_time_interp(self):
+        """Temporal node mode should use nearest spatial node and interpolate in time."""
+        node_x = np.array([0.0, 1000.0])
+        node_y = np.array([0.0, 0.0])
+
+        # Frame 0 and frame 1 values per node
+        wu = np.array([
+            [1.0, 3.0],
+            [3.0, 5.0],
+        ])
+        wv = np.array([
+            [-2.0, -4.0],
+            [0.0, -2.0],
+        ])
+        wf = WindField.from_node_frames(
+            node_x=node_x,
+            node_y=node_y,
+            wu_frames=wu,
+            wv_frames=wv,
+            frame_times_s=[0.0, 3600.0],
+        )
+
+        # Near node 0 at halfway time
+        u0, v0 = wf.query(100.0, 10.0, elapsed_s=1800.0)
+        assert u0 == pytest.approx(2.0, abs=0.01)
+        assert v0 == pytest.approx(-1.0, abs=0.01)
+
+        # Near node 1 at halfway time
+        u1, v1 = wf.query(900.0, 5.0, elapsed_s=1800.0)
+        assert u1 == pytest.approx(4.0, abs=0.01)
+        assert v1 == pytest.approx(-3.0, abs=0.01)
 
     def test_routing_with_time_varying_wind(self):
         """Route with time-varying wind should work and produce a valid result."""

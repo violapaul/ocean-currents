@@ -1,4 +1,5 @@
 numpy
+pandas
 xarray
 h5netcdf
 h5py
@@ -6,3 +7,4 @@ s3fs
 boto3
 requests
 aiohttp
+PyYAML

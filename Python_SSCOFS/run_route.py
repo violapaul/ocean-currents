@@ -28,8 +28,18 @@ YAML schema:
       polar: "path/to/polar.csv"      # optional; relative to this script's dir
 
     wind:                             # optional; only used with a polar
+      # Option A: constant wind
+      source: "constant"
       speed_kt: 12.0
       direction_deg: 180.0            # meteorological "from" convention
+
+      # Option B: dynamic Open-Meteo ECMWF wind near route
+      # source: "open_meteo_ecmwf"
+      # timezone: "America/Los_Angeles"
+      # step_deg: 0.08
+      # padding_deg: 0.25
+      # duration_hours: 12
+      # buffer_hours: 2
 
     routing:
       grid_resolution_m: 300
@@ -45,6 +55,7 @@ YAML schema:
 import argparse
 import sys
 from pathlib import Path
+import datetime as _dt
 from datetime import timedelta
 
 import numpy as np
@@ -88,20 +99,121 @@ def load_task(yaml_path: Path) -> dict:
 # Build routing objects from YAML
 # ---------------------------------------------------------------------------
 
-def build_boat_and_wind(doc: dict):
+def _build_openmeteo_route_wind(wind_cfg: dict, ctx: dict) -> WindField:
+    """Build a dynamic wind field by fetching Open-Meteo ECMWF nodes."""
+    from ecmwf_wind import fetch_route_wind_dataset, DEFAULT_TIMEZONE
+
+    tz_req = str(wind_cfg.get("timezone", ctx.get("tz_str", DEFAULT_TIMEZONE)))
+    padding_deg = float(wind_cfg.get("padding_deg", 0.25))
+    step_deg = float(wind_cfg.get("step_deg", 0.08))
+    chunk_size = int(wind_cfg.get("chunk_size", 100))
+    wind_hours = float(wind_cfg.get("duration_hours", ctx.get("duration_h", 10)))
+    buffer_h = float(wind_cfg.get("buffer_hours", 2.0))
+
+    depart_dt = ctx["depart_dt"]
+    end_dt = depart_dt + timedelta(hours=wind_hours + buffer_h)
+    start_date = wind_cfg.get("start_date", depart_dt.date().isoformat())
+    end_date = wind_cfg.get("end_date", end_dt.date().isoformat())
+    forecast_days = wind_cfg.get("forecast_days")
+    past_days = wind_cfg.get("past_days")
+    models = wind_cfg.get("models")
+    min_non_null_coverage = float(wind_cfg.get("min_non_null_coverage", 0.05))
+
+    cache_dir = HERE / ".wind_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    slug = ctx["task_slug"]
+
+    nodes_csv = Path(wind_cfg.get("nodes_csv", cache_dir / f"{slug}_ecmwf_nodes.csv"))
+    if not nodes_csv.is_absolute():
+        nodes_csv = HERE / nodes_csv
+
+    out_nc = wind_cfg.get("output_netcdf")
+    if out_nc is None:
+        out_nc_path = cache_dir / f"{slug}_ecmwf_wind.nc"
+    else:
+        out_nc_path = Path(out_nc)
+        if not out_nc_path.is_absolute():
+            out_nc_path = HERE / out_nc_path
+
+    out_csv = wind_cfg.get("output_csv")
+    out_csv_path = None
+    if out_csv is not None:
+        out_csv_path = Path(out_csv)
+        if not out_csv_path.is_absolute():
+            out_csv_path = HERE / out_csv_path
+
+    print("Fetching route-local ECMWF wind nodes…")
+    _, ds, nodes = fetch_route_wind_dataset(
+        waypoints_latlon=ctx["waypoints"],
+        nodes_csv=nodes_csv,
+        timezone=tz_req,
+        padding_deg=padding_deg,
+        step_deg=step_deg,
+        chunk_size=chunk_size,
+        start_date=start_date,
+        end_date=end_date,
+        forecast_days=forecast_days,
+        past_days=past_days,
+        models=models,
+        min_non_null_coverage=min_non_null_coverage,
+        output_csv=out_csv_path,
+        output_netcdf=out_nc_path,
+        use_cached_nodes=(not ctx["no_cache"]),
+        verbose=True,
+    )
+
+    time_vals = np.asarray(ds["time"].values, dtype="datetime64[s]")
+    if time_vals.size == 0:
+        raise RuntimeError("Open-Meteo wind dataset is empty")
+    depart_utc_naive = np.datetime64(
+        ctx["depart_utc"].astimezone(_dt.timezone.utc).replace(tzinfo=None),
+        "s",
+    )
+    # Dataset times are in local timezone (from Open-Meteo); convert to
+    # UTC before computing offsets relative to the UTC departure time.
+    utc_offset_s = int(ctx["depart_dt"].utcoffset().total_seconds())
+    time_vals_utc = time_vals - np.timedelta64(utc_offset_s, "s")
+    frame_times_s = ctx["start_time_s"] + (
+        (time_vals_utc - depart_utc_naive) / np.timedelta64(1, "s")
+    ).astype(np.float64)
+
+    speed_ms = ds["wind_speed_10m"].values.astype(np.float64) * KNOTS_TO_MS
+    from_rad = np.radians(ds["wind_direction_10m"].values.astype(np.float64))
+    wu_frames = -speed_ms * np.sin(from_rad)
+    wv_frames = -speed_ms * np.cos(from_rad)
+
+    node_lons = ds["longitude"].values.astype(np.float64)
+    node_lats = ds["latitude"].values.astype(np.float64)
+    node_x, node_y = ctx["transformer"].transform(node_lons, node_lats)
+
+    wind = WindField.from_node_frames(
+        node_x=node_x,
+        node_y=node_y,
+        wu_frames=wu_frames,
+        wv_frames=wv_frames,
+        frame_times_s=frame_times_s,
+    )
+    print(f"Wind field ready: {len(nodes)} nodes, {len(frame_times_s)} hourly frames, "
+          f"model={ds.attrs.get('model', 'unknown')}")
+    return wind
+
+
+def build_boat_and_wind(doc: dict, context: dict | None = None):
     """Construct BoatModel and optional WindField from YAML config."""
     boat_cfg = doc.get("boat", {})
     speed_kt = float(boat_cfg.get("speed_kt", 6.0))
 
     polar = None
     polar_path_str = boat_cfg.get("polar")
+    minimum_twa = float(boat_cfg.get("minimum_twa", 0.0))
     if polar_path_str:
         polar_path = Path(polar_path_str)
         if not polar_path.is_absolute():
             polar_path = HERE / polar_path
         if polar_path.exists():
-            polar = PolarTable(polar_path)
-            print(f"Polar loaded from {polar_path}: max {polar.max_speed_kt:.1f} kt")
+            polar = PolarTable(polar_path, minimum_twa=minimum_twa)
+            nogo = f", no-go zone < {minimum_twa:.0f}°" if minimum_twa > 0 else ""
+            print(f"Polar loaded from {polar_path}: max {polar.max_speed_kt:.1f} kt{nogo}")
         else:
             print(f"Warning: polar file not found at {polar_path}, using fixed speed.")
 
@@ -110,10 +222,30 @@ def build_boat_and_wind(doc: dict):
     wind = None
     wind_cfg = doc.get("wind")
     if wind_cfg and polar is not None:
-        ws = float(wind_cfg.get("speed_kt", 0.0))
-        wd = float(wind_cfg.get("direction_deg", 0.0))
-        wind = WindField.from_met(ws, wd)
-        print(f"Wind: {ws:.1f} kt from {wd:.0f}°")
+        source = str(wind_cfg.get("source", "constant")).lower()
+        if source in ("constant", "met", "manual"):
+            ws = float(wind_cfg.get("speed_kt", 0.0))
+            wd = float(wind_cfg.get("direction_deg", 0.0))
+            wind = WindField.from_met(ws, wd)
+            print(f"Wind: {ws:.1f} kt from {wd:.0f}°")
+        elif source in ("open_meteo_ecmwf", "ecmwf_openmeteo", "ecmwf_route"):
+            if context is None:
+                raise ValueError("Open-Meteo wind source requires route context")
+            allow_fallback = bool(wind_cfg.get("allow_fallback", True))
+            try:
+                wind = _build_openmeteo_route_wind(wind_cfg, context)
+            except Exception as exc:
+                if allow_fallback and "speed_kt" in wind_cfg and "direction_deg" in wind_cfg:
+                    ws = float(wind_cfg.get("speed_kt", 0.0))
+                    wd = float(wind_cfg.get("direction_deg", 0.0))
+                    wind = WindField.from_met(ws, wd)
+                    print("Warning: dynamic wind fetch failed "
+                          f"({exc}). Falling back to constant wind "
+                          f"{ws:.1f} kt from {wd:.0f}°")
+                else:
+                    raise
+        else:
+            print(f"Warning: unknown wind source '{source}', ignoring wind config.")
     elif wind_cfg and polar is None:
         print("Note: wind specified but no polar loaded — wind ignored.")
 
@@ -761,7 +893,20 @@ def main():
     )
 
     # ---- Boat and wind ----
-    boat, wind = build_boat_and_wind(doc)
+    boat, wind = build_boat_and_wind(
+        doc,
+        context={
+            "waypoints": wps,
+            "depart_dt": depart_dt,
+            "depart_utc": depart_utc,
+            "start_time_s": start_time_s,
+            "duration_h": duration_h,
+            "no_cache": args.no_cache,
+            "transformer": transformer,
+            "tz_str": tz_str,
+            "task_slug": yaml_path.stem,
+        },
+    )
 
     # ---- Build router ----
     router = Router(cf, boat,

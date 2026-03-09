@@ -112,6 +112,40 @@ with optional polar-based sail performance and wind fields. `run_route.py`
 wraps that solver in a YAML-driven multi-leg workflow that can export route
 JSON, leg plots, hourly frames, and UTM position-vs-time plots.
 
+### ECMWF Wind Pipeline (Open-Meteo)
+
+`ecmwf_wind.py` downloads native ECMWF 9 km IFS HRES winds using:
+- `models=ecmwf_ifs` (full 9 km resolution, available since ECMWF open-data Oct 2025)
+- `elevation=nan`
+- `cell_selection=nearest`
+- hourly `wind_speed_10m`, `wind_direction_10m`, `wind_gusts_10m`
+
+Two-step workflow:
+
+```bash
+# 1) Discover and cache snapped ECMWF nodes (run once for a region)
+python ecmwf_wind.py discover \
+  --center-lat 47.6062 --center-lon -122.3321 \
+  --radius-deg 0.75 --step-deg 0.08 \
+  --output ecmwf_seattle_nodes.csv
+
+# 2) Fetch forecast for cached nodes
+python ecmwf_wind.py fetch \
+  --nodes ecmwf_seattle_nodes.csv \
+  --output-netcdf ecmwf_wind_forecast.nc \
+  --timezone America/Los_Angeles
+```
+
+Route-scoped fetch (download only near your route):
+
+```bash
+python ecmwf_wind.py route-fetch \
+  --waypoints "47.682919,-122.412349;47.449485,-122.384278;47.682919,-122.412349" \
+  --nodes .wind_cache/my_route_nodes.csv \
+  --output-netcdf .wind_cache/my_route_wind.nc \
+  --step-deg 0.08 --padding-deg 0.25
+```
+
 See **[ROUTING.md](ROUTING.md)** for the full algorithm description (A\* search,
 polar interpolation, heading sweep, path smoothing, etc.).
 
@@ -129,6 +163,21 @@ python -m pytest test_sail_routing.py -v
 
 # Run a multi-leg route from YAML
 conda run -n anaconda python run_route.py routes/shilshole_alki_return.yaml
+```
+
+`run_route.py` now supports dynamic route-local ECMWF wind in YAML:
+
+```yaml
+wind:
+  source: "open_meteo_ecmwf"  # dynamic hourly wind near route
+  timezone: "America/Los_Angeles"
+  step_deg: 0.08
+  padding_deg: 0.25
+  duration_hours: 12
+  buffer_hours: 2
+  # optional cache/output paths (relative to Python_SSCOFS/)
+  # nodes_csv: ".wind_cache/my_route_nodes.csv"
+  # output_netcdf: ".wind_cache/my_route_wind.nc"
 ```
 
 ---
