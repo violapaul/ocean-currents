@@ -97,11 +97,11 @@ def load_geometry_direct(run_date, cycle, forecast_hour=0):
     
     fs = _get_s3fs()
     with fs.open(s3_key, 'rb', block_size=8*1024*1024) as f:
-        ds = xr.open_dataset(f, engine='h5netcdf')
+        ds = xr.open_dataset(f, engine='h5netcdf', drop_variables=['siglay', 'siglev'])
         lonc = ds["lonc"].values
         latc = ds["latc"].values
         ds.close()
-    
+
     return lonc, latc
 
 
@@ -117,11 +117,11 @@ def load_velocity_direct(run_date, cycle, forecast_hour):
     
     fs = _get_s3fs()
     with fs.open(s3_key, 'rb', block_size=8*1024*1024) as f:
-        ds = xr.open_dataset(f, engine='h5netcdf')
+        ds = xr.open_dataset(f, engine='h5netcdf', drop_variables=['siglay', 'siglev'])
         u = ds["u"].isel(time=0, siglay=0).values
         v = ds["v"].isel(time=0, siglay=0).values
         ds.close()
-    
+
     return u, v
 
 

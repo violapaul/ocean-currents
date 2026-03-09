@@ -71,7 +71,7 @@ def build_water_mask(
     lat: np.ndarray,
     threshold_factor: float = 3.5,
     max_aspect_ratio: float = 6.0,
-    max_edge_m: float = 800.0,
+    max_edge_m: float = 2000.0,
     use_utm: bool = False,
     utm_zone: int = 10,
 ) -> Tuple[Delaunay, np.ndarray]:
@@ -81,8 +81,8 @@ def build_water_mask(
     1. Local scale: max edge > threshold_factor * local mesh density
     2. Aspect ratio: max_edge / min_edge > max_aspect_ratio (catches
        elongated slivers that bridge narrow peninsulas)
-    3. Absolute edge length: max edge > max_edge_m (hard cap that catches
-       bridges between close but land-separated mesh regions)
+    3. Absolute edge length: max edge > max_edge_m (catches convex-hull
+       boundary artifacts; set high enough to allow coarse open-water mesh)
     
     Parameters
     ----------
@@ -94,8 +94,9 @@ def build_water_mask(
     max_aspect_ratio : float
         Reject triangles where max_edge / min_edge exceeds this value.
     max_edge_m : float
-        Absolute maximum edge length in meters. Any triangle with an edge
-        longer than this is rejected regardless of local scale.
+        Absolute maximum edge length in meters. Catches convex-hull boundary
+        artifacts. Must be larger than the coarsest valid mesh spacing (~1km
+        in the open Strait of Juan de Fuca).
     use_utm : bool
         If True, convert to UTM for more accurate distance calculations.
     utm_zone : int
@@ -627,7 +628,7 @@ def build_water_mask_utm(
     y_utm: np.ndarray,
     threshold_factor: float = 3.5,
     max_aspect_ratio: float = 6.0,
-    max_edge_m: float = 800.0,
+    max_edge_m: float = 2000.0,
 ) -> Tuple[Delaunay, np.ndarray]:
     """Build Delaunay triangulation from UTM coordinates directly.
     
