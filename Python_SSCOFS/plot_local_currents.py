@@ -28,6 +28,7 @@ from pyproj import Transformer
 # Import helper functions from existing modules
 from latest_cycle import latest_cycle_and_url_for_local_hour
 from fetch_sscofs import build_sscofs_url, compute_file_for_datetime
+from shoreline_utils import draw_shoreline
 from sscofs_cache import load_sscofs_data, list_cache, clear_cache
 
 def get_utm_zone(lon):
@@ -100,8 +101,9 @@ def get_latest_current_data(use_cache=True, target_datetime=None, tz_str="Americ
             from zoneinfo import ZoneInfo
             current_time_local = current_time_utc.astimezone(ZoneInfo(tz_str))
         except ImportError:
-            # Fallback to PST/PDT offset
-            current_time_local = current_time_utc - timedelta(hours=8)  # Approximate PST
+            # Fallback for Python < 3.9: fixed UTC-8 (PST); off by 1h during PDT (Mar–Nov)
+            _pst = dt.timezone(timedelta(hours=-8))
+            current_time_local = current_time_utc.astimezone(_pst)
         
         local_hour = current_time_local.hour * 100 + current_time_local.minute
         
@@ -211,9 +213,10 @@ def plot_currents_at_location(ds, center_lat, center_lon, radius_miles=5,
         time_local = time_utc.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("America/Los_Angeles"))
         time_str = time_local.strftime("%Y-%m-%d %H:%M:%S %Z")
     except ImportError:
-        # Fallback for older Python
-        time_local = time_utc - timedelta(hours=8)  # Approximate PST
-        time_str = time_local.strftime("%Y-%m-%d %H:%M:%S PST")
+        # Fallback for Python < 3.9: fixed UTC-8 (PST); off by 1h during PDT (Mar–Nov)
+        _pst = dt.timezone(timedelta(hours=-8))
+        time_local = time_utc.replace(tzinfo=dt.timezone.utc).astimezone(_pst)
+        time_str = time_local.strftime("%Y-%m-%d %H:%M:%S UTC-8")
     
     # ---- Subplot 1: Current vectors ----
     if len(x_masked) > 0:
@@ -311,7 +314,8 @@ def plot_currents_at_location(ds, center_lat, center_lon, radius_miles=5,
     margin = radius_meters * 0.05
     ax1.set_xlim(center_x - radius_meters - margin, center_x + radius_meters + margin)
     ax1.set_ylim(center_y - radius_meters - margin, center_y + radius_meters + margin)
-    
+    draw_shoreline(ax1, transformer, zorder=6)
+
     # ---- Subplot 2: Current speed heatmap ----
     if len(x_masked) > 0:
         # Create scatter plot for speed (show in knots for mariners)
@@ -340,6 +344,7 @@ def plot_currents_at_location(ds, center_lat, center_lon, radius_miles=5,
     # Set same axis limits
     ax2.set_xlim(ax1.get_xlim())
     ax2.set_ylim(ax1.get_ylim())
+    draw_shoreline(ax2, transformer, zorder=6)
     
     plt.suptitle(f'SSCOFS Surface Currents - Puget Sound\nLocation: ({center_lat:.4f}°N, {abs(center_lon):.4f}°W) - UTM Zone {utm_zone}{hemisphere[0].upper()}', 
                  fontsize=14, fontweight='bold')

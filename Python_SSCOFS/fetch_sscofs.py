@@ -214,6 +214,11 @@ def _latest_cycle_for_time(dt_utc: datetime) -> tuple[datetime.date, int]:
         A tuple ``(date, cycle_hour)`` where ``date`` is the run date (as
         ``datetime.date``) and ``cycle_hour`` is the integer cycle hour.
     """
+    if dt_utc.tzinfo is None:
+        raise ValueError(
+            "_latest_cycle_for_time() requires a UTC-aware datetime; "
+            "got a naive datetime.  Wrap with .replace(tzinfo=timezone.utc)."
+        )
     cycles = [0, 3, 9, 15, 21]
     # Find the latest cycle <= current hour
     for hour in reversed(cycles):

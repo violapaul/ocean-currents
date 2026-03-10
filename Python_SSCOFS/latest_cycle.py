@@ -37,7 +37,7 @@ def newest_cycle_for_date(d: dt.date) -> tuple[int, list[str]]:
 
 def find_latest_cycle(max_days_back: int = 3) -> tuple[dt.date, int, list[str]]:
     """Search today, then back up to `max_days_back` days for a date that has at least one cycle."""
-    today_utc = dt.datetime.utcnow().date()
+    today_utc = dt.datetime.now(dt.timezone.utc).date()
     for i in range(max_days_back + 1):
         d = today_utc - dt.timedelta(days=i)
         try:
