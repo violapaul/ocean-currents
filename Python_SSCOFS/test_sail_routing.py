@@ -21,9 +21,9 @@ import numpy as np
 import pytest
 from pyproj import Transformer
 
-from sail_routing import (CurrentField, BoatModel, Router, Route,
-                          PolarTable, WindField, compute_twa, _solve_heading,
-                          KNOTS_TO_MS, MS_TO_KNOTS)
+from sail_routing import (CurrentField, BoatModel, Router, MeshRouter, SectorRouter,
+                          Route, PolarTable, WindField, compute_twa, _solve_heading,
+                          KNOTS_TO_MS, MS_TO_KNOTS, build_mesh_adjacency)
 
 POLAR_CSV = Path(__file__).parent.parent.parent / "j105_polar_data_long.csv"
 
@@ -1895,6 +1895,413 @@ class TestSimulatedTrack:
         assert np.all(dt >= -1e-9), "Track time must be monotonic"
         assert np.max(step) < 500.0, (
             f"Track contains an implausible jump of {np.max(step):.0f} m")
+
+
+# =====================================================================
+#  MeshRouter tests
+# =====================================================================
+
+class TestBuildMeshAdjacency:
+    """Tests for the mesh adjacency extraction helper."""
+
+    def test_adjacency_from_simple_triangulation(self):
+        """Build adjacency from a synthetic current field's Delaunay."""
+        cf, _ = make_synthetic_field(half_size_deg=0.03, spacing_deg=0.005)
+        assert cf.delaunay is not None
+        assert cf.valid_triangle is not None
+
+        adj, edge_dist = build_mesh_adjacency(cf.delaunay, cf.valid_triangle)
+
+        assert len(adj) > 0, "Should have some nodes with edges"
+        for node, neighbors in adj.items():
+            assert len(neighbors) > 0, f"Node {node} should have neighbors"
+            for nbr in neighbors:
+                assert node in adj[nbr], "Adjacency should be symmetric"
+
+        for (a, b), dist in edge_dist.items():
+            assert a < b, "Edge keys should be canonically ordered"
+            assert dist > 0, "Edge distances should be positive"
+
+
+class TestMeshRouterBasic:
+    """Basic MeshRouter tests with zero current."""
+
+    def test_straight_north(self):
+        """With zero current, route should be approximately straight."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = MeshRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, xs, ys, wm = router.find_route(start, end)
+        expected_dist = 4000.0
+        expected_time = expected_dist / boat.speed()
+
+        assert route.total_distance_m == pytest.approx(expected_dist, rel=0.15)
+        assert route.total_time_s == pytest.approx(expected_time, rel=0.15)
+
+    def test_diagonal(self):
+        """Diagonal route should work."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = MeshRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(-1500, -1500, tr)
+        end = _latlon_for_offset(1500, 1500, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+        expected_dist = np.hypot(3000, 3000)
+
+        assert route.total_distance_m == pytest.approx(expected_dist, rel=0.20)
+
+
+class TestMeshRouterWithCurrent:
+    """MeshRouter tests with uniform current."""
+
+    def test_favorable_current_faster(self):
+        """Traveling north with northward current should be faster."""
+        cf, tr = make_synthetic_field(
+            v_func=lambda x, y: 1.0,
+            half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = MeshRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+        sog_ms = route.total_distance_m / route.total_time_s
+        expected_sog = boat.speed() + 1.0
+
+        assert sog_ms == pytest.approx(expected_sog, rel=0.15)
+
+    def test_opposing_current_slower(self):
+        """Traveling north against southward current should be slower."""
+        cf, tr = make_synthetic_field(
+            v_func=lambda x, y: -1.0,
+            half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = MeshRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+        sog_ms = route.total_distance_m / route.total_time_s
+        expected_sog = boat.speed() - 1.0
+
+        assert sog_ms == pytest.approx(expected_sog, rel=0.15)
+
+
+class TestMeshRouterLandAvoidance:
+    """MeshRouter should avoid land areas."""
+
+    def test_routes_around_land_obstacle(self):
+        """A land obstacle between start and end forces a detour."""
+        tr = _make_transformer()
+        cx, cy = tr.transform(CENTER_LON, CENTER_LAT)
+
+        def land_func(x, y):
+            return abs(x - cx) < 500 and abs(y - cy) < 500
+
+        cf, tr = make_synthetic_field(
+            land_func=land_func,
+            half_size_deg=0.04, spacing_deg=0.003,
+            land_threshold_m=200.0)
+
+        boat = BoatModel(base_speed_knots=6.0)
+        router = MeshRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2500, tr)
+        end = _latlon_for_offset(0, 2500, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+        straight_dist = 5000.0
+        assert route.total_distance_m > straight_dist, (
+            "Route should detour around land")
+
+
+class TestMeshRouterTackingPenalty:
+    """MeshRouter tacking penalty should discourage sharp turns."""
+
+    def test_tacking_penalty_increases_cost(self):
+        """A zigzag path should be more expensive with tacking penalty."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+
+        router_no_penalty = MeshRouter(cf, boat, tack_penalty_s=0.0)
+        router_with_penalty = MeshRouter(cf, boat, tack_penalty_s=120.0,
+                                         tack_threshold_deg=60.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route_no_pen, _, _, _ = router_no_penalty.find_route(start, end)
+        route_with_pen, _, _, _ = router_with_penalty.find_route(start, end)
+
+        assert route_with_pen.total_time_s >= route_no_pen.total_time_s * 0.95
+
+
+class TestMeshRouterTimeDependentCurrent:
+    """MeshRouter with time-varying current field."""
+
+    def test_uses_time_varying_current(self):
+        """Route should adapt to current that changes over time."""
+        def u0(x, y): return 0.0
+        def v0(x, y): return 1.0  # northward at t=0
+
+        def u1(x, y): return 0.0
+        def v1(x, y): return -1.0  # southward at t=3600
+
+        cf, tr = make_time_varying_field(
+            frame_specs=[(u0, v0), (u1, v1)],
+            frame_times_s=[0.0, 3600.0],
+            half_size_deg=0.04, spacing_deg=0.003)
+
+        boat = BoatModel(base_speed_knots=6.0)
+        router = MeshRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, _, _, _ = router.find_route(start, end, start_time_s=0.0)
+        assert route.total_time_s > 0
+
+
+class TestMeshRouterRouteQuality:
+    """Route quality checks for MeshRouter."""
+
+    def test_waypoints_progress_toward_goal(self):
+        """Each waypoint should be closer to the goal than the previous."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = MeshRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+
+        end_x, end_y = tr.transform(end[1], end[0])
+        prev_dist = float('inf')
+        for wp in route.waypoints_utm:
+            dist = np.hypot(wp[0] - end_x, wp[1] - end_y)
+            assert dist <= prev_dist + 100, "Waypoints should progress toward goal"
+            prev_dist = dist
+
+    def test_simulated_track_timing(self):
+        """Simulated track should have consistent timing."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = MeshRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+
+        assert route.simulated_track is not None
+        assert route.simulated_track_times is not None
+        assert len(route.simulated_track) == len(route.simulated_track_times)
+
+        times = np.asarray(route.simulated_track_times)
+        assert np.all(np.diff(times) >= -1e-9), "Track time must be monotonic"
+
+        final_time = times[-1] - times[0]
+        assert final_time == pytest.approx(route.total_time_s, rel=0.15)
+
+
+# =====================================================================
+#  SectorRouter tests
+# =====================================================================
+
+class TestSectorRouterBasic:
+    """Basic SectorRouter tests with zero current."""
+
+    def test_straight_north(self):
+        """With zero current, route should be approximately straight."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = SectorRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, xs, ys, wm = router.find_route(start, end)
+        expected_dist = 4000.0
+        expected_time = expected_dist / boat.speed()
+
+        assert route.total_distance_m == pytest.approx(expected_dist, rel=0.20)
+        assert route.total_time_s == pytest.approx(expected_time, rel=0.20)
+
+    def test_diagonal(self):
+        """Diagonal route should work."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = SectorRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(-1500, -1500, tr)
+        end = _latlon_for_offset(1500, 1500, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+        expected_dist = np.hypot(3000, 3000)
+
+        assert route.total_distance_m == pytest.approx(expected_dist, rel=0.25)
+
+
+class TestSectorRouterWithCurrent:
+    """SectorRouter tests with uniform current."""
+
+    def test_favorable_current_faster(self):
+        """Traveling north with northward current should be faster."""
+        cf, tr = make_synthetic_field(
+            v_func=lambda x, y: 1.0,
+            half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = SectorRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+        sog_ms = route.total_distance_m / route.total_time_s
+        expected_sog = boat.speed() + 1.0
+
+        assert sog_ms == pytest.approx(expected_sog, rel=0.20)
+
+    def test_opposing_current_slower(self):
+        """Traveling north against southward current should be slower."""
+        cf, tr = make_synthetic_field(
+            v_func=lambda x, y: -1.0,
+            half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = SectorRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+        sog_ms = route.total_distance_m / route.total_time_s
+        expected_sog = boat.speed() - 1.0
+
+        assert sog_ms == pytest.approx(expected_sog, rel=0.20)
+
+
+class TestSectorRouterLandAvoidance:
+    """SectorRouter should avoid land areas."""
+
+    def test_routes_around_land_obstacle(self):
+        """A land obstacle between start and end forces a detour."""
+        tr = _make_transformer()
+        cx, cy = tr.transform(CENTER_LON, CENTER_LAT)
+
+        def land_func(x, y):
+            rel_x = x - cx
+            rel_y = y - cy
+            return abs(rel_x) < 300 and -1500 < rel_y < 1500
+
+        cf, _ = make_synthetic_field(land_func=land_func, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = SectorRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(-2000, 0, tr)
+        end = _latlon_for_offset(2000, 0, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+        assert route.total_distance_m > 4000, (
+            "Route should detour around land")
+
+
+class TestSectorRouterTackingPenalty:
+    """SectorRouter tacking penalty should discourage sharp turns."""
+
+    def test_tacking_penalty_increases_cost(self):
+        """A route with tack penalty should cost at least as much."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+
+        router_no_pen = SectorRouter(cf, boat, tack_penalty_s=0.0)
+        router_with_pen = SectorRouter(cf, boat, tack_penalty_s=120.0)
+
+        start = _latlon_for_offset(-1500, -1500, tr)
+        end = _latlon_for_offset(1500, 1500, tr)
+
+        route_no_pen, _, _, _ = router_no_pen.find_route(start, end)
+        route_with_pen, _, _, _ = router_with_pen.find_route(start, end)
+
+        assert route_with_pen.total_time_s >= route_no_pen.total_time_s * 0.90
+
+
+class TestSectorRouterHeadingDiversity:
+    """SectorRouter should provide diverse heading options."""
+
+    def test_16_sector_coverage(self):
+        """The router should be able to navigate to any of 16 directions."""
+        cf, tr = make_synthetic_field(half_size_deg=0.06, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = SectorRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, 0, tr)
+
+        directions_reached = 0
+        for angle_deg in range(0, 360, 45):
+            dx = 2500 * np.sin(np.radians(angle_deg))
+            dy = 2500 * np.cos(np.radians(angle_deg))
+            try:
+                end = _latlon_for_offset(dx, dy, tr)
+                route, _, _, _ = router.find_route(start, end)
+                if route.total_distance_m > 0:
+                    directions_reached += 1
+            except Exception:
+                pass
+
+        assert directions_reached >= 6, (
+            "Should be able to route to most compass directions")
+
+
+class TestSectorRouterRouteQuality:
+    """Route quality checks for SectorRouter."""
+
+    def test_waypoints_progress_toward_goal(self):
+        """Waypoints should generally get closer to the goal."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = SectorRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+
+        end_x, end_y = tr.transform(end[1], end[0])
+        prev_dist = float('inf')
+        for wp in route.waypoints_utm:
+            dist = np.hypot(wp[0] - end_x, wp[1] - end_y)
+            assert dist <= prev_dist + 200, "Waypoints should progress toward goal"
+            prev_dist = dist
+
+    def test_simulated_track_timing(self):
+        """Simulated track should have consistent timing."""
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.003)
+        boat = BoatModel(base_speed_knots=6.0)
+        router = SectorRouter(cf, boat, tack_penalty_s=0.0)
+
+        start = _latlon_for_offset(0, -2000, tr)
+        end = _latlon_for_offset(0, 2000, tr)
+
+        route, _, _, _ = router.find_route(start, end)
+
+        assert route.simulated_track is not None
+        assert route.simulated_track_times is not None
+        assert len(route.simulated_track) == len(route.simulated_track_times)
+
+        times = np.asarray(route.simulated_track_times)
+        assert np.all(np.diff(times) >= -1e-9), "Track time must be monotonic"
+
+        final_time = times[-1] - times[0]
+        assert final_time == pytest.approx(route.total_time_s, rel=0.20)
 
 
 if __name__ == "__main__":

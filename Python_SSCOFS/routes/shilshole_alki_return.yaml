@@ -31,10 +31,11 @@ wind:
   source: "open_meteo_ecmwf"
 
 routing:
-  grid_resolution_m: 300
-  padding_m: 5000
+  router_type: "sector"       # "sector" (default), "mesh", or "grid" (legacy)
+  grid_resolution_m: 300      # only used for grid router
+  padding_m: 5000             # only used for grid router
   tack_penalty_s: 60
-  duration_hours: 10        # forecast window to load per leg
+  duration_hours: 10          # forecast window to load per leg
 
 output:
   save_plots: true          # save a PNG for each leg

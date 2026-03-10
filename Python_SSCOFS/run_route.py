@@ -42,8 +42,9 @@ YAML schema:
       # buffer_hours: 2
 
     routing:
-      grid_resolution_m: 300
-      padding_m: 5000
+      router_type: "sector"           # "sector" (default), "mesh", or "grid" (legacy)
+      grid_resolution_m: 300          # only used for grid router
+      padding_m: 5000                 # only used for grid router
       tack_penalty_s: 60
       duration_hours: 10              # forecast window to load per leg
 
@@ -63,7 +64,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 from sail_routing import (
-    PolarTable, WindField, BoatModel, Router,
+    PolarTable, WindField, BoatModel, Router, MeshRouter, SectorRouter,
     load_current_field, plot_route,
     KNOTS_TO_MS, MS_TO_KNOTS,
     CurrentField,
@@ -358,12 +359,12 @@ def position_at_time(xs, ys, ts, query_t):
 
 
 def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
-                           tz, task_name, plot_dir, slug):
+                           tz, task_name, plot_dir, slug, wind_field=None):
     """Generate one annotated PNG per hour of the trip.
 
-    Each frame shows:
-    - Current speed heatmap at that exact hour (live forecast)
-    - Current direction arrows
+    Each frame shows side-by-side panels for current and wind (if wind_field provided):
+    - Current/wind speed heatmap at that exact hour (live forecast)
+    - Current/wind direction arrows
     - Full planned route (all legs, light dashed)
     - Simulated ground track up to the current moment
     - Boat position marker
@@ -407,15 +408,74 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
     n_hours = int(np.ceil(trip_duration_s / 3600)) + 1
 
     # ── full simulated track for all legs (used as the "planned route" overlay) ──
-    # Use the actual tacking track rather than the heavily-smoothed waypoints,
-    # which can look like an artifact when only 3 points survive string-pulling.
     route_x = list(tx)
     route_y = list(ty)
 
     # ── compute max current speed for consistent colorscale ──────────────
     speed_max = cf.max_current_speed * MS_TO_KNOTS
 
+    # ── precompute wind speed max if wind field provided ──────────────────
+    wind_max = 15.0  # default
+    if wind_field is not None:
+        try:
+            wu_sample, wv_sample = wind_field.query(xs[len(xs)//2], ys_g[len(ys_g)//2], 0.0)
+            wind_max = max(15.0, np.hypot(wu_sample, wv_sample) * MS_TO_KNOTS * 1.5)
+        except Exception:
+            pass
+
     print(f"\nGenerating {n_hours} hourly frames…")
+
+    def _draw_route_overlay(ax, frame_local, track_x_past, track_y_past, bx, by, show_legend=True):
+        """Draw route, track, waypoints and boat on an axis."""
+        ax.plot(route_x, route_y,
+                color="#88aacc", linewidth=1.5, linestyle="--",
+                alpha=0.5, zorder=4, label="Planned route" if show_legend else None)
+
+        if len(track_x_past) > 1:
+            ax.plot(track_x_past, track_y_past,
+                    color="#00e5ff", linewidth=2.5, zorder=5,
+                    label="Track so far" if show_legend else None,
+                    path_effects=[pe.Stroke(linewidth=4.5,
+                                            foreground="#003344",
+                                            alpha=0.6),
+                                  pe.Normal()])
+
+        for k, (wx, wy) in enumerate(all_utm):
+            if k == 0:
+                ax.plot(wx, wy, "o", color="#2ecc71", markersize=11,
+                        zorder=8, markeredgecolor="white",
+                        markeredgewidth=2, label="Start" if show_legend else None)
+            elif k == len(all_utm) - 1 and k != 0:
+                ax.plot(wx, wy, "s", color="#e74c3c", markersize=11,
+                        zorder=8, markeredgecolor="white",
+                        markeredgewidth=2,
+                        label="Finish" if show_legend else None)
+            else:
+                ax.plot(wx, wy, "D", color="#f39c12", markersize=8,
+                        zorder=8, markeredgecolor="white",
+                        markeredgewidth=1.5)
+
+        for radius, alpha in [(18, 0.12), (13, 0.20), (9, 0.35)]:
+            ax.plot(bx, by, "o", color="#ffdd00",
+                    markersize=radius, alpha=alpha, zorder=9,
+                    markeredgewidth=0)
+        ax.plot(bx, by, "o", color="#ffdd00", markersize=8, zorder=10,
+                markeredgecolor="white", markeredgewidth=2,
+                label=f"Boat @ {frame_local:%I:%M %p}" if show_legend else None)
+
+    def _setup_ax(ax, title):
+        """Common axis setup."""
+        ax.set_facecolor("#0f1923")
+        ax.set_title(title, color="white", fontsize=11, pad=8)
+        ax.set_xlabel("Easting (m)", color="#aaaaaa", fontsize=8)
+        ax.set_ylabel("Northing (m)", color="#aaaaaa", fontsize=8)
+        ax.tick_params(colors="#666666", labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#334455")
+        ax.set_aspect("equal")
+        ax.set_xlim(xs[0], xs[-1])
+        ax.set_ylim(ys_g[0], ys_g[-1])
+        ax.grid(True, alpha=0.10, color="#445566")
 
     for h in range(n_hours):
         elapsed_s = depart_time_s + h * 3600.0
@@ -437,93 +497,133 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
         track_x_past = tx[mask_past]
         track_y_past = ty[mask_past]
 
-        # ── figure ────────────────────────────────────────────────────────
-        fig, ax = plt.subplots(figsize=(10, 14))
-        fig.patch.set_facecolor("#1a1a2e")
-        ax.set_facecolor("#0f1923")
-
-        # Water background
-        ax.pcolormesh(xs, ys_g,
-                      np.where(water_mask, 0.0, np.nan),
-                      cmap="Blues", vmin=0, vmax=1, alpha=0.08,
-                      shading="auto", zorder=0)
-
-        # Current speed heatmap
-        im = ax.pcolormesh(xs, ys_g, speed_grid,
-                           cmap="plasma", alpha=0.5, shading="auto",
-                           vmin=0, vmax=max(speed_max, 1.0), zorder=1)
-        cbar = fig.colorbar(im, ax=ax, label="Current speed (kt)",
-                            pad=0.01, shrink=0.6, fraction=0.03)
-        cbar.ax.yaxis.label.set_color("white")
-        cbar.ax.tick_params(colors="white")
-
-        # Current arrows (subsampled)
+        # Arrow subsampling
         step = max(1, len(xs) // 18)
         xx, yy = np.meshgrid(xs, ys_g)
-        u_sub = u_grid[::step, ::step]
-        v_sub = v_grid[::step, ::step]
-        spd_sub = speed_grid[::step, ::step]
-        mag = np.hypot(u_sub, v_sub)
-        mag_safe = np.where(mag < 1e-8, 1.0, mag)
-        u_norm = u_sub / mag_safe
-        v_norm = v_sub / mag_safe
-        visible = (mag > 0.04) & ~np.isnan(spd_sub)
-        u_norm[~visible] = np.nan
-        v_norm[~visible] = np.nan
         arrow_scale = 1.0 / (step * res) * 0.65
-        ax.quiver(xx[::step, ::step], yy[::step, ::step],
-                  u_norm, v_norm, spd_sub,
-                  cmap="cool", clim=(0, max(speed_max, 1.0)),
-                  scale=arrow_scale, scale_units="xy",
-                  width=0.003, headwidth=4, headlength=5,
-                  alpha=0.7, zorder=3)
 
-        # Full planned route (dashed, low opacity)
-        ax.plot(route_x, route_y,
-                color="#88aacc", linewidth=1.5, linestyle="--",
-                alpha=0.5, zorder=4, label="Planned route")
+        if wind_field is None:
+            fig, ax = plt.subplots(figsize=(10, 14))
+            fig.patch.set_facecolor("#1a1a2e")
 
-        # Ground track so far (bright solid line)
-        if len(track_x_past) > 1:
-            ax.plot(track_x_past, track_y_past,
-                    color="#00e5ff", linewidth=2.5, zorder=5,
-                    label="Track so far",
-                    path_effects=[pe.Stroke(linewidth=4.5,
-                                            foreground="#003344",
-                                            alpha=0.6),
-                                  pe.Normal()])
+            _setup_ax(ax, f"{task_name}  —  Hour {h}")
 
-        # Start / end / intermediate waypoint markers
-        sx0, sy0 = all_utm[0]
-        sx_end, sy_end = all_utm[-1]
-        # Mark all intermediate waypoints
-        for k, (wx, wy) in enumerate(all_utm):
-            if k == 0:
-                ax.plot(wx, wy, "o", color="#2ecc71", markersize=13,
-                        zorder=8, markeredgecolor="white",
-                        markeredgewidth=2, label="Start")
-            elif k == len(all_utm) - 1 and k != 0:
-                ax.plot(wx, wy, "s", color="#e74c3c", markersize=13,
-                        zorder=8, markeredgecolor="white",
-                        markeredgewidth=2,
-                        label="Finish" if k != 0 else None)
-            else:
-                ax.plot(wx, wy, "D", color="#f39c12", markersize=9,
-                        zorder=8, markeredgecolor="white",
-                        markeredgewidth=1.5)
+            ax.pcolormesh(xs, ys_g, np.where(water_mask, 0.0, np.nan),
+                          cmap="Blues", vmin=0, vmax=1, alpha=0.08,
+                          shading="auto", zorder=0)
 
-        # ── Boat position ─────────────────────────────────────────────────
-        # Glowing halo effect
-        for radius, alpha in [(22, 0.12), (16, 0.20), (11, 0.35)]:
-            ax.plot(bx, by, "o", color="#ffdd00",
-                    markersize=radius, alpha=alpha, zorder=9,
-                    markeredgewidth=0)
-        ax.plot(bx, by, "o", color="#ffdd00", markersize=9, zorder=10,
-                markeredgecolor="white", markeredgewidth=2,
-                label=f"Boat @ {frame_local:%I:%M %p}")
+            im = ax.pcolormesh(xs, ys_g, speed_grid,
+                               cmap="plasma", alpha=0.5, shading="auto",
+                               vmin=0, vmax=max(speed_max, 1.0), zorder=1)
+            cbar = fig.colorbar(im, ax=ax, label="Current (kt)",
+                                pad=0.01, shrink=0.6, fraction=0.03)
+            cbar.ax.yaxis.label.set_color("white")
+            cbar.ax.tick_params(colors="white")
+
+            u_sub = u_grid[::step, ::step]
+            v_sub = v_grid[::step, ::step]
+            spd_sub = speed_grid[::step, ::step]
+            mag = np.hypot(u_sub, v_sub)
+            mag_safe = np.where(mag < 1e-8, 1.0, mag)
+            u_norm = u_sub / mag_safe
+            v_norm = v_sub / mag_safe
+            visible = (mag > 0.04) & ~np.isnan(spd_sub)
+            u_norm[~visible] = np.nan
+            v_norm[~visible] = np.nan
+            ax.quiver(xx[::step, ::step], yy[::step, ::step],
+                      u_norm, v_norm, spd_sub,
+                      cmap="cool", clim=(0, max(speed_max, 1.0)),
+                      scale=arrow_scale, scale_units="xy",
+                      width=0.003, headwidth=4, headlength=5,
+                      alpha=0.7, zorder=3)
+
+            _draw_route_overlay(ax, frame_local, track_x_past, track_y_past, bx, by)
+            ax.legend(loc="upper right", framealpha=0.7,
+                      facecolor="#0d1b2a", edgecolor="#334455",
+                      labelcolor="white", fontsize=8)
+        else:
+            fig, (ax_cur, ax_wind) = plt.subplots(1, 2, figsize=(16, 10))
+            fig.patch.set_facecolor("#1a1a2e")
+
+            _setup_ax(ax_cur, "Ocean Current")
+            _setup_ax(ax_wind, "Wind")
+
+            for ax in (ax_cur, ax_wind):
+                ax.pcolormesh(xs, ys_g, np.where(water_mask, 0.0, np.nan),
+                              cmap="Blues", vmin=0, vmax=1, alpha=0.08,
+                              shading="auto", zorder=0)
+
+            im_cur = ax_cur.pcolormesh(xs, ys_g, speed_grid,
+                                       cmap="plasma", alpha=0.5, shading="auto",
+                                       vmin=0, vmax=max(speed_max, 1.0), zorder=1)
+            cbar_cur = fig.colorbar(im_cur, ax=ax_cur, label="Current (kt)",
+                                    pad=0.02, shrink=0.7)
+            cbar_cur.ax.yaxis.label.set_color("white")
+            cbar_cur.ax.tick_params(colors="white")
+
+            u_sub = u_grid[::step, ::step]
+            v_sub = v_grid[::step, ::step]
+            spd_sub = speed_grid[::step, ::step]
+            mag = np.hypot(u_sub, v_sub)
+            mag_safe = np.where(mag < 1e-8, 1.0, mag)
+            u_norm = u_sub / mag_safe
+            v_norm = v_sub / mag_safe
+            visible = (mag > 0.04) & ~np.isnan(spd_sub)
+            u_norm[~visible] = np.nan
+            v_norm[~visible] = np.nan
+            ax_cur.quiver(xx[::step, ::step], yy[::step, ::step],
+                          u_norm, v_norm, spd_sub,
+                          cmap="cool", clim=(0, max(speed_max, 1.0)),
+                          scale=arrow_scale, scale_units="xy",
+                          width=0.003, headwidth=4, headlength=5,
+                          alpha=0.7, zorder=3)
+
+            wu_grid = np.zeros_like(u_grid)
+            wv_grid = np.zeros_like(v_grid)
+            for i, y in enumerate(ys_g):
+                for j, x in enumerate(xs):
+                    if water_mask[i, j]:
+                        wu, wv = wind_field.query(x, y, elapsed_s=elapsed_s)
+                        wu_grid[i, j] = wu
+                        wv_grid[i, j] = wv
+                    else:
+                        wu_grid[i, j] = np.nan
+                        wv_grid[i, j] = np.nan
+
+            wind_speed_grid = np.hypot(wu_grid, wv_grid) * MS_TO_KNOTS
+
+            im_wind = ax_wind.pcolormesh(xs, ys_g, wind_speed_grid,
+                                         cmap="YlOrRd", alpha=0.5, shading="auto",
+                                         vmin=0, vmax=wind_max, zorder=1)
+            cbar_wind = fig.colorbar(im_wind, ax=ax_wind, label="Wind (kt)",
+                                     pad=0.02, shrink=0.7)
+            cbar_wind.ax.yaxis.label.set_color("white")
+            cbar_wind.ax.tick_params(colors="white")
+
+            wu_sub = wu_grid[::step, ::step]
+            wv_sub = wv_grid[::step, ::step]
+            wspd_sub = wind_speed_grid[::step, ::step]
+            wmag = np.hypot(wu_sub, wv_sub)
+            wmag_safe = np.where(wmag < 1e-8, 1.0, wmag)
+            wu_norm = wu_sub / wmag_safe
+            wv_norm = wv_sub / wmag_safe
+            wvisible = (wmag > 0.1) & ~np.isnan(wspd_sub)
+            wu_norm[~wvisible] = np.nan
+            wv_norm[~wvisible] = np.nan
+            ax_wind.quiver(xx[::step, ::step], yy[::step, ::step],
+                           wu_norm, wv_norm, wspd_sub,
+                           cmap="Reds", clim=(0, wind_max),
+                           scale=arrow_scale, scale_units="xy",
+                           width=0.003, headwidth=4, headlength=5,
+                           alpha=0.7, zorder=3)
+
+            _draw_route_overlay(ax_cur, frame_local, track_x_past, track_y_past, bx, by, show_legend=True)
+            _draw_route_overlay(ax_wind, frame_local, track_x_past, track_y_past, bx, by, show_legend=False)
+            ax_cur.legend(loc="upper right", framealpha=0.7,
+                          facecolor="#0d1b2a", edgecolor="#334455",
+                          labelcolor="white", fontsize=7)
 
         # ── Annotations ───────────────────────────────────────────────────
-        # Time block (top-left)
         time_str = frame_local.strftime("%I:%M %p %Z")
         date_str = frame_local.strftime("%a %b %-d")
         frac = min((elapsed_s - tt[0]) / max(trip_duration_s, 1), 1.0)
@@ -532,50 +632,32 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
         ann_text = (f"{date_str}\n{time_str}\n"
                     f"Hour {h} of trip\n"
                     f"Progress: {100*frac:.0f}%")
-        ax.text(0.02, 0.985, ann_text,
-                transform=ax.transAxes,
-                fontsize=10, va="top", ha="left",
-                color="white", fontfamily="monospace",
-                bbox=dict(boxstyle="round,pad=0.5",
-                          facecolor="#0d1b2a", alpha=0.85,
-                          edgecolor="#334455"))
 
-        # Cumulative distance / SOG (bottom-left)
-        # find cumulative distance along track up to this point
+        ax_for_ann = ax if wind_field is None else ax_cur
+        ax_for_ann.text(0.02, 0.98, ann_text,
+                        transform=ax_for_ann.transAxes,
+                        fontsize=9, va="top", ha="left",
+                        color="white", fontfamily="monospace",
+                        bbox=dict(boxstyle="round,pad=0.4",
+                                  facecolor="#0d1b2a", alpha=0.85,
+                                  edgecolor="#334455"))
+
         if len(track_x_past) > 1:
             seg_dists = np.hypot(np.diff(track_x_past), np.diff(track_y_past))
             cum_dist_nm = seg_dists.sum() / 1852.0
-            if elapsed_h > 0:
-                avg_sog = cum_dist_nm / elapsed_h
-            else:
-                avg_sog = 0.0
-            stats_text = (f"Dist so far: {cum_dist_nm:.1f} nm\n"
-                          f"Avg SOG:     {avg_sog:.2f} kt")
-            ax.text(0.02, 0.02, stats_text,
-                    transform=ax.transAxes,
-                    fontsize=9, va="bottom", ha="left",
-                    color="white", fontfamily="monospace",
-                    bbox=dict(boxstyle="round,pad=0.4",
-                              facecolor="#0d1b2a", alpha=0.85,
-                              edgecolor="#334455"))
+            avg_sog = cum_dist_nm / elapsed_h if elapsed_h > 0 else 0.0
+            stats_text = (f"Dist: {cum_dist_nm:.1f} nm\n"
+                          f"SOG:  {avg_sog:.2f} kt")
+            ax_for_ann.text(0.02, 0.02, stats_text,
+                            transform=ax_for_ann.transAxes,
+                            fontsize=8, va="bottom", ha="left",
+                            color="white", fontfamily="monospace",
+                            bbox=dict(boxstyle="round,pad=0.3",
+                                      facecolor="#0d1b2a", alpha=0.85,
+                                      edgecolor="#334455"))
 
-        # Title
-        ax.set_title(f"{task_name}  —  Hour {h}",
-                     color="white", fontsize=13, pad=10)
-        ax.set_xlabel("Easting (m, UTM)", color="#aaaaaa", fontsize=9)
-        ax.set_ylabel("Northing (m, UTM)", color="#aaaaaa", fontsize=9)
-        ax.tick_params(colors="#666666")
-        for spine in ax.spines.values():
-            spine.set_edgecolor("#334455")
-
-        legend = ax.legend(loc="upper right", framealpha=0.7,
-                           facecolor="#0d1b2a", edgecolor="#334455",
-                           labelcolor="white", fontsize=8)
-
-        ax.set_aspect("equal")
-        ax.set_xlim(xs[0], xs[-1])
-        ax.set_ylim(ys_g[0], ys_g[-1])
-        ax.grid(True, alpha=0.10, color="#445566")
+        if wind_field is not None:
+            fig.suptitle(f"{task_name}  —  Hour {h}", color="white", fontsize=12, y=0.98)
 
         plt.tight_layout()
         out_path = plot_dir / f"{slug}_hour{h:02d}.png"
@@ -875,6 +957,7 @@ def main():
     padding_m    = float(r_cfg.get("padding_m", 5000))
     tack_penalty = float(r_cfg.get("tack_penalty_s", 60))
     duration_h   = int(r_cfg.get("duration_hours", 10))
+    router_type  = r_cfg.get("router_type", "sector")  # "sector", "mesh", or "grid"
 
     # ---- Output config ----
     out_cfg = doc.get("output", {})
@@ -909,11 +992,21 @@ def main():
     )
 
     # ---- Build router ----
-    router = Router(cf, boat,
-                    resolution_m=resolution_m,
-                    padding_m=padding_m,
-                    wind=wind,
-                    tack_penalty_s=tack_penalty)
+    if router_type == "sector":
+        print("Using SectorRouter (16-sector heading-binned connectivity)")
+        router = SectorRouter(cf, boat, wind=wind,
+                              tack_penalty_s=tack_penalty)
+    elif router_type == "mesh":
+        print("Using MeshRouter (A* on SSCOFS Delaunay mesh)")
+        router = MeshRouter(cf, boat, wind=wind,
+                            tack_penalty_s=tack_penalty)
+    else:
+        print("Using Router (8-connected grid, legacy)")
+        router = Router(cf, boat,
+                        resolution_m=resolution_m,
+                        padding_m=padding_m,
+                        wind=wind,
+                        tack_penalty_s=tack_penalty)
 
     # ---- Run each leg ----
     routes = []
@@ -942,7 +1035,8 @@ def main():
             plot_route(route, xs, ys, wm, cf,
                        start_ll, end_ll,
                        straight_time_s=sl_time, straight_dist_m=sl_dist,
-                       save_path=plot_path, show=False)
+                       save_path=plot_path, show=False,
+                       wind_field=wind, elapsed_s=current_time_s)
 
         # Chain: departure of next leg = arrival of this leg
         current_time_s += route.total_time_s
@@ -989,6 +1083,7 @@ def main():
             task_name=task_name,
             plot_dir=plot_dir,
             slug=yaml_path.stem,
+            wind_field=wind,
         )
 
     if save_plots:

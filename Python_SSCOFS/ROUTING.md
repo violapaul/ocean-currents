@@ -15,12 +15,15 @@ and wind fields.
 5. [Wind: WindField](#5-wind-windfield)
 6. [Boat Model: BoatModel](#6-boat-model-boatmodel)
 7. [Edge Cost Physics](#7-edge-cost-physics)
-8. [A* Router](#8-a-router)
-9. [Path Smoothing and Stub Removal](#9-path-smoothing-and-stub-removal)
-10. [Ground-Track Simulation](#10-ground-track-simulation)
-11. [CLI Usage](#11-cli-usage)
-12. [Testing](#12-testing)
-13. [Known Limitations and Future Work](#13-known-limitations-and-future-work)
+8. [A* Router (Grid-Based, Legacy)](#8-a-router-grid-based-legacy)
+9. [MeshRouter (Delaunay-Based, Legacy)](#9-meshrouter-delaunay-based-legacy)
+10. [SectorRouter (Default)](#10-sectorrouter-default)
+11. [SectorRouter Path Smoothing](#11-sectorrouter-path-smoothing)
+12. [Legacy Router Smoothing and Stub Removal](#12-legacy-router-smoothing-and-stub-removal)
+13. [Ground-Track Simulation](#13-ground-track-simulation)
+14. [CLI Usage](#14-cli-usage)
+15. [Testing](#15-testing)
+16. [Known Limitations and Future Work](#16-known-limitations-and-future-work)
 
 ---
 
@@ -70,7 +73,9 @@ runs take 1–10 seconds on a laptop).
 | `PolarTable` | Stores boat speed vs TWA/TWS from CSV; bilinear interpolation |
 | `WindField` | Stores wind velocity; constant, spatial-grid, or temporal modes |
 | `BoatModel` | Wraps polar + fallback fixed speed; single `speed()` method |
-| `Router` | Builds a UTM grid, runs time-dependent A\*, smooths, simulates |
+| `SectorRouter` | **Default.** 16-sector heading-binned connectivity on SSCOFS nodes |
+| `Router` | Legacy 8-connected UTM grid router |
+| `MeshRouter` | Legacy Delaunay mesh edge router |
 | `Route` | Result container with waypoints, leg times, SOG stats |
 
 ---
@@ -259,7 +264,10 @@ and `_solve_heading_full()` (the full sweep returning SOG + ground velocity
 
 ---
 
-## 8. A\* Router
+## 8. A\* Router (Grid-Based, Legacy)
+
+> **Note:** This 8-connected grid router is retained for compatibility but is
+> not recommended. Use `SectorRouter` (the default) for better path quality.
 
 ### Grid construction
 
@@ -329,11 +337,286 @@ The path is traced backwards through `came_from[r, c, d, :]` which stores
 
 ---
 
-## 9. Path Smoothing and Stub Removal
+## 9. MeshRouter (Delaunay-Based, Legacy)
 
-The raw A\* path is a staircase of 8-connected grid cells, which
-over-estimates distance by up to ~8% on diagonal routes and produces
-unnecessary intermediate waypoints.  Two post-processing passes clean it up.
+> **Note:** MeshRouter is retained for comparison but is not recommended.
+> Use `SectorRouter` (the default) for better heading freedom and path quality.
+
+`MeshRouter` runs A\* directly on the SSCOFS Delaunay mesh edges.  While this
+provides exact node velocities and adaptive resolution, the mesh topology was
+designed for hydrodynamics (FVCOM), not navigation.  The arbitrary edge angles
+create path wobble that requires aggressive smoothing.
+
+### Mesh graph construction
+
+The search graph is built by `build_mesh_adjacency(delaunay, valid_mask)`:
+
+```
+for each valid triangle:
+    add edges (v0,v1), (v1,v2), (v2,v0) to adjacency
+```
+
+An edge exists between nodes `a` and `b` if they share a valid water triangle.
+Edge distances are precomputed in UTM metres.
+
+### State space
+
+State is `(node_id, bearing_bucket)` where `bearing_bucket` quantizes the
+incoming direction into 16 bins (22.5° each).  This enables tacking penalties
+without a fixed grid direction set.
+
+- 16 bearing buckets + 1 start sentinel = 17 states per node
+- Sparse storage: Python dicts for `best_cost`, `came_from`, `arrival_time`
+
+### Edge cost
+
+Uses the same physics as the grid router (`_fixed_speed_sog`, `_solve_heading`)
+but with direct node velocity lookup instead of IDW:
+
+```
+cu = 0.5 * (u[node_a] + u[node_b])  # averaged, time-interpolated
+cv = 0.5 * (v[node_a] + v[node_b])
+```
+
+### Tacking penalty
+
+Angle difference between bearing buckets:
+
+```
+diff = |bucket_in - bucket_out|
+if diff > N_BUCKETS/2: diff = N_BUCKETS - diff
+angle_diff = diff * 22.5°
+```
+
+Penalty applies when `angle_diff > tack_threshold_deg`.
+
+### Path smoothing
+
+The same greedy string-pulling approach as the grid router, but:
+
+- **Line-of-sight** is checked by sampling points along the shortcut and
+  calling `CurrentField.query()` — any NaN (land) rejects the shortcut.
+- **Stub removal** uses the same geometric heuristic (leg ratio + turn angle).
+
+### CLI usage
+
+```bash
+python sail_routing.py \
+    --start-lat 47.63 --start-lon -122.40 \
+    --end-lat 47.75 --end-lon -122.42 \
+    --mesh
+```
+
+### YAML usage (`run_route.py`)
+
+```yaml
+routing:
+  router_type: "mesh"  # legacy; use "sector" instead
+  tack_penalty_s: 60
+```
+
+---
+
+## 10. SectorRouter (Default)
+
+`SectorRouter` is the recommended router.  It uses SSCOFS element centers as
+routing nodes (inheriting their adaptive density: ~100 m near shore, ~500 m
+offshore) but replaces Delaunay edge adjacency with **16-sector heading-binned
+connectivity**.
+
+### Why SectorRouter?
+
+The grid router (8 directions) forces zigzag paths that must be heavily
+smoothed.  The mesh router (Delaunay edges, 3–6 directions) has arbitrary angles
+tied to the PDE mesh, causing path wobble.
+
+SectorRouter gives the A\* **16 angular choices** (22.5° sectors) at every node:
+
+```
+For each node, connect to the nearest reachable neighbor in each sector:
+    0 = North, 1 = NNE, 2 = NE, ..., 15 = NNW
+```
+
+This decouples the navigation action lattice from both grid geometry and mesh
+topology, producing paths that already represent reasonable sailing headings.
+
+### Key properties
+
+| Aspect | SectorRouter | MeshRouter | Grid Router |
+|--------|--------------|------------|-------------|
+| Directions per node | 16 | 3–6 | 8 |
+| Edge cost eval | `cf.query` at midpoint | Averaged node velocities | `cf.query` at midpoint |
+| Graph build | Lazy (during A\*) | Eager (all edges) | Eager (full grid) |
+| Smoothing | Two-pass (tack-aware DP, ~74% reduction) | Heavy greedy string-pull (217→17 typical) | Heavy greedy string-pull (120→29 typical) |
+
+### Lazy neighbor discovery
+
+Neighbors are computed on-demand during A\*:
+
+```python
+def _find_sector_neighbors(self, node_id):
+    1. Query KD-tree for k_candidates nearest nodes (default 50)
+    2. Filter by distance: min_edge_m < dist < max_edge_m
+    3. Assign each candidate to its heading sector (0–15)
+    4. Keep nearest candidate per sector
+    5. Validate with line-of-sight water check
+    6. Cache and return list of (neighbor_id, sector, distance)
+```
+
+Only explored nodes pay the neighbor-discovery cost.  Typical runs cache
+~10–20k nodes out of 400k+ SSCOFS elements.
+
+### Edge cost
+
+Same physics as other routers (`_fixed_speed_sog`, `_solve_heading`) but queries
+`CurrentField.query(midpoint)` rather than averaging node velocities:
+
+```python
+mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+cu, cv = cf.query(mx, my, elapsed_s=arrival_time)
+# then _solve_heading or _fixed_speed_sog
+```
+
+### Tacking penalty
+
+Same 16-bucket system as MeshRouter, but buckets map directly to sectors:
+
+```
+angle_diff = |sector_in - sector_out| * 22.5°
+if angle_diff > tack_threshold_deg: add tack_penalty_s
+```
+
+### Path quality
+
+Because the raw A\* path already has 16 heading options per step, the output
+is cleaner than grid or mesh routing.  A two-pass smoothing step (§11) further
+reduces the waypoint count by ~70–80% on typical Puget Sound routes while
+correctly preserving tacks and handling land avoidance.
+Example: a 4 nm upwind beat produces ~57 raw nodes → 15 smoothed waypoints.
+
+### Performance
+
+SectorRouter is slower than MeshRouter (~300s vs ~70s for a 20 nm route) due to
+line-of-sight validation during neighbor discovery (~16 × 15 samples × explored
+nodes).  This is acceptable for planning routes; for real-time use, caching or
+pre-building the sector graph would help.
+
+### CLI usage
+
+```bash
+# SectorRouter is the default (no flag needed)
+python sail_routing.py \
+    --start-lat 47.63 --start-lon -122.40 \
+    --end-lat 47.75 --end-lon -122.42
+
+# Explicitly select sector router
+python sail_routing.py ... --sector
+
+# Use legacy routers
+python sail_routing.py ... --mesh   # MeshRouter
+python sail_routing.py ... --grid   # Grid Router
+```
+
+### YAML usage (`run_route.py`)
+
+```yaml
+routing:
+  router_type: "sector"  # default; or "mesh" / "grid" for legacy
+  tack_penalty_s: 60
+```
+
+---
+
+## 11. SectorRouter Path Smoothing
+
+The raw SectorRouter A\* path contains every SSCOFS node visited during the
+search.  While already more angular than grid/mesh routes, it still has many
+redundant intermediate waypoints — especially in tacking sequences where the
+boat alternates headings every 100–200 m.  `_smooth_path` reduces these with
+a two-pass algorithm that distinguishes **genuine tacks** from **gradual
+curves**.
+
+### Why the distinction matters
+
+A sailing route has two very different kinds of heading changes:
+
+- **Tacks** — the boat physically changes tack (port ↔ starboard), producing a
+  sharp 45–90° heading reversal that is a true navigational event.
+- **Gradual curves** — the heading drifts slowly as the boat follows a current
+  band, avoids a shore, or sails a slightly curved VMG course.  These can be
+  approximated by fewer waypoints without losing navigational meaning.
+
+### Pass 1a — Tack detection
+
+A waypoint is a **tack** if the turn angle (incoming vs outgoing heading) is
+≥ `SMOOTH_TACK_THRESHOLD_DEG` (default 45°).  Tack points are always kept.
+
+### Pass 1b — Tack merging
+
+In a short upwind beat the A\* may produce tack legs only 75–200 m long,
+leaving every other node as a "tack" — which would produce no simplifiable
+inter-tack segments.  Nearby tacks are merged: any raw tack within
+`SMOOTH_MIN_TACK_SPACING_M` (default 400 m) of the previous kept tack is
+either skipped or replaces it if it has a larger turn angle.
+
+```
+tack_boundaries = [start]
+for each raw tack candidate t:
+    if dist(last_boundary, t) >= 400 m:
+        tack_boundaries.append(t)
+    elif t.turn_angle > last_boundary.turn_angle:
+        tack_boundaries[-1] = t     # sharper tack wins
+tack_boundaries.append(end)
+```
+
+### Pass 2 — Douglas-Peucker within each inter-tack segment
+
+Between consecutive tack boundaries the path follows a gradual curve.
+Douglas-Peucker with `SMOOTH_DP_EPSILON_M` (default 120 m) collapses
+intermediate nodes whose perpendicular distance from the straight chord is
+below the threshold:
+
+```
+dp_segment(start, end):
+    find node k in (start..end) with max perpendicular distance d to chord
+    if d > 120 m:
+        return dp_segment(start, k) + dp_segment(k, end)
+    else:
+        return [start]          # chord is good enough
+```
+
+All `dp_segment` results are merged and `end` is appended once.
+
+### Per-leg land fallback
+
+A simplified chord (tack boundary → tack boundary) may cross land even though
+all individual raw edges were over water.  Rather than reverting the **entire**
+smoothed route, `_compute_leg_times` detects non-finite travel times per leg
+and re-inserts the original raw sub-path for just that leg.
+
+### Tuning knobs
+
+| Constant | Default | Effect |
+|----------|---------|--------|
+| `SMOOTH_TACK_THRESHOLD_DEG` | 45° | Lower → more waypoints treated as tacks |
+| `SMOOTH_MIN_TACK_SPACING_M` | 400 m | Higher → fewer tack waypoints in dense beats |
+| `SMOOTH_DP_EPSILON_M` | 120 m | Higher → more aggressive curve simplification |
+
+### Typical results
+
+| Scenario | Raw nodes | Smoothed | Reduction |
+|----------|-----------|----------|-----------|
+| 4 nm upwind beat (polar + ECMWF wind) | 57–82 | 15–22 | ~73–74% |
+| Downwind / reaching run | lower | lower | ~70%+ |
+
+---
+
+## 12. Legacy Router Smoothing and Stub Removal
+
+The raw A\* path from the grid or mesh router is a staircase of connected
+cells that over-estimates distance by up to ~8% on diagonal routes and
+produces unnecessary intermediate waypoints.  Two post-processing passes
+clean it up.
 
 ### Pass 1: Greedy string-pulling (`_smooth_path`)
 
@@ -350,14 +633,13 @@ while i < n-1:
 ```
 
 The **1.005 tolerance** allows shortcuts that are trivially slower than
-the original (grid discretisation noise) but rejects beneficial detours
-from being collapsed into a slower straight line — e.g., a route that
-deliberately goes into a favorable current band should not be straightened
-away from it.
+the original (grid discretisation noise) but rejects beneficial detours —
+a route that deliberately enters a favorable current band should not be
+straightened away from it.
 
-`travel_time` is computed by `_segment_travel_time`, which sub-samples
-the segment at ~1 resolution-length intervals and accounts for currents
-(and polar/wind) along the way.
+`travel_time` is computed by `_segment_travel_time`, which sub-samples the
+segment at ~1 resolution-length intervals and accounts for currents (and
+polar/wind) along the way.
 
 ### Pass 2: Stub removal (`_remove_stubs`)
 
@@ -367,14 +649,13 @@ branching off at a large angle.  `_remove_stubs` scans for waypoints where:
 - One adjacent leg is > 3× shorter than the other, **and**
 - The turn angle at that waypoint exceeds 45°.
 
-Such points are dropped.  The scan repeats (`while changed`) until no more
-stubs are found.  The "previous" point used for leg-angle calculation is
-always the last **kept** point (not the raw index), so consecutive stubs
-are handled correctly.
+Such points are dropped.  The scan repeats until no more stubs are found.
+The "previous" point used for leg-angle calculation is always the last **kept**
+point (not the raw index), so consecutive stubs are handled correctly.
 
 ---
 
-## 10. Ground-Track Simulation
+## 13. Ground-Track Simulation
 
 `simulate_track()` now **densifies the solved route polyline** rather than
 free-integrating a separate steering simulation.  This is still purely for
@@ -397,7 +678,7 @@ This produces a dense ground-track polyline that:
 
 ---
 
-## 11. CLI Usage
+## 14. CLI Usage
 
 ```
 python sail_routing.py \
@@ -433,7 +714,7 @@ the loaded frames.
 
 ---
 
-## 12. Testing
+## 15. Testing
 
 `test_sail_routing.py` has 86 pytest tests across 19 test classes, all
 using **synthetic current fields** (no SSCOFS download required):
@@ -459,6 +740,12 @@ using **synthetic current fields** (no SSCOFS download required):
 | `TestTackingPenalty` | Penalty logic, angle precomputation |
 | `TestRouteQuality` | No Y-junctions, no backward progress, no stubs |
 | `TestSimulatedTrack` | Exported track continuity, timing, no teleports |
+| `TestSectorRouterBasic` | Straight north/diagonal routes on synthetic field |
+| `TestSectorRouterWithCurrent` | Favorable/opposing current affects SOG correctly |
+| `TestSectorRouterLandAvoidance` | Routes around land obstacles |
+| `TestSectorRouterTackingPenalty` | Tack penalty raises cost vs no-penalty baseline |
+| `TestSectorRouterHeadingDiversity` | All 16 sectors get at least one neighbor |
+| `TestSectorRouterRouteQuality` | Waypoints progress toward goal; simulated track timing |
 
 Run with:
 
@@ -477,7 +764,7 @@ python viz_test_scenarios.py   # saves test_viz_*.png in current directory
 
 ---
 
-## 13. Known Limitations and Future Work
+## 16. Known Limitations and Future Work
 
 ### Routing grid is fixed
 

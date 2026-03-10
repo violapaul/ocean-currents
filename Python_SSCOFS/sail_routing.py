@@ -1002,6 +1002,54 @@ def _solve_heading_full(d_hat_x, d_hat_y, cu, cv, wind_u, wind_v,
 
 
 # ===================================================================
+#  Mesh adjacency helper for MeshRouter
+# ===================================================================
+
+def build_mesh_adjacency(delaunay, valid_mask):
+    """Extract node adjacency and edge distances from a Delaunay triangulation.
+
+    An edge exists between nodes a and b if they share a valid water triangle.
+    This produces the navigation graph for mesh-based A* routing.
+
+    Parameters
+    ----------
+    delaunay : scipy.spatial.Delaunay
+        Delaunay triangulation of SSCOFS element centers.
+    valid_mask : ndarray of bool
+        True for water triangles, False for land-spanning triangles.
+
+    Returns
+    -------
+    adj : dict[int, set[int]]
+        Adjacency list: adj[node_id] -> set of neighbor node_ids.
+    edge_dist : dict[tuple[int,int], float]
+        Edge distances in the same units as delaunay.points (typically UTM metres).
+        Keys are (min(a,b), max(a,b)) for canonical ordering.
+    """
+    from collections import defaultdict
+
+    adj = defaultdict(set)
+    edge_dist = {}
+    points = delaunay.points
+    simplices = delaunay.simplices
+
+    for t in range(len(simplices)):
+        if not valid_mask[t]:
+            continue
+        v0, v1, v2 = simplices[t]
+        for a, b in [(v0, v1), (v1, v2), (v2, v0)]:
+            adj[a].add(b)
+            adj[b].add(a)
+            key = (min(a, b), max(a, b))
+            if key not in edge_dist:
+                dx = points[b, 0] - points[a, 0]
+                dy = points[b, 1] - points[a, 1]
+                edge_dist[key] = np.hypot(dx, dy)
+
+    return dict(adj), edge_dist
+
+
+# ===================================================================
 #  Router -- time-dependent A* on a regular grid
 # ===================================================================
 
@@ -1398,7 +1446,7 @@ class Router:
     # ------------------------------------------------------------------
 
     def find_route(self, start_latlon, end_latlon, start_time_s=0.0,
-                   max_iterations=2_000_000):
+                   max_iterations=2_000_000, return_debug=False):
         """Find the time-optimal route between two lat/lon points.
 
         Parameters
@@ -1410,10 +1458,13 @@ class Router:
         max_iterations : int
             Hard limit on A* iterations to prevent runaway searches.
             Raises RuntimeError if exceeded.
+        return_debug : bool
+            If True, returns a 5th element: dict with 'raw_path_rc',
+            'smoothed_path_rc', 'xs', 'ys', 'water_mask'.
 
         Returns
         -------
-        Route
+        (Route, xs, ys, water_mask[, debug_info])
         """
         t_wall_0 = _time.monotonic()
 
@@ -1593,6 +1644,17 @@ class Router:
         print(f"\nA* completed in {wall_s:.2f}s, explored {explored} nodes")
         print(f"Path smoothing: {n_raw} -> {n_smooth} waypoints")
         print(route.summary())
+
+        if return_debug:
+            debug_info = {
+                'raw_path_rc': raw_path_rc,
+                'smoothed_path_rc': path_rc,
+                'xs': xs,
+                'ys': ys,
+                'water_mask': water_mask,
+            }
+            return route, xs, ys, water_mask, debug_info
+
         return route, xs, ys, water_mask
 
     # ------------------------------------------------------------------
@@ -1726,166 +1788,1537 @@ Router._ANGLE_DIFF = Router._build_angle_diff()
 
 
 # ===================================================================
+#  MeshRouter -- time-dependent A* on the SSCOFS Delaunay mesh
+# ===================================================================
+
+class MeshRouter:
+    """Find the time-optimal route using A* directly on the SSCOFS mesh.
+
+    Instead of overlaying a regular grid, this router uses the natural
+    Delaunay triangulation of SSCOFS element centers as the search graph.
+    Edges connect nodes that share a valid water triangle. This provides:
+
+    - Exact velocity at nodes (no IDW interpolation for edge costs)
+    - Adaptive resolution (dense near coast, coarser in open water)
+    - Alignment with the same water boundary used for display
+
+    State space is (node_id, bearing_bucket) where bearing_bucket quantizes
+    the incoming direction into 16 bins (22.5 deg each) for tacking penalty.
+    """
+
+    N_BEARING_BUCKETS = 16
+    BEARING_BUCKET_DEG = 360.0 / N_BEARING_BUCKETS
+    START_SENTINEL = N_BEARING_BUCKETS  # bucket index for start node
+
+    def __init__(self, current_field: CurrentField, boat: BoatModel,
+                 wind: 'WindField | None' = None,
+                 tack_penalty_s: float = 60.0,
+                 tack_threshold_deg: float = 90.0):
+        """
+        Parameters
+        ----------
+        current_field : CurrentField
+            Must have delaunay and valid_triangle attributes set.
+        boat : BoatModel
+            Boat performance model.
+        wind : WindField, optional
+            Wind field for polar-based routing.
+        tack_penalty_s : float
+            Time penalty (seconds) added for course changes > tack_threshold_deg.
+        tack_threshold_deg : float
+            Minimum angle change that triggers tack penalty.
+        """
+        self.cf = current_field
+        self.boat = boat
+        self.wind = wind
+        self.tack_penalty_s = tack_penalty_s
+        self.tack_threshold_deg = tack_threshold_deg
+
+        if current_field.delaunay is None or current_field.valid_triangle is None:
+            raise ValueError("CurrentField must have Delaunay triangulation for MeshRouter")
+
+        self.adj, self.edge_dist = build_mesh_adjacency(
+            current_field.delaunay, current_field.valid_triangle)
+
+        self.node_x = current_field._x_utm
+        self.node_y = current_field._y_utm
+        self.n_nodes = len(self.node_x)
+
+    @property
+    def _use_polar(self):
+        return self.wind is not None and self.boat.polar is not None
+
+    def _bearing_bucket(self, dx, dy):
+        """Convert a direction vector to a bearing bucket index (0-15)."""
+        angle_deg = np.degrees(np.arctan2(dx, dy)) % 360.0
+        return int(angle_deg / self.BEARING_BUCKET_DEG) % self.N_BEARING_BUCKETS
+
+    def _bucket_angle_diff(self, bucket1, bucket2):
+        """Compute minimum angle difference between two bearing buckets."""
+        if bucket1 == self.START_SENTINEL or bucket2 == self.START_SENTINEL:
+            return 0.0
+        diff = abs(bucket1 - bucket2)
+        if diff > self.N_BEARING_BUCKETS // 2:
+            diff = self.N_BEARING_BUCKETS - diff
+        return diff * self.BEARING_BUCKET_DEG
+
+    def _interpolate_velocity(self, node_a, node_b, elapsed_s):
+        """Get current velocity at edge midpoint via direct node lookup.
+
+        Uses time interpolation between frames, but no spatial IDW.
+        Returns (cu, cv) in m/s.
+        """
+        cf = self.cf
+        t = np.clip(elapsed_s, cf.frame_times[0], cf.frame_times[-1])
+
+        if cf.n_frames == 1:
+            ua = cf.u_frames[0][node_a]
+            va = cf.v_frames[0][node_a]
+            ub = cf.u_frames[0][node_b]
+            vb = cf.v_frames[0][node_b]
+        else:
+            idx = np.searchsorted(cf.frame_times, t, side='right') - 1
+            idx = int(np.clip(idx, 0, cf.n_frames - 2))
+            t0 = cf.frame_times[idx]
+            t1 = cf.frame_times[idx + 1]
+            alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+
+            ua = cf.u_frames[idx][node_a] * (1 - alpha) + cf.u_frames[idx + 1][node_a] * alpha
+            va = cf.v_frames[idx][node_a] * (1 - alpha) + cf.v_frames[idx + 1][node_a] * alpha
+            ub = cf.u_frames[idx][node_b] * (1 - alpha) + cf.u_frames[idx + 1][node_b] * alpha
+            vb = cf.v_frames[idx][node_b] * (1 - alpha) + cf.v_frames[idx + 1][node_b] * alpha
+
+        cu = 0.5 * (ua + ub)
+        cv = 0.5 * (va + vb)
+        return cu, cv
+
+    def _edge_cost(self, node_a, node_b, arrival_time_s):
+        """Compute travel time (seconds) from node_a to node_b.
+
+        Returns np.inf if the edge is impassable.
+        """
+        x1, y1 = self.node_x[node_a], self.node_y[node_a]
+        x2, y2 = self.node_x[node_b], self.node_y[node_b]
+
+        dx = x2 - x1
+        dy = y2 - y1
+        dist = np.hypot(dx, dy)
+        if dist < 1e-6:
+            return 0.0
+
+        d_hat_x = dx / dist
+        d_hat_y = dy / dist
+
+        cu, cv = self._interpolate_velocity(node_a, node_b, arrival_time_s)
+
+        if self._use_polar:
+            mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+            wu, wv = self.wind.query(mx, my, elapsed_s=arrival_time_s)
+            v_sog = _solve_heading(d_hat_x, d_hat_y, cu, cv, wu, wv, self.boat)
+            if v_sog <= 0.01:
+                return np.inf
+            return dist / v_sog
+
+        v_sog = _fixed_speed_sog(d_hat_x, d_hat_y, cu, cv, self.boat.speed())
+        if not np.isfinite(v_sog):
+            return np.inf
+        return dist / v_sog
+
+    def _heuristic(self, node, goal_x, goal_y, max_speed):
+        """Admissible heuristic: straight-line distance / max possible speed."""
+        dx = goal_x - self.node_x[node]
+        dy = goal_y - self.node_y[node]
+        return np.hypot(dx, dy) / max_speed
+
+    def _segment_travel_time(self, x1, y1, x2, y2, start_time_s, n_samples=10):
+        """Compute travel time along a straight segment using CurrentField.query.
+
+        Used for path smoothing and ground-track simulation where we need
+        continuous spatial queries (not just at mesh nodes).
+        """
+        dist = np.hypot(x2 - x1, y2 - y1)
+        if dist < 1e-6:
+            return 0.0, dist
+
+        d_hat_x = (x2 - x1) / dist
+        d_hat_y = (y2 - y1) / dist
+
+        seg_len = dist / n_samples
+        elapsed = start_time_s
+        total_time = 0.0
+
+        for i in range(n_samples):
+            frac = (i + 0.5) / n_samples
+            mx = x1 + frac * (x2 - x1)
+            my = y1 + frac * (y2 - y1)
+
+            cu, cv = self.cf.query(mx, my, elapsed_s=elapsed)
+            if np.isnan(cu):
+                return np.inf, dist
+
+            if self._use_polar:
+                wu, wv = self.wind.query(mx, my, elapsed_s=elapsed)
+                v_sog = _solve_heading(d_hat_x, d_hat_y, cu, cv, wu, wv, self.boat)
+                if v_sog <= 0.01:
+                    return np.inf, dist
+            else:
+                v_sog = _fixed_speed_sog(d_hat_x, d_hat_y, cu, cv, self.boat.speed())
+                if not np.isfinite(v_sog):
+                    return np.inf, dist
+
+            dt = seg_len / v_sog
+            total_time += dt
+            elapsed += dt
+
+        return total_time, dist
+
+    def _line_of_sight(self, x1, y1, x2, y2, n_samples=20):
+        """Check if a straight line between two points crosses land.
+
+        Samples points along the line and checks CurrentField.query for NaN.
+        Returns True if all samples are over water.
+        """
+        for i in range(n_samples + 1):
+            frac = i / n_samples
+            mx = x1 + frac * (x2 - x1)
+            my = y1 + frac * (y2 - y1)
+            cu, _ = self.cf.query(mx, my, elapsed_s=0.0)
+            if np.isnan(cu):
+                return False
+        return True
+
+    def _smooth_path(self, path_nodes, arrival_times):
+        """Remove unnecessary waypoints via greedy string-pulling.
+
+        A shortcut is accepted if:
+        1. Line-of-sight check passes (no land)
+        2. Travel time via shortcut is no worse than original path segments
+        """
+        if len(path_nodes) <= 2:
+            return path_nodes
+
+        smoothed = [path_nodes[0]]
+        smoothed_times = [arrival_times[0]]
+        i = 0
+
+        while i < len(path_nodes) - 1:
+            best_j = i + 1
+            best_time = arrival_times[i + 1] - arrival_times[i]
+
+            for j in range(i + 2, len(path_nodes)):
+                x1 = self.node_x[path_nodes[i]]
+                y1 = self.node_y[path_nodes[i]]
+                x2 = self.node_x[path_nodes[j]]
+                y2 = self.node_y[path_nodes[j]]
+
+                if not self._line_of_sight(x1, y1, x2, y2):
+                    break
+
+                shortcut_time, _ = self._segment_travel_time(
+                    x1, y1, x2, y2, smoothed_times[-1])
+                original_time = arrival_times[j] - arrival_times[i]
+
+                if np.isfinite(shortcut_time) and shortcut_time <= original_time * 1.05:
+                    best_j = j
+                    best_time = shortcut_time
+
+            smoothed.append(path_nodes[best_j])
+            smoothed_times.append(smoothed_times[-1] + best_time)
+            i = best_j
+
+        return smoothed
+
+    def _remove_stubs(self, path_nodes):
+        """Remove stub waypoints that create Y-junctions.
+
+        A stub is an intermediate waypoint where one adjacent leg is much
+        shorter than the other and the turn angle is large.
+        """
+        if len(path_nodes) <= 2:
+            return path_nodes
+
+        result = [path_nodes[0]]
+        for i in range(1, len(path_nodes) - 1):
+            prev_node = result[-1]
+            curr_node = path_nodes[i]
+            next_node = path_nodes[i + 1]
+
+            x0, y0 = self.node_x[prev_node], self.node_y[prev_node]
+            x1, y1 = self.node_x[curr_node], self.node_y[curr_node]
+            x2, y2 = self.node_x[next_node], self.node_y[next_node]
+
+            leg_in = np.hypot(x1 - x0, y1 - y0)
+            leg_out = np.hypot(x2 - x1, y2 - y1)
+
+            if leg_in < 1e-6 or leg_out < 1e-6:
+                result.append(curr_node)
+                continue
+
+            ratio = max(leg_in, leg_out) / min(leg_in, leg_out)
+
+            v_in = ((x1 - x0) / leg_in, (y1 - y0) / leg_in)
+            v_out = ((x2 - x1) / leg_out, (y2 - y1) / leg_out)
+            dot = v_in[0] * v_out[0] + v_in[1] * v_out[1]
+            turn_angle = np.degrees(np.arccos(np.clip(dot, -1.0, 1.0)))
+
+            is_stub = ratio > 3.0 and turn_angle > 45.0
+
+            if is_stub and self._line_of_sight(x0, y0, x2, y2):
+                shortcut_time, _ = self._segment_travel_time(x0, y0, x2, y2, 0.0)
+                if np.isfinite(shortcut_time):
+                    continue
+            result.append(curr_node)
+
+        result.append(path_nodes[-1])
+        return result
+
+    def find_route(self, start_latlon, end_latlon, start_time_s=0.0,
+                   max_iterations=2_000_000, return_debug=False):
+        """Find the time-optimal route between two lat/lon points.
+
+        Parameters
+        ----------
+        start_latlon : (lat, lon)
+        end_latlon : (lat, lon)
+        start_time_s : float
+            Elapsed seconds from the forecast reference time at departure.
+        max_iterations : int
+            Hard limit on A* iterations.
+        return_debug : bool
+            If True, returns a 5th element: dict with 'raw_path' (node ids),
+            'raw_times', and 'explored_nodes' (set of node ids).
+
+        Returns
+        -------
+        (Route, xs, ys, water_mask[, debug_info])
+        """
+        t_wall_0 = _time.monotonic()
+
+        transformer = self.cf.transformer
+        sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
+        ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
+
+        _, start_node = self.cf.tree.query([sx, sy])
+        _, end_node = self.cf.tree.query([ex, ey])
+        start_node = int(start_node)
+        end_node = int(end_node)
+
+        if start_node not in self.adj:
+            raise ValueError(f"Start point snapped to isolated node {start_node}")
+        if end_node not in self.adj:
+            raise ValueError(f"End point snapped to isolated node {end_node}")
+
+        goal_x, goal_y = self.node_x[end_node], self.node_y[end_node]
+        boat_speed = self.boat.speed()
+        max_speed = boat_speed + self.cf.max_current_speed
+
+        print(f"MeshRouter: {self.n_nodes:,} nodes, {len(self.adj):,} with edges")
+        print(f"Start node: {start_node}, End node: {end_node}")
+
+        INF = float('inf')
+        N_BUCKETS = self.N_BEARING_BUCKETS + 1
+
+        best_cost = {}
+        came_from = {}
+        arrival_time = {}
+
+        start_state = (start_node, self.START_SENTINEL)
+        best_cost[start_state] = 0.0
+        arrival_time[start_state] = start_time_s
+
+        open_set = [(self._heuristic(start_node, goal_x, goal_y, max_speed),
+                     0.0, start_node, self.START_SENTINEL)]
+        explored = 0
+        explored_nodes = set()
+
+        while open_set:
+            if explored >= max_iterations:
+                raise RuntimeError(f"A* exceeded {max_iterations} iterations")
+
+            _, cost, node, bucket_in = heapq.heappop(open_set)
+            state = (node, bucket_in)
+
+            if cost > best_cost.get(state, INF):
+                continue
+
+            explored += 1
+            explored_nodes.add(node)
+
+            if node == end_node:
+                break
+
+            arr_t = arrival_time[state]
+
+            for neighbor in self.adj.get(node, []):
+                dx = self.node_x[neighbor] - self.node_x[node]
+                dy = self.node_y[neighbor] - self.node_y[node]
+                bucket_out = self._bearing_bucket(dx, dy)
+
+                dt = self._edge_cost(node, neighbor, arr_t)
+                if dt == INF:
+                    continue
+
+                penalty = 0.0
+                angle_diff = self._bucket_angle_diff(bucket_in, bucket_out)
+                if self.tack_penalty_s > 0 and angle_diff > self.tack_threshold_deg:
+                    penalty = self.tack_penalty_s
+
+                new_cost = cost + dt + penalty
+                new_state = (neighbor, bucket_out)
+
+                if new_cost < best_cost.get(new_state, INF):
+                    best_cost[new_state] = new_cost
+                    arrival_time[new_state] = arr_t + dt
+                    came_from[new_state] = state
+                    h = self._heuristic(neighbor, goal_x, goal_y, max_speed)
+                    heapq.heappush(open_set, (new_cost + h, new_cost, neighbor, bucket_out))
+
+        goal_states = [(best_cost.get((end_node, b), INF), b)
+                       for b in range(N_BUCKETS)]
+        best_goal_cost, final_bucket = min(goal_states)
+
+        if best_goal_cost == INF:
+            raise RuntimeError("No path found between start and end")
+
+        raw_path = []
+        raw_times = []
+        state = (end_node, final_bucket)
+        while state in came_from or state == start_state:
+            node, _ = state
+            raw_path.append(node)
+            raw_times.append(arrival_time.get(state, start_time_s))
+            if state == start_state:
+                break
+            state = came_from.get(state)
+            if state is None:
+                break
+        raw_path.reverse()
+        raw_times.reverse()
+
+        path_nodes = self._smooth_path(raw_path, raw_times)
+        path_nodes = self._remove_stubs(path_nodes)
+
+        inv_transformer = Transformer.from_crs(
+            transformer.target_crs, transformer.source_crs, always_xy=True)
+
+        def _compute_leg_times(nodes):
+            """Compute leg times for a list of path nodes."""
+            wps = [(self.node_x[n], self.node_y[n]) for n in nodes]
+            times = []
+            dists = []
+            t = start_time_s
+            for k in range(len(wps) - 1):
+                x1, y1 = wps[k]
+                x2, y2 = wps[k + 1]
+                t_seg, d_seg = self._segment_travel_time(x1, y1, x2, y2, t)
+                times.append(t_seg)
+                dists.append(d_seg)
+                t += t_seg
+            return wps, times, dists
+
+        def _use_astar_times(nodes, arr_times):
+            """Use the A* arrival times directly (fallback)."""
+            wps = [(self.node_x[n], self.node_y[n]) for n in nodes]
+            times = []
+            dists = []
+            for k in range(len(wps) - 1):
+                x1, y1 = wps[k]
+                x2, y2 = wps[k + 1]
+                dists.append(np.hypot(x2 - x1, y2 - y1))
+                times.append(arr_times[k + 1] - arr_times[k])
+            return wps, times, dists
+
+        waypoints_utm, leg_times, leg_dists = _compute_leg_times(path_nodes)
+        total_time = sum(leg_times)
+
+        if not np.isfinite(total_time):
+            path_nodes = raw_path
+            waypoints_utm, leg_times, leg_dists = _use_astar_times(path_nodes, raw_times)
+            total_time = sum(leg_times)
+
+        total_dist = sum(leg_dists)
+        avg_sog = (total_dist / total_time * MS_TO_KNOTS) if total_time > 0 and np.isfinite(total_time) else 0.0
+
+        waypoints_latlon = []
+        for x, y in waypoints_utm:
+            lon, lat = inv_transformer.transform(x, y)
+            waypoints_latlon.append((lat, lon))
+
+        sim_track, sim_track_times = self._simulate_track(waypoints_utm, start_time_s)
+
+        route = Route(
+            waypoints_utm=waypoints_utm,
+            waypoints_latlon=waypoints_latlon,
+            leg_times_s=leg_times,
+            leg_distances_m=leg_dists,
+            total_time_s=total_time,
+            total_distance_m=total_dist,
+            avg_sog_knots=avg_sog,
+            boat_speed_knots=self.boat.base_speed_knots,
+            nodes_explored=explored,
+            simulated_track=sim_track,
+            simulated_track_times=sim_track_times,
+        )
+
+        xs, ys, water_mask = self._build_grid_for_plotting(
+            waypoints_utm, start_latlon, end_latlon)
+
+        wall_s = _time.monotonic() - t_wall_0
+        n_raw = len(raw_path)
+        n_smooth = len(path_nodes)
+        print(f"\nMesh A* completed in {wall_s:.2f}s, explored {explored} nodes")
+        print(f"Path smoothing: {n_raw} -> {n_smooth} waypoints")
+        print(route.summary())
+
+        if return_debug:
+            debug_info = {
+                'raw_path': raw_path,
+                'raw_times': raw_times,
+                'explored_nodes': explored_nodes,
+                'smoothed_path': path_nodes,
+            }
+            return route, xs, ys, water_mask, debug_info
+
+        return route, xs, ys, water_mask
+
+    def _simulate_track(self, waypoints_utm, start_time_s, dt_s=10.0):
+        """Sample the ground track into a dense time series."""
+        if len(waypoints_utm) < 2:
+            return list(waypoints_utm), [start_time_s] * len(waypoints_utm)
+
+        track = []
+        track_times = []
+        elapsed = start_time_s
+        px, py = waypoints_utm[0]
+        track.append((px, py))
+        track_times.append(elapsed)
+
+        for wp_idx in range(1, len(waypoints_utm)):
+            tx, ty = waypoints_utm[wp_idx]
+            seg_time, seg_dist = self._segment_travel_time(px, py, tx, ty, elapsed)
+
+            if not np.isfinite(seg_time) or seg_dist < 1e-6:
+                px, py = tx, ty
+                track.append((px, py))
+                track_times.append(elapsed)
+                continue
+
+            n_steps = max(1, int(np.ceil(seg_time / dt_s)),
+                          int(np.ceil(seg_dist / 150.0)))
+
+            x0, y0 = px, py
+            for step_idx in range(1, n_steps + 1):
+                alpha = step_idx / n_steps
+                px = x0 + alpha * (tx - x0)
+                py = y0 + alpha * (ty - y0)
+                t = elapsed + alpha * seg_time
+                track.append((px, py))
+                track_times.append(t)
+
+            elapsed += seg_time
+
+        return track, track_times
+
+    def _build_grid_for_plotting(self, waypoints_utm, start_latlon, end_latlon,
+                                  resolution=300.0, padding=2000.0):
+        """Generate a regular grid overlay for plot_route compatibility."""
+        transformer = self.cf.transformer
+        sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
+        ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
+
+        all_x = [sx, ex] + [p[0] for p in waypoints_utm]
+        all_y = [sy, ey] + [p[1] for p in waypoints_utm]
+
+        x0 = min(all_x) - padding
+        x1 = max(all_x) + padding
+        y0 = min(all_y) - padding
+        y1 = max(all_y) + padding
+
+        xs = np.arange(x0, x1 + resolution, resolution)
+        ys = np.arange(y0, y1 + resolution, resolution)
+
+        u_grid, v_grid = self.cf.query_grid(xs, ys, elapsed_s=0.0)
+        water_mask = ~np.isnan(u_grid)
+
+        return xs, ys, water_mask
+
+    def straight_line_time(self, start_latlon, end_latlon, start_time_s=0.0):
+        """Estimate travel time along a straight line."""
+        transformer = self.cf.transformer
+        sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
+        ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
+
+        total_time, total_dist = self._segment_travel_time(
+            sx, sy, ex, ey, start_time_s, n_samples=50)
+        return total_time, total_dist
+
+
+# ===================================================================
+#  SectorRouter: Heading-binned connectivity on SSCOFS nodes
+# ===================================================================
+
+class SectorRouter:
+    """Find the time-optimal route using A* with heading-binned connectivity.
+
+    Instead of using raw Delaunay mesh adjacency (which is tied to the PDE
+    mesh topology), this router connects each SSCOFS node to the nearest
+    reachable neighbor in each of 16 heading sectors (22.5 deg each).
+
+    This gives the A* 16 angular choices at every decision point, decoupling
+    the navigation action lattice from the hydrodynamics mesh while still
+    using SSCOFS element centers as routing nodes (inheriting their adaptive
+    density: ~100m near shore, ~500m offshore).
+
+    Key differences from MeshRouter:
+    - Connectivity: 16 heading sectors vs. Delaunay edge adjacency
+    - Edge cost: CurrentField.query at midpoint vs. averaged node velocities
+    - Graph build: Lazy (during A*) vs. eager (all edges upfront)
+    - Path quality: Directly steerable headings vs. mesh topology wobble
+    """
+
+    N_SECTORS = 16
+    SECTOR_WIDTH = 360.0 / N_SECTORS  # 22.5 deg
+    START_SENTINEL = N_SECTORS  # sector index for start node (no incoming)
+    SMOOTH_TACK_THRESHOLD_DEG = 45.0   # turns >= this are tack waypoints
+    SMOOTH_DP_EPSILON_M = 120.0        # DP perpendicular tolerance within curved segments
+    SMOOTH_MIN_TACK_SPACING_M = 400.0  # minimum distance between consecutive tack waypoints
+
+    def __init__(self, current_field: CurrentField, boat: BoatModel,
+                 wind: 'WindField | None' = None,
+                 tack_penalty_s: float = 60.0,
+                 tack_threshold_deg: float = 90.0,
+                 max_edge_m: float = 2000.0,
+                 min_edge_m: float = 50.0,
+                 k_candidates: int = 50):
+        """
+        Parameters
+        ----------
+        current_field : CurrentField
+            Must have tree (KD-tree) and _x_utm, _y_utm arrays.
+        boat : BoatModel
+            Boat performance model.
+        wind : WindField, optional
+            Wind field for polar-based routing.
+        tack_penalty_s : float
+            Time penalty (seconds) for course changes > tack_threshold_deg.
+        tack_threshold_deg : float
+            Minimum angle change that triggers tack penalty.
+        max_edge_m : float
+            Maximum edge length in meters.
+        min_edge_m : float
+            Minimum edge length in meters (skip very short edges).
+        k_candidates : int
+            Number of KD-tree neighbors to consider when filling sectors.
+        """
+        self.cf = current_field
+        self.boat = boat
+        self.wind = wind
+        self.tack_penalty_s = tack_penalty_s
+        self.tack_threshold_deg = tack_threshold_deg
+        self.max_edge_m = max_edge_m
+        self.min_edge_m = min_edge_m
+        self.k_candidates = k_candidates
+
+        if current_field.tree is None:
+            raise ValueError("CurrentField must have KD-tree for SectorRouter")
+
+        self.node_x = current_field._x_utm
+        self.node_y = current_field._y_utm
+        self.n_nodes = len(self.node_x)
+
+        # Lazy neighbor cache: node_id -> list of (neighbor_id, sector, distance)
+        self._neighbor_cache = {}
+
+        # Line-of-sight samples per edge
+        self._los_samples = 15
+
+    @property
+    def _use_polar(self):
+        return self.wind is not None and self.boat.polar is not None
+
+    def _bearing_to_sector(self, dx, dy):
+        """Convert a direction vector to a sector index (0-15).
+
+        Sector 0 is centered on North (0 deg), sector 4 on East (90 deg), etc.
+        """
+        angle_deg = np.degrees(np.arctan2(dx, dy)) % 360.0
+        return int(angle_deg / self.SECTOR_WIDTH) % self.N_SECTORS
+
+    def _sector_angle_diff(self, sector1, sector2):
+        """Compute minimum angle difference between two sectors."""
+        if sector1 == self.START_SENTINEL or sector2 == self.START_SENTINEL:
+            return 0.0
+        diff = abs(sector1 - sector2)
+        if diff > self.N_SECTORS // 2:
+            diff = self.N_SECTORS - diff
+        return diff * self.SECTOR_WIDTH
+
+    def _line_of_sight(self, x1, y1, x2, y2):
+        """Check if a straight line between two points crosses land.
+
+        Samples points along the line and checks CurrentField.query for NaN.
+        Returns True if all samples are over water.
+        """
+        n = self._los_samples
+        for i in range(n + 1):
+            frac = i / n
+            mx = x1 + frac * (x2 - x1)
+            my = y1 + frac * (y2 - y1)
+            cu, _ = self.cf.query(mx, my, elapsed_s=0.0)
+            if np.isnan(cu):
+                return False
+        return True
+
+    def _find_sector_neighbors(self, node_id):
+        """Find reachable neighbors in each of 16 heading sectors.
+
+        Uses KD-tree to find candidate neighbors, assigns each to a sector,
+        keeps the nearest valid candidate per sector.
+
+        Returns list of (neighbor_id, sector, distance) tuples.
+        """
+        if node_id in self._neighbor_cache:
+            return self._neighbor_cache[node_id]
+
+        x0 = self.node_x[node_id]
+        y0 = self.node_y[node_id]
+
+        # Query k_candidates nearest neighbors
+        dists, idxs = self.cf.tree.query([x0, y0], k=self.k_candidates)
+        dists = np.atleast_1d(dists)
+        idxs = np.atleast_1d(idxs)
+
+        # Best candidate per sector: sector -> (neighbor_id, distance)
+        sector_best = {}
+
+        for d, idx in zip(dists, idxs):
+            idx = int(idx)
+            if idx == node_id:
+                continue
+            if d < self.min_edge_m or d > self.max_edge_m:
+                continue
+
+            x1 = self.node_x[idx]
+            y1 = self.node_y[idx]
+            dx = x1 - x0
+            dy = y1 - y0
+            sector = self._bearing_to_sector(dx, dy)
+
+            if sector not in sector_best or d < sector_best[sector][1]:
+                sector_best[sector] = (idx, d)
+
+        # Validate each sector's best candidate with line-of-sight
+        neighbors = []
+        for sector, (idx, d) in sector_best.items():
+            x1 = self.node_x[idx]
+            y1 = self.node_y[idx]
+            if self._line_of_sight(x0, y0, x1, y1):
+                neighbors.append((idx, sector, d))
+
+        self._neighbor_cache[node_id] = neighbors
+        return neighbors
+
+    def _edge_cost(self, node_a, node_b, dist, arrival_time_s):
+        """Compute travel time (seconds) from node_a to node_b.
+
+        Uses CurrentField.query at edge midpoint for current velocity.
+        Returns np.inf if the edge is impassable.
+        """
+        x1, y1 = self.node_x[node_a], self.node_y[node_a]
+        x2, y2 = self.node_x[node_b], self.node_y[node_b]
+
+        if dist < 1e-6:
+            return 0.0
+
+        d_hat_x = (x2 - x1) / dist
+        d_hat_y = (y2 - y1) / dist
+
+        # Query current at edge midpoint
+        mx, my = 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+        cu, cv = self.cf.query(mx, my, elapsed_s=arrival_time_s)
+
+        if np.isnan(cu):
+            return np.inf
+
+        if self._use_polar:
+            wu, wv = self.wind.query(mx, my, elapsed_s=arrival_time_s)
+            v_sog = _solve_heading(d_hat_x, d_hat_y, cu, cv, wu, wv, self.boat)
+            if v_sog <= 0.01:
+                return np.inf
+            return dist / v_sog
+
+        v_sog = _fixed_speed_sog(d_hat_x, d_hat_y, cu, cv, self.boat.speed())
+        if not np.isfinite(v_sog):
+            return np.inf
+        return dist / v_sog
+
+    def _heuristic(self, node, goal_x, goal_y, max_speed):
+        """Admissible heuristic: straight-line distance / max possible speed."""
+        dx = goal_x - self.node_x[node]
+        dy = goal_y - self.node_y[node]
+        return np.hypot(dx, dy) / max_speed
+
+    def _segment_travel_time(self, x1, y1, x2, y2, start_time_s, n_samples=10):
+        """Compute travel time along a straight segment using CurrentField.query.
+
+        Used for path smoothing and ground-track simulation.
+        """
+        dist = np.hypot(x2 - x1, y2 - y1)
+        if dist < 1e-6:
+            return 0.0, dist
+
+        d_hat_x = (x2 - x1) / dist
+        d_hat_y = (y2 - y1) / dist
+
+        seg_len = dist / n_samples
+        elapsed = start_time_s
+        total_time = 0.0
+
+        for i in range(n_samples):
+            frac = (i + 0.5) / n_samples
+            mx = x1 + frac * (x2 - x1)
+            my = y1 + frac * (y2 - y1)
+
+            cu, cv = self.cf.query(mx, my, elapsed_s=elapsed)
+            if np.isnan(cu):
+                return np.inf, dist
+
+            if self._use_polar:
+                wu, wv = self.wind.query(mx, my, elapsed_s=elapsed)
+                v_sog = _solve_heading(d_hat_x, d_hat_y, cu, cv, wu, wv, self.boat)
+                if v_sog <= 0.01:
+                    return np.inf, dist
+            else:
+                v_sog = _fixed_speed_sog(d_hat_x, d_hat_y, cu, cv, self.boat.speed())
+                if not np.isfinite(v_sog):
+                    return np.inf, dist
+
+            dt = seg_len / v_sog
+            total_time += dt
+            elapsed += dt
+
+        return total_time, dist
+
+    def _smooth_path(self, path_nodes, arrival_times,
+                      tack_threshold_deg=None, dp_epsilon_m=None,
+                      min_tack_spacing_m=None):
+        """Two-pass path simplification: preserve tacks, simplify curves.
+
+        Sailing routes have two kinds of heading changes:
+        - **Tacks** (genuine course changes, ~45-90°): must be preserved
+        - **Natural curves** (gradual drift from current/shore, 0-20°): simplified
+
+        Algorithm:
+        1. Find all raw tack points (turn angle >= tack_threshold_deg)
+        2. Merge nearby tacks: skip tacks < min_tack_spacing_m from the previous
+           kept tack (prevents consecutive rapid-fire tacks each becoming a wpt)
+        3. Apply Douglas-Peucker within each inter-tack segment to simplify curves
+
+        Parameters
+        ----------
+        tack_threshold_deg : float
+            Turn angles at or above this are tacks (default 45°).
+        dp_epsilon_m : float
+            DP perpendicular tolerance within curved segments (default 120m).
+        min_tack_spacing_m : float
+            Minimum distance between consecutive tack waypoints (default 400m).
+        """
+        if tack_threshold_deg is None:
+            tack_threshold_deg = self.SMOOTH_TACK_THRESHOLD_DEG
+        if dp_epsilon_m is None:
+            dp_epsilon_m = self.SMOOTH_DP_EPSILON_M
+        if min_tack_spacing_m is None:
+            min_tack_spacing_m = self.SMOOTH_MIN_TACK_SPACING_M
+
+        if len(path_nodes) <= 2:
+            return path_nodes
+
+        px = np.array([self.node_x[n] for n in path_nodes])
+        py = np.array([self.node_y[n] for n in path_nodes])
+        n = len(path_nodes)
+
+        # Cumulative distance along path
+        seg_dists = np.hypot(np.diff(px), np.diff(py))
+        cum_dist  = np.concatenate([[0.0], np.cumsum(seg_dists)])
+
+        def _hdiff(h1, h2):
+            d = abs(h2 - h1)
+            return d if d <= 180 else 360 - d
+
+        def _heading(i, j):
+            return np.degrees(np.arctan2(px[j] - px[i], py[j] - py[i])) % 360.0
+
+        # --- Pass 1: find raw tack indices ---
+        raw_tacks = []
+        for i in range(1, n - 1):
+            h_in  = _heading(i - 1, i)
+            h_out = _heading(i, i + 1)
+            if _hdiff(h_in, h_out) >= tack_threshold_deg:
+                raw_tacks.append(i)
+
+        # --- Pass 1b: merge nearby tacks ---
+        # Consecutive tacks < min_tack_spacing_m apart are collapsed: keep only
+        # the one that is furthest from the previous kept tack waypoint.
+        tack_boundaries = [0]
+        for ti in raw_tacks:
+            last = tack_boundaries[-1]
+            dist_from_last = cum_dist[ti] - cum_dist[last]
+            if dist_from_last >= min_tack_spacing_m:
+                tack_boundaries.append(ti)
+            else:
+                # Replace last tack with this one if it has a bigger turn
+                if last != 0:
+                    last_turn = _hdiff(_heading(last - 1, last), _heading(last, last + 1))
+                    this_turn = _hdiff(_heading(ti - 1, ti), _heading(ti, ti + 1))
+                    if this_turn > last_turn:
+                        tack_boundaries[-1] = ti
+        tack_boundaries.append(n - 1)
+
+        # --- Pass 2: Douglas-Peucker within each inter-tack segment ---
+        def _dp_segment(start, end):
+            """Simplify path[start..end] via Douglas-Peucker."""
+            if end - start <= 1:
+                return [start]
+            x1, y1 = px[start], py[start]
+            x2, y2 = px[end],   py[end]
+            seg_len = np.hypot(x2 - x1, y2 - y1)
+            if seg_len < 1e-6:
+                return [start]
+
+            max_d, max_i = 0.0, start
+            for k in range(start + 1, end):
+                d = abs((x2 - x1) * (y1 - py[k]) - (x1 - px[k]) * (y2 - y1)) / seg_len
+                if d > max_d:
+                    max_d, max_i = d, k
+
+            if max_d > dp_epsilon_m:
+                return _dp_segment(start, max_i) + _dp_segment(max_i, end)
+            return [start]
+
+        kept = []
+        for seg_i in range(len(tack_boundaries) - 1):
+            kept.extend(_dp_segment(tack_boundaries[seg_i], tack_boundaries[seg_i + 1]))
+        kept.append(n - 1)
+        kept = sorted(set(kept))
+
+        return [path_nodes[i] for i in kept]
+
+    def _remove_stubs(self, path_nodes):
+        """Remove stub waypoints that create Y-junctions."""
+        if len(path_nodes) <= 2:
+            return path_nodes
+
+        result = [path_nodes[0]]
+        for i in range(1, len(path_nodes) - 1):
+            prev_node = result[-1]
+            curr_node = path_nodes[i]
+            next_node = path_nodes[i + 1]
+
+            x0, y0 = self.node_x[prev_node], self.node_y[prev_node]
+            x1, y1 = self.node_x[curr_node], self.node_y[curr_node]
+            x2, y2 = self.node_x[next_node], self.node_y[next_node]
+
+            leg_in = np.hypot(x1 - x0, y1 - y0)
+            leg_out = np.hypot(x2 - x1, y2 - y1)
+
+            if leg_in < 1e-6 or leg_out < 1e-6:
+                result.append(curr_node)
+                continue
+
+            ratio = max(leg_in, leg_out) / min(leg_in, leg_out)
+
+            v_in = ((x1 - x0) / leg_in, (y1 - y0) / leg_in)
+            v_out = ((x2 - x1) / leg_out, (y2 - y1) / leg_out)
+            dot = v_in[0] * v_out[0] + v_in[1] * v_out[1]
+            turn_angle = np.degrees(np.arccos(np.clip(dot, -1.0, 1.0)))
+
+            is_stub = ratio > 3.0 and turn_angle > 45.0
+
+            if is_stub and self._line_of_sight(x0, y0, x2, y2):
+                shortcut_time, _ = self._segment_travel_time(x0, y0, x2, y2, 0.0)
+                if np.isfinite(shortcut_time):
+                    continue
+            result.append(curr_node)
+
+        result.append(path_nodes[-1])
+        return result
+
+    def find_route(self, start_latlon, end_latlon, start_time_s=0.0,
+                   max_iterations=2_000_000, return_debug=False):
+        """Find the time-optimal route between two lat/lon points.
+
+        Parameters
+        ----------
+        start_latlon : (lat, lon)
+        end_latlon : (lat, lon)
+        start_time_s : float
+            Elapsed seconds from the forecast reference time at departure.
+        max_iterations : int
+            Hard limit on A* iterations.
+        return_debug : bool
+            If True, returns a 5th element: dict with 'raw_path', 'raw_times',
+            'explored_nodes', 'smoothed_path'.
+
+        Returns
+        -------
+        (Route, xs, ys, water_mask[, debug_info])
+        """
+        t_wall_0 = _time.monotonic()
+
+        transformer = self.cf.transformer
+        sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
+        ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
+
+        _, start_node = self.cf.tree.query([sx, sy])
+        _, end_node = self.cf.tree.query([ex, ey])
+        start_node = int(start_node)
+        end_node = int(end_node)
+
+        # Validate start/end are over water
+        cu, _ = self.cf.query(self.node_x[start_node], self.node_y[start_node])
+        if np.isnan(cu):
+            raise ValueError(f"Start point snapped to land node {start_node}")
+        cu, _ = self.cf.query(self.node_x[end_node], self.node_y[end_node])
+        if np.isnan(cu):
+            raise ValueError(f"End point snapped to land node {end_node}")
+
+        goal_x, goal_y = self.node_x[end_node], self.node_y[end_node]
+        boat_speed = self.boat.speed()
+        if self._use_polar:
+            max_boat_speed = self.boat.polar.max_speed_ms
+        else:
+            max_boat_speed = boat_speed
+        max_speed = max_boat_speed + self.cf.max_current_speed
+
+        print(f"SectorRouter: {self.n_nodes:,} nodes, {self.N_SECTORS} sectors/node")
+        print(f"Start node: {start_node}, End node: {end_node}")
+
+        INF = float('inf')
+        N_BUCKETS = self.N_SECTORS + 1
+
+        best_cost = {}
+        came_from = {}
+        arrival_time = {}
+
+        start_state = (start_node, self.START_SENTINEL)
+        best_cost[start_state] = 0.0
+        arrival_time[start_state] = start_time_s
+
+        open_set = [(self._heuristic(start_node, goal_x, goal_y, max_speed),
+                     0.0, start_node, self.START_SENTINEL)]
+        explored = 0
+        explored_nodes = set()
+
+        while open_set:
+            if explored >= max_iterations:
+                raise RuntimeError(f"A* exceeded {max_iterations} iterations")
+
+            _, cost, node, sector_in = heapq.heappop(open_set)
+            state = (node, sector_in)
+
+            if cost > best_cost.get(state, INF):
+                continue
+
+            explored += 1
+            explored_nodes.add(node)
+
+            if node == end_node:
+                break
+
+            arr_t = arrival_time[state]
+
+            # Get neighbors for this node (lazy computation)
+            neighbors = self._find_sector_neighbors(node)
+
+            for neighbor, sector_out, dist in neighbors:
+                dt = self._edge_cost(node, neighbor, dist, arr_t)
+                if dt == INF:
+                    continue
+
+                penalty = 0.0
+                angle_diff = self._sector_angle_diff(sector_in, sector_out)
+                if self.tack_penalty_s > 0 and angle_diff > self.tack_threshold_deg:
+                    penalty = self.tack_penalty_s
+
+                new_cost = cost + dt + penalty
+                new_state = (neighbor, sector_out)
+
+                if new_cost < best_cost.get(new_state, INF):
+                    best_cost[new_state] = new_cost
+                    arrival_time[new_state] = arr_t + dt
+                    came_from[new_state] = state
+                    h = self._heuristic(neighbor, goal_x, goal_y, max_speed)
+                    heapq.heappush(open_set, (new_cost + h, new_cost, neighbor, sector_out))
+
+        # Find best goal state
+        goal_states = [(best_cost.get((end_node, b), INF), b)
+                       for b in range(N_BUCKETS)]
+        best_goal_cost, final_sector = min(goal_states)
+
+        if best_goal_cost == INF:
+            raise RuntimeError("No path found between start and end")
+
+        # Reconstruct path
+        raw_path = []
+        raw_times = []
+        state = (end_node, final_sector)
+        while state in came_from or state == start_state:
+            node, _ = state
+            raw_path.append(node)
+            raw_times.append(arrival_time.get(state, start_time_s))
+            if state == start_state:
+                break
+            state = came_from.get(state)
+            if state is None:
+                break
+        raw_path.reverse()
+        raw_times.reverse()
+
+        # Smooth and remove stubs
+        path_nodes = self._smooth_path(raw_path, raw_times)
+        path_nodes = self._remove_stubs(path_nodes)
+
+        inv_transformer = Transformer.from_crs(
+            transformer.target_crs, transformer.source_crs, always_xy=True)
+
+        def _compute_leg_times(nodes):
+            """Compute leg times; fall back per-leg to raw sub-path if over land."""
+            raw_node_idx = {nd: i for i, nd in enumerate(raw_path)}
+            final_nodes = []
+            wps = []
+            times = []
+            dists = []
+            t = start_time_s
+
+            for k in range(len(nodes) - 1):
+                na, nb = nodes[k], nodes[k + 1]
+                x1, y1 = self.node_x[na], self.node_y[na]
+                x2, y2 = self.node_x[nb], self.node_y[nb]
+                t_seg, d_seg = self._segment_travel_time(x1, y1, x2, y2, t)
+
+                if np.isfinite(t_seg):
+                    if not final_nodes:
+                        final_nodes.append(na)
+                    elif final_nodes[-1] != na:
+                        final_nodes.append(na)
+                    final_nodes.append(nb)
+                    wps.append((x1, y1))
+                    times.append(t_seg)
+                    dists.append(d_seg)
+                    t += t_seg
+                else:
+                    # Smoothed leg crosses land — reinsert original raw sub-path
+                    ia = raw_node_idx.get(na, -1)
+                    ib = raw_node_idx.get(nb, -1)
+                    sub = raw_path[ia:ib + 1] if (ia >= 0 and ib > ia) else [na, nb]
+                    for j in range(len(sub) - 1):
+                        sx1, sy1 = self.node_x[sub[j]],   self.node_y[sub[j]]
+                        sx2, sy2 = self.node_x[sub[j+1]], self.node_y[sub[j+1]]
+                        t_s, d_s = self._segment_travel_time(sx1, sy1, sx2, sy2, t)
+                        if not final_nodes:
+                            final_nodes.append(sub[j])
+                        elif final_nodes[-1] != sub[j]:
+                            final_nodes.append(sub[j])
+                        final_nodes.append(sub[j + 1])
+                        wps.append((sx1, sy1))
+                        d_s = np.hypot(sx2 - sx1, sy2 - sy1)
+                        t_s = t_s if np.isfinite(t_s) else (
+                            d_s / max(self.boat.base_speed_knots * 0.514, 0.1))
+                        times.append(t_s)
+                        dists.append(d_s)
+                        t += t_s
+
+            if final_nodes:
+                wps.append((self.node_x[final_nodes[-1]],
+                            self.node_y[final_nodes[-1]]))
+            return final_nodes, wps, times, dists
+
+        path_nodes, waypoints_utm, leg_times, leg_dists = _compute_leg_times(path_nodes)
+        total_time = sum(leg_times) if leg_times else float('nan')
+
+        total_dist = sum(leg_dists)
+        avg_sog = (total_dist / total_time * MS_TO_KNOTS) if total_time > 0 and np.isfinite(total_time) else 0.0
+
+        waypoints_latlon = []
+        for x, y in waypoints_utm:
+            lon, lat = inv_transformer.transform(x, y)
+            waypoints_latlon.append((lat, lon))
+
+        sim_track, sim_track_times = self._simulate_track(waypoints_utm, start_time_s)
+
+        route = Route(
+            waypoints_utm=waypoints_utm,
+            waypoints_latlon=waypoints_latlon,
+            leg_times_s=leg_times,
+            leg_distances_m=leg_dists,
+            total_time_s=total_time,
+            total_distance_m=total_dist,
+            avg_sog_knots=avg_sog,
+            boat_speed_knots=self.boat.base_speed_knots,
+            nodes_explored=explored,
+            simulated_track=sim_track,
+            simulated_track_times=sim_track_times,
+        )
+
+        xs, ys, water_mask = self._build_grid_for_plotting(
+            waypoints_utm, start_latlon, end_latlon)
+
+        wall_s = _time.monotonic() - t_wall_0
+        n_raw = len(raw_path)
+        n_smooth = len(path_nodes)
+        n_cached = len(self._neighbor_cache)
+        print(f"\nSector A* completed in {wall_s:.2f}s, explored {explored} nodes")
+        print(f"Neighbor cache: {n_cached} nodes")
+        print(f"Path smoothing: {n_raw} -> {n_smooth} waypoints")
+        print(route.summary())
+
+        if return_debug:
+            debug_info = {
+                'raw_path': raw_path,
+                'raw_times': raw_times,
+                'explored_nodes': explored_nodes,
+                'smoothed_path': path_nodes,
+            }
+            return route, xs, ys, water_mask, debug_info
+
+        return route, xs, ys, water_mask
+
+    def _simulate_track(self, waypoints_utm, start_time_s, dt_s=10.0):
+        """Sample the ground track into a dense time series."""
+        if len(waypoints_utm) < 2:
+            return list(waypoints_utm), [start_time_s] * len(waypoints_utm)
+
+        track = []
+        track_times = []
+        elapsed = start_time_s
+        px, py = waypoints_utm[0]
+        track.append((px, py))
+        track_times.append(elapsed)
+
+        for wp_idx in range(1, len(waypoints_utm)):
+            tx, ty = waypoints_utm[wp_idx]
+            seg_time, seg_dist = self._segment_travel_time(px, py, tx, ty, elapsed)
+
+            if not np.isfinite(seg_time) or seg_dist < 1e-6:
+                px, py = tx, ty
+                track.append((px, py))
+                track_times.append(elapsed)
+                continue
+
+            n_steps = max(1, int(np.ceil(seg_time / dt_s)),
+                          int(np.ceil(seg_dist / 150.0)))
+
+            x0, y0 = px, py
+            for step_idx in range(1, n_steps + 1):
+                alpha = step_idx / n_steps
+                px = x0 + alpha * (tx - x0)
+                py = y0 + alpha * (ty - y0)
+                t = elapsed + alpha * seg_time
+                track.append((px, py))
+                track_times.append(t)
+
+            elapsed += seg_time
+
+        return track, track_times
+
+    def _build_grid_for_plotting(self, waypoints_utm, start_latlon, end_latlon,
+                                  resolution=300.0, padding=2000.0):
+        """Generate a regular grid overlay for plot_route compatibility."""
+        transformer = self.cf.transformer
+        sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
+        ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
+
+        all_x = [sx, ex] + [p[0] for p in waypoints_utm]
+        all_y = [sy, ey] + [p[1] for p in waypoints_utm]
+
+        x0 = min(all_x) - padding
+        x1 = max(all_x) + padding
+        y0 = min(all_y) - padding
+        y1 = max(all_y) + padding
+
+        xs = np.arange(x0, x1 + resolution, resolution)
+        ys = np.arange(y0, y1 + resolution, resolution)
+
+        u_grid, v_grid = self.cf.query_grid(xs, ys, elapsed_s=0.0)
+        water_mask = ~np.isnan(u_grid)
+
+        return xs, ys, water_mask
+
+    def straight_line_time(self, start_latlon, end_latlon, start_time_s=0.0):
+        """Estimate travel time along a straight line."""
+        transformer = self.cf.transformer
+        sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
+        ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
+
+        total_time, total_dist = self._segment_travel_time(
+            sx, sy, ex, ey, start_time_s, n_samples=50)
+        return total_time, total_dist
+
+
+# ===================================================================
 #  Visualization
 # ===================================================================
 
 def plot_route(route, xs, ys, water_mask, current_field,
                start_latlon, end_latlon,
                straight_time_s=None, straight_dist_m=None,
-               save_path=None, subsample_arrows=3, show=True):
-    """Plot the optimised route over the current field."""
+               save_path=None, subsample_arrows=3, show=True,
+               wind_field=None, elapsed_s=0.0):
+    """Plot the optimised route over the current field.
+
+    Parameters
+    ----------
+    wind_field : WindField, optional
+        If provided, creates a side-by-side plot with current (left)
+        and wind (right) vector fields.
+    elapsed_s : float
+        Time offset for querying current/wind fields (default 0).
+    """
     import matplotlib.pyplot as plt
     import matplotlib.patheffects as pe
     import matplotlib.colors as mcolors
 
     transformer = current_field.transformer
+    xx, yy = np.meshgrid(xs, ys)
+    margin = 500
 
-    u_grid, v_grid = current_field.query_grid(xs, ys, elapsed_s=0.0)
+    u_grid, v_grid = current_field.query_grid(xs, ys, elapsed_s=elapsed_s)
     speed_grid = np.sqrt(u_grid**2 + v_grid**2) * MS_TO_KNOTS
     speed_grid[~water_mask] = np.nan
 
-    fig, ax = plt.subplots(figsize=(14, 10))
-
-    xx, yy = np.meshgrid(xs, ys)
-
-    # Land / water background
-    land_color = '#f0e6d3'
-    ax.set_facecolor(land_color)
-    water_bg = np.where(water_mask, 0.0, np.nan)
-    ax.pcolormesh(xs, ys, water_bg, cmap='Greys', vmin=0, vmax=1,
-                  alpha=0.05, shading='auto', zorder=0)
-
-    # Current speed heatmap (water only)
-    speed_max = np.nanmax(speed_grid) if np.any(~np.isnan(speed_grid)) else 1.0
-    im = ax.pcolormesh(xs, ys, speed_grid,
-                       cmap='cividis', alpha=0.35, shading='auto',
-                       vmin=0, vmax=max(speed_max, 0.5), zorder=1)
-    cbar = fig.colorbar(im, ax=ax, label='Current speed (knots)',
-                        pad=0.02, shrink=0.8)
-
-    # Current direction arrows -- normalised to uniform length,
-    # colored by speed for magnitude, black outlines for contrast.
-    step = subsample_arrows
-    u_sub = u_grid[::step, ::step].copy()
-    v_sub = v_grid[::step, ::step].copy()
-    spd_sub = speed_grid[::step, ::step].copy()
-    xx_sub = xx[::step, ::step]
-    yy_sub = yy[::step, ::step]
-
-    mag = np.sqrt(u_sub**2 + v_sub**2)
-    mag_safe = np.where(mag < 1e-8, 1.0, mag)
-    u_norm = u_sub / mag_safe
-    v_norm = v_sub / mag_safe
-
-    # Hide arrows where speed is negligible or over land
-    visible = (mag > 0.02) & ~np.isnan(spd_sub)
-    u_norm[~visible] = np.nan
-    v_norm[~visible] = np.nan
-
-    arrow_scale = 1.0 / (step * (xs[1] - xs[0])) * 0.7
-    ax.quiver(
-        xx_sub, yy_sub, u_norm, v_norm,
-        spd_sub,
-        cmap='plasma', clim=(0, max(speed_max, 0.5)),
-        scale=arrow_scale, scale_units='xy',
-        width=0.004, headwidth=4, headlength=5, headaxislength=4,
-        alpha=0.85, zorder=3,
-        edgecolors='#333333', linewidth=0.3,
-    )
-
-    # Shoreline overlay
     shoreline_path = Path(__file__).parent / "data" / "shoreline_puget.geojson"
-    if shoreline_path.exists():
-        try:
-            import geopandas as gpd
-            shore = gpd.read_file(shoreline_path)
-            for geom in shore.geometry:
-                if geom is None:
-                    continue
-                lines = []
-                if geom.geom_type == 'LineString':
-                    lines = [geom]
-                elif geom.geom_type == 'MultiLineString':
-                    lines = list(geom.geoms)
-                for line in lines:
-                    coords = np.array(line.coords)
-                    sx_arr, sy_arr = transformer.transform(
-                        coords[:, 0], coords[:, 1])
-                    ax.plot(sx_arr, sy_arr, color='#3d3d3d',
-                            linewidth=0.7, zorder=2)
-        except Exception:
-            pass
 
-    # Route: simulated ground track (curved) if available, else waypoints
-    if route.simulated_track and len(route.simulated_track) > 1:
-        stx = [p[0] for p in route.simulated_track]
-        sty = [p[1] for p in route.simulated_track]
-        ax.plot(stx, sty, color='#e63946', linewidth=3, zorder=5,
-                label='Ground track',
-                path_effects=[pe.Stroke(linewidth=5, foreground='white'),
+    def _draw_shoreline(ax):
+        if shoreline_path.exists():
+            try:
+                import geopandas as gpd
+                shore = gpd.read_file(shoreline_path)
+                for geom in shore.geometry:
+                    if geom is None:
+                        continue
+                    lines = []
+                    if geom.geom_type == 'LineString':
+                        lines = [geom]
+                    elif geom.geom_type == 'MultiLineString':
+                        lines = list(geom.geoms)
+                    for line in lines:
+                        coords = np.array(line.coords)
+                        sx_arr, sy_arr = transformer.transform(
+                            coords[:, 0], coords[:, 1])
+                        ax.plot(sx_arr, sy_arr, color='#3d3d3d',
+                                linewidth=0.7, zorder=2)
+            except Exception:
+                pass
+
+    def _draw_route(ax, show_legend=True):
+        if route.simulated_track and len(route.simulated_track) > 1:
+            stx = [p[0] for p in route.simulated_track]
+            sty = [p[1] for p in route.simulated_track]
+            ax.plot(stx, sty, color='#e63946', linewidth=3, zorder=5,
+                    label='Ground track' if show_legend else None,
+                    path_effects=[pe.Stroke(linewidth=5, foreground='white'),
+                                  pe.Normal()])
+            rx = [p[0] for p in route.waypoints_utm[1:-1]]
+            ry = [p[1] for p in route.waypoints_utm[1:-1]]
+            if rx:
+                ax.plot(rx, ry, 'o', color='#e63946', markersize=5, zorder=6,
+                        markeredgecolor='white', markeredgewidth=1,
+                        label='Tack points' if show_legend else None)
+        else:
+            rx = [p[0] for p in route.waypoints_utm]
+            ry = [p[1] for p in route.waypoints_utm]
+            ax.plot(rx, ry, color='#e63946', linewidth=3, zorder=5,
+                    label='Optimal route' if show_legend else None,
+                    path_effects=[pe.Stroke(linewidth=5, foreground='white'),
+                                  pe.Normal()])
+
+        sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
+        ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
+        ax.plot([sx, ex], [sy, ey], '--', color='#457b9d', linewidth=2,
+                zorder=4, label='Straight line' if show_legend else None,
+                path_effects=[pe.Stroke(linewidth=3.5, foreground='white',
+                                        alpha=0.6),
                               pe.Normal()])
-        # Tack/waypoint markers (small dots, no connecting lines)
-        rx = [p[0] for p in route.waypoints_utm[1:-1]]
-        ry = [p[1] for p in route.waypoints_utm[1:-1]]
-        if rx:
-            ax.plot(rx, ry, 'o', color='#e63946', markersize=5, zorder=6,
-                    markeredgecolor='white', markeredgewidth=1,
-                    label='Tack points')
+        ax.plot(sx, sy, 'o', color='#2a9d8f', markersize=12, zorder=6,
+                markeredgecolor='white', markeredgewidth=2,
+                label='Start' if show_legend else None)
+        ax.plot(ex, ey, 's', color='#e76f51', markersize=12, zorder=6,
+                markeredgecolor='white', markeredgewidth=2,
+                label='End' if show_legend else None)
+
+    def _setup_ax(ax, title):
+        ax.set_facecolor('#f0e6d3')
+        water_bg = np.where(water_mask, 0.0, np.nan)
+        ax.pcolormesh(xs, ys, water_bg, cmap='Greys', vmin=0, vmax=1,
+                      alpha=0.05, shading='auto', zorder=0)
+        ax.set_xlabel('Easting (m, UTM)')
+        ax.set_ylabel('Northing (m, UTM)')
+        ax.set_title(title)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.15, color='#999999')
+        ax.set_xlim(xs[0] - margin, xs[-1] + margin)
+        ax.set_ylim(ys[0] - margin, ys[-1] + margin)
+
+    if wind_field is None:
+        fig, ax = plt.subplots(figsize=(14, 10))
+
+        _setup_ax(ax, 'Sail Routing -- Time-Optimal Path Through Currents')
+
+        speed_max = np.nanmax(speed_grid) if np.any(~np.isnan(speed_grid)) else 1.0
+        im = ax.pcolormesh(xs, ys, speed_grid,
+                           cmap='cividis', alpha=0.35, shading='auto',
+                           vmin=0, vmax=max(speed_max, 0.5), zorder=1)
+        fig.colorbar(im, ax=ax, label='Current speed (knots)',
+                     pad=0.02, shrink=0.8)
+
+        step = subsample_arrows
+        u_sub = u_grid[::step, ::step].copy()
+        v_sub = v_grid[::step, ::step].copy()
+        spd_sub = speed_grid[::step, ::step].copy()
+        xx_sub = xx[::step, ::step]
+        yy_sub = yy[::step, ::step]
+
+        mag = np.sqrt(u_sub**2 + v_sub**2)
+        mag_safe = np.where(mag < 1e-8, 1.0, mag)
+        u_norm = u_sub / mag_safe
+        v_norm = v_sub / mag_safe
+        visible = (mag > 0.02) & ~np.isnan(spd_sub)
+        u_norm[~visible] = np.nan
+        v_norm[~visible] = np.nan
+
+        arrow_scale = 1.0 / (step * (xs[1] - xs[0])) * 0.7
+        ax.quiver(
+            xx_sub, yy_sub, u_norm, v_norm, spd_sub,
+            cmap='plasma', clim=(0, max(speed_max, 0.5)),
+            scale=arrow_scale, scale_units='xy',
+            width=0.004, headwidth=4, headlength=5, headaxislength=4,
+            alpha=0.85, zorder=3, edgecolors='#333333', linewidth=0.3,
+        )
+
+        _draw_shoreline(ax)
+        _draw_route(ax)
+
+        stats_lines = [
+            f"Optimal:  {route.total_time_s / 60:.1f} min, "
+            f"{route.total_distance_m / 1852:.2f} nm, "
+            f"SOG {route.avg_sog_knots:.2f} kt",
+        ]
+        if straight_time_s is not None and np.isfinite(straight_time_s):
+            sl_sog = (straight_dist_m / straight_time_s * MS_TO_KNOTS
+                      if straight_time_s > 0 else 0)
+            stats_lines.append(
+                f"Straight: {straight_time_s / 60:.1f} min, "
+                f"{straight_dist_m / 1852:.2f} nm, "
+                f"SOG {sl_sog:.2f} kt")
+            saved = straight_time_s - route.total_time_s
+            stats_lines.append(f"Time saved: {saved / 60:.1f} min")
+        stats_lines.append(f"Boat STW: {route.boat_speed_knots:.1f} kt")
+        stats_text = "\n".join(stats_lines)
+        ax.text(0.02, 0.02, stats_text, transform=ax.transAxes,
+                fontsize=10, verticalalignment='bottom', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9,
+                          edgecolor='#cccccc'))
+        ax.legend(loc='upper right', framealpha=0.9, fontsize=9)
+
     else:
-        rx = [p[0] for p in route.waypoints_utm]
-        ry = [p[1] for p in route.waypoints_utm]
-        ax.plot(rx, ry, color='#e63946', linewidth=3, zorder=5,
-                label='Optimal route',
-                path_effects=[pe.Stroke(linewidth=5, foreground='white'),
-                              pe.Normal()])
+        fig, (ax_cur, ax_wind) = plt.subplots(1, 2, figsize=(20, 10))
 
-    # Straight line
-    sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
-    ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
-    ax.plot([sx, ex], [sy, ey], '--', color='#457b9d', linewidth=2,
-            zorder=4, label='Straight line',
-            path_effects=[pe.Stroke(linewidth=3.5, foreground='white',
-                                    alpha=0.6),
-                          pe.Normal()])
+        _setup_ax(ax_cur, 'Ocean Current')
+        _setup_ax(ax_wind, 'Wind')
 
-    # Markers
-    ax.plot(sx, sy, 'o', color='#2a9d8f', markersize=14, zorder=6,
-            markeredgecolor='white', markeredgewidth=2.5, label='Start')
-    ax.plot(ex, ey, 's', color='#e76f51', markersize=14, zorder=6,
-            markeredgecolor='white', markeredgewidth=2.5, label='End')
+        speed_max = np.nanmax(speed_grid) if np.any(~np.isnan(speed_grid)) else 1.0
+        im_cur = ax_cur.pcolormesh(xs, ys, speed_grid,
+                                   cmap='cividis', alpha=0.35, shading='auto',
+                                   vmin=0, vmax=max(speed_max, 0.5), zorder=1)
+        fig.colorbar(im_cur, ax=ax_cur, label='Current (knots)',
+                     pad=0.02, shrink=0.7)
 
-    # Stats box
-    stats_lines = [
-        f"Optimal:  {route.total_time_s / 60:.1f} min, "
-        f"{route.total_distance_m / 1852:.2f} nm, "
-        f"SOG {route.avg_sog_knots:.2f} kt",
-    ]
-    if straight_time_s is not None and np.isfinite(straight_time_s):
-        sl_sog = (straight_dist_m / straight_time_s * MS_TO_KNOTS
-                  if straight_time_s > 0 else 0)
-        stats_lines.append(
-            f"Straight: {straight_time_s / 60:.1f} min, "
-            f"{straight_dist_m / 1852:.2f} nm, "
-            f"SOG {sl_sog:.2f} kt")
-        saved = straight_time_s - route.total_time_s
-        stats_lines.append(f"Time saved: {saved / 60:.1f} min")
-    stats_lines.append(f"Boat STW: {route.boat_speed_knots:.1f} kt")
-    stats_text = "\n".join(stats_lines)
-    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes,
-            fontsize=10, verticalalignment='bottom', fontfamily='monospace',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.9,
-                      edgecolor='#cccccc'))
+        step = subsample_arrows
+        u_sub = u_grid[::step, ::step].copy()
+        v_sub = v_grid[::step, ::step].copy()
+        spd_sub = speed_grid[::step, ::step].copy()
+        xx_sub = xx[::step, ::step]
+        yy_sub = yy[::step, ::step]
 
-    ax.set_xlabel('Easting (m, UTM)')
-    ax.set_ylabel('Northing (m, UTM)')
-    ax.set_title('Sail Routing -- Time-Optimal Path Through Currents')
-    ax.legend(loc='upper right', framealpha=0.9, fontsize=9)
-    ax.set_aspect('equal')
-    ax.grid(True, alpha=0.15, color='#999999')
+        mag = np.sqrt(u_sub**2 + v_sub**2)
+        mag_safe = np.where(mag < 1e-8, 1.0, mag)
+        u_norm = u_sub / mag_safe
+        v_norm = v_sub / mag_safe
+        visible = (mag > 0.02) & ~np.isnan(spd_sub)
+        u_norm[~visible] = np.nan
+        v_norm[~visible] = np.nan
 
-    margin = 500
-    ax.set_xlim(xs[0] - margin, xs[-1] + margin)
-    ax.set_ylim(ys[0] - margin, ys[-1] + margin)
+        arrow_scale = 1.0 / (step * (xs[1] - xs[0])) * 0.7
+        ax_cur.quiver(
+            xx_sub, yy_sub, u_norm, v_norm, spd_sub,
+            cmap='plasma', clim=(0, max(speed_max, 0.5)),
+            scale=arrow_scale, scale_units='xy',
+            width=0.004, headwidth=4, headlength=5, headaxislength=4,
+            alpha=0.85, zorder=3, edgecolors='#333333', linewidth=0.3,
+        )
+
+        wu_grid = np.zeros_like(u_grid)
+        wv_grid = np.zeros_like(v_grid)
+        for i, y in enumerate(ys):
+            for j, x in enumerate(xs):
+                if water_mask[i, j]:
+                    wu, wv = wind_field.query(x, y, elapsed_s=elapsed_s)
+                    wu_grid[i, j] = wu
+                    wv_grid[i, j] = wv
+                else:
+                    wu_grid[i, j] = np.nan
+                    wv_grid[i, j] = np.nan
+
+        wind_speed_grid = np.sqrt(wu_grid**2 + wv_grid**2) * MS_TO_KNOTS
+        wind_max = np.nanmax(wind_speed_grid) if np.any(~np.isnan(wind_speed_grid)) else 10.0
+
+        im_wind = ax_wind.pcolormesh(xs, ys, wind_speed_grid,
+                                     cmap='YlOrRd', alpha=0.35, shading='auto',
+                                     vmin=0, vmax=max(wind_max, 5.0), zorder=1)
+        fig.colorbar(im_wind, ax=ax_wind, label='Wind (knots)',
+                     pad=0.02, shrink=0.7)
+
+        wu_sub = wu_grid[::step, ::step].copy()
+        wv_sub = wv_grid[::step, ::step].copy()
+        wspd_sub = wind_speed_grid[::step, ::step].copy()
+
+        wmag = np.sqrt(wu_sub**2 + wv_sub**2)
+        wmag_safe = np.where(wmag < 1e-8, 1.0, wmag)
+        wu_norm = wu_sub / wmag_safe
+        wv_norm = wv_sub / wmag_safe
+        wvisible = (wmag > 0.1) & ~np.isnan(wspd_sub)
+        wu_norm[~wvisible] = np.nan
+        wv_norm[~wvisible] = np.nan
+
+        ax_wind.quiver(
+            xx_sub, yy_sub, wu_norm, wv_norm, wspd_sub,
+            cmap='Reds', clim=(0, max(wind_max, 5.0)),
+            scale=arrow_scale, scale_units='xy',
+            width=0.004, headwidth=4, headlength=5, headaxislength=4,
+            alpha=0.85, zorder=3, edgecolors='#333333', linewidth=0.3,
+        )
+
+        _draw_shoreline(ax_cur)
+        _draw_shoreline(ax_wind)
+        _draw_route(ax_cur, show_legend=True)
+        _draw_route(ax_wind, show_legend=False)
+
+        ax_cur.legend(loc='upper right', framealpha=0.9, fontsize=9)
+
+        stats_lines = [
+            f"Optimal:  {route.total_time_s / 60:.1f} min, "
+            f"{route.total_distance_m / 1852:.2f} nm, "
+            f"SOG {route.avg_sog_knots:.2f} kt",
+            f"Boat STW: {route.boat_speed_knots:.1f} kt",
+        ]
+        if straight_time_s is not None and np.isfinite(straight_time_s):
+            saved = straight_time_s - route.total_time_s
+            stats_lines.insert(1, f"Time saved: {saved / 60:.1f} min")
+        stats_text = "\n".join(stats_lines)
+        ax_cur.text(0.02, 0.02, stats_text, transform=ax_cur.transAxes,
+                    fontsize=9, verticalalignment='bottom', fontfamily='monospace',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.9,
+                              edgecolor='#cccccc'))
 
     plt.tight_layout()
     if save_path:
@@ -2164,6 +3597,12 @@ def main():
                              "(default: 60).  Set 0 to disable.")
     parser.add_argument("--no-cache", action="store_true",
                         help="Skip SSCOFS cache, always download fresh")
+    parser.add_argument("--sector", action="store_true",
+                        help="Use SectorRouter (16-sector heading-binned, default)")
+    parser.add_argument("--mesh", action="store_true",
+                        help="Use MeshRouter (A* on SSCOFS Delaunay mesh)")
+    parser.add_argument("--grid", action="store_true",
+                        help="Use legacy 8-connected grid Router")
     parser.add_argument("--save", type=str, default=None,
                         help="Save plot to file (e.g. route.png)")
     parser.add_argument("--no-plot", action="store_true",
@@ -2203,9 +3642,20 @@ def main():
               "together; ignoring wind.")
 
     boat = BoatModel(base_speed_knots=args.boat_speed, polar=polar)
-    router = Router(cf, boat, resolution_m=args.grid_resolution,
-                    padding_m=args.padding, wind=wind,
-                    tack_penalty_s=args.tack_penalty)
+
+    if args.grid:
+        print("Using Router (8-connected grid, legacy)")
+        router = Router(cf, boat, resolution_m=args.grid_resolution,
+                        padding_m=args.padding, wind=wind,
+                        tack_penalty_s=args.tack_penalty)
+    elif args.mesh:
+        print("Using MeshRouter (A* on SSCOFS Delaunay mesh)")
+        router = MeshRouter(cf, boat, wind=wind,
+                            tack_penalty_s=args.tack_penalty)
+    else:
+        print("Using SectorRouter (16-sector heading-binned connectivity)")
+        router = SectorRouter(cf, boat, wind=wind,
+                              tack_penalty_s=args.tack_penalty)
 
     start = (args.start_lat, args.start_lon)
     end = (args.end_lat, args.end_lon)
