@@ -69,6 +69,7 @@ from sail_routing import (
     KNOTS_TO_MS, MS_TO_KNOTS,
     CurrentField,
 )
+from shoreline_utils import draw_shoreline
 
 HERE = Path(__file__).parent
 
@@ -170,12 +171,10 @@ def _build_openmeteo_route_wind(wind_cfg: dict, ctx: dict) -> WindField:
         ctx["depart_utc"].astimezone(_dt.timezone.utc).replace(tzinfo=None),
         "s",
     )
-    # Dataset times are in local timezone (from Open-Meteo); convert to
-    # UTC before computing offsets relative to the UTC departure time.
-    utc_offset_s = int(ctx["depart_dt"].utcoffset().total_seconds())
-    time_vals_utc = time_vals - np.timedelta64(utc_offset_s, "s")
+    # Dataset times are already UTC (ecmwf_wind.py converts to UTC before
+    # saving).  Compute offsets relative to the UTC departure time.
     frame_times_s = ctx["start_time_s"] + (
-        (time_vals_utc - depart_utc_naive) / np.timedelta64(1, "s")
+        (time_vals - depart_utc_naive) / np.timedelta64(1, "s")
     ).astype(np.float64)
 
     speed_ms = ds["wind_speed_10m"].values.astype(np.float64) * KNOTS_TO_MS
@@ -428,16 +427,16 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
     def _draw_route_overlay(ax, frame_local, track_x_past, track_y_past, bx, by, show_legend=True):
         """Draw route, track, waypoints and boat on an axis."""
         ax.plot(route_x, route_y,
-                color="#88aacc", linewidth=1.5, linestyle="--",
-                alpha=0.5, zorder=4, label="Planned route" if show_legend else None)
+                color="#4477aa", linewidth=1.5, linestyle="--",
+                alpha=0.6, zorder=4, label="Planned route" if show_legend else None)
 
         if len(track_x_past) > 1:
             ax.plot(track_x_past, track_y_past,
-                    color="#00e5ff", linewidth=2.5, zorder=5,
+                    color="#0055cc", linewidth=2.5, zorder=5,
                     label="Track so far" if show_legend else None,
                     path_effects=[pe.Stroke(linewidth=4.5,
-                                            foreground="#003344",
-                                            alpha=0.6),
+                                            foreground="white",
+                                            alpha=0.7),
                                   pe.Normal()])
 
         for k, (wx, wy) in enumerate(all_utm):
@@ -465,17 +464,18 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
 
     def _setup_ax(ax, title):
         """Common axis setup."""
-        ax.set_facecolor("#0f1923")
-        ax.set_title(title, color="white", fontsize=11, pad=8)
-        ax.set_xlabel("Easting (m)", color="#aaaaaa", fontsize=8)
-        ax.set_ylabel("Northing (m)", color="#aaaaaa", fontsize=8)
-        ax.tick_params(colors="#666666", labelsize=7)
+        ax.set_facecolor("#f5f8fc")
+        ax.set_title(title, fontsize=11, pad=8)
+        ax.set_xlabel("Easting (m)", fontsize=8)
+        ax.set_ylabel("Northing (m)", fontsize=8)
+        ax.tick_params(labelsize=7)
         for spine in ax.spines.values():
-            spine.set_edgecolor("#334455")
+            spine.set_edgecolor("#cccccc")
         ax.set_aspect("equal")
         ax.set_xlim(xs[0], xs[-1])
         ax.set_ylim(ys_g[0], ys_g[-1])
-        ax.grid(True, alpha=0.10, color="#445566")
+        ax.grid(True, alpha=0.25, color="#aaaaaa")
+        draw_shoreline(ax, transformer, zorder=3)
 
     for h in range(n_hours):
         elapsed_s = depart_time_s + h * 3600.0
@@ -504,7 +504,6 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
 
         if wind_field is None:
             fig, ax = plt.subplots(figsize=(10, 14))
-            fig.patch.set_facecolor("#1a1a2e")
 
             _setup_ax(ax, f"{task_name}  —  Hour {h}")
 
@@ -517,8 +516,6 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
                                vmin=0, vmax=max(speed_max, 1.0), zorder=1)
             cbar = fig.colorbar(im, ax=ax, label="Current (kt)",
                                 pad=0.01, shrink=0.6, fraction=0.03)
-            cbar.ax.yaxis.label.set_color("white")
-            cbar.ax.tick_params(colors="white")
 
             u_sub = u_grid[::step, ::step]
             v_sub = v_grid[::step, ::step]
@@ -538,12 +535,10 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
                       alpha=0.7, zorder=3)
 
             _draw_route_overlay(ax, frame_local, track_x_past, track_y_past, bx, by)
-            ax.legend(loc="upper right", framealpha=0.7,
-                      facecolor="#0d1b2a", edgecolor="#334455",
-                      labelcolor="white", fontsize=8)
+            ax.legend(loc="upper right", framealpha=0.9,
+                      facecolor="white", edgecolor="#cccccc", fontsize=8)
         else:
             fig, (ax_cur, ax_wind) = plt.subplots(1, 2, figsize=(16, 10))
-            fig.patch.set_facecolor("#1a1a2e")
 
             _setup_ax(ax_cur, "Ocean Current")
             _setup_ax(ax_wind, "Wind")
@@ -558,8 +553,6 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
                                        vmin=0, vmax=max(speed_max, 1.0), zorder=1)
             cbar_cur = fig.colorbar(im_cur, ax=ax_cur, label="Current (kt)",
                                     pad=0.02, shrink=0.7)
-            cbar_cur.ax.yaxis.label.set_color("white")
-            cbar_cur.ax.tick_params(colors="white")
 
             u_sub = u_grid[::step, ::step]
             v_sub = v_grid[::step, ::step]
@@ -597,8 +590,6 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
                                          vmin=0, vmax=wind_max, zorder=1)
             cbar_wind = fig.colorbar(im_wind, ax=ax_wind, label="Wind (kt)",
                                      pad=0.02, shrink=0.7)
-            cbar_wind.ax.yaxis.label.set_color("white")
-            cbar_wind.ax.tick_params(colors="white")
 
             wu_sub = wu_grid[::step, ::step]
             wv_sub = wv_grid[::step, ::step]
@@ -619,9 +610,8 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
 
             _draw_route_overlay(ax_cur, frame_local, track_x_past, track_y_past, bx, by, show_legend=True)
             _draw_route_overlay(ax_wind, frame_local, track_x_past, track_y_past, bx, by, show_legend=False)
-            ax_cur.legend(loc="upper right", framealpha=0.7,
-                          facecolor="#0d1b2a", edgecolor="#334455",
-                          labelcolor="white", fontsize=7)
+            ax_cur.legend(loc="upper right", framealpha=0.9,
+                          facecolor="white", edgecolor="#cccccc", fontsize=7)
 
         # ── Annotations ───────────────────────────────────────────────────
         time_str = frame_local.strftime("%I:%M %p %Z")
@@ -637,10 +627,10 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
         ax_for_ann.text(0.02, 0.98, ann_text,
                         transform=ax_for_ann.transAxes,
                         fontsize=9, va="top", ha="left",
-                        color="white", fontfamily="monospace",
+                        color="#1a1a2a", fontfamily="monospace",
                         bbox=dict(boxstyle="round,pad=0.4",
-                                  facecolor="#0d1b2a", alpha=0.85,
-                                  edgecolor="#334455"))
+                                  facecolor="white", alpha=0.85,
+                                  edgecolor="#cccccc"))
 
         if len(track_x_past) > 1:
             seg_dists = np.hypot(np.diff(track_x_past), np.diff(track_y_past))
@@ -651,18 +641,17 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
             ax_for_ann.text(0.02, 0.02, stats_text,
                             transform=ax_for_ann.transAxes,
                             fontsize=8, va="bottom", ha="left",
-                            color="white", fontfamily="monospace",
+                            color="#1a1a2a", fontfamily="monospace",
                             bbox=dict(boxstyle="round,pad=0.3",
-                                      facecolor="#0d1b2a", alpha=0.85,
-                                      edgecolor="#334455"))
+                                      facecolor="white", alpha=0.85,
+                                      edgecolor="#cccccc"))
 
         if wind_field is not None:
-            fig.suptitle(f"{task_name}  —  Hour {h}", color="white", fontsize=12, y=0.98)
+            fig.suptitle(f"{task_name}  —  Hour {h}", fontsize=12, y=0.98)
 
         plt.tight_layout()
         out_path = plot_dir / f"{slug}_hour{h:02d}.png"
-        fig.savefig(out_path, dpi=130, bbox_inches="tight",
-                    facecolor=fig.get_facecolor())
+        fig.savefig(out_path, dpi=130, bbox_inches="tight")
         plt.close(fig)
         print(f"  Hour {h:02d}  {frame_local:%I:%M %p %Z}  "
               f"boat=({bx:.0f},{by:.0f})  → {out_path.name}")
@@ -789,10 +778,10 @@ def plot_position_timeseries(routes, wps, depart_utc, depart_time_s, tz,
     if len(tx) == 0:
         return
 
-    # Absolute wall-clock times (local)
-    t_local = [depart_utc + _dt.timedelta(seconds=float(t - depart_time_s))
-               for t in tt]
-    t_local_tz = [t.astimezone(tz) for t in t_local]
+    # Absolute wall-clock times: UTC-aware first, then converted to local tz for display
+    t_utc = [depart_utc + _dt.timedelta(seconds=float(t - depart_time_s))
+             for t in tt]
+    t_local_tz = [t.astimezone(tz) for t in t_utc]
     t_hours = np.array([(t - t_local_tz[0]).total_seconds() / 3600
                         for t in t_local_tz])
 
@@ -1037,6 +1026,10 @@ def main():
                        straight_time_s=sl_time, straight_dist_m=sl_dist,
                        save_path=plot_path, show=False,
                        wind_field=wind, elapsed_s=current_time_s)
+
+        # Save rich NPZ diagnostics for this leg
+        npz_path = plot_dir / f"{yaml_path.stem}_leg{i:02d}.npz"
+        route.save_npz(str(npz_path))
 
         # Chain: departure of next leg = arrival of this leg
         current_time_s += route.total_time_s
