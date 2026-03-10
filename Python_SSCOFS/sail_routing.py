@@ -47,11 +47,19 @@ import numpy as np
 from pyproj import Transformer
 from scipy.spatial import cKDTree, Delaunay
 
+try:
+    import numba as _numba_mod
+    _NUMBA_AVAILABLE = True
+except ImportError:
+    _NUMBA_AVAILABLE = False
+    _numba_mod = None
+
 # ---------------------------------------------------------------------------
 # Local imports from the existing SSCOFS pipeline
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent))
 from plot_local_currents import get_latest_current_data, create_utm_transformer
+from shoreline_utils import draw_shoreline
 from water_boundary import build_water_mask_utm, load_nav_mask
 
 NAV_MASK_PATH = Path(__file__).parent / "data" / "nav_mask.npz"
@@ -837,6 +845,7 @@ class Route:
     nodes_explored: int = 0
     simulated_track: Optional[list] = None        # [(x, y), ...]
     simulated_track_times: Optional[list] = None  # [elapsed_s, ...] parallel to simulated_track
+    debug: Optional[dict] = None                  # rich diagnostics for NPZ export
 
     def summary(self):
         lines = [
@@ -853,6 +862,72 @@ class Route:
             f"  Nodes explored:   {self.nodes_explored}",
         ]
         return "\n".join(lines)
+
+    def save_npz(self, path):
+        """Save all route data + diagnostics to a compressed .npz file.
+
+        The file contains everything needed to reconstruct, re-plot, and
+        analyze the route without re-running the router.
+        """
+        d = {}
+
+        # Final waypoints
+        wps_utm = np.array(self.waypoints_utm)
+        wps_ll = np.array(self.waypoints_latlon)
+        d['wp_x'] = wps_utm[:, 0]
+        d['wp_y'] = wps_utm[:, 1]
+        d['wp_lat'] = wps_ll[:, 0]
+        d['wp_lon'] = wps_ll[:, 1]
+        d['wp_leg_time_s'] = np.array(self.leg_times_s)
+        d['wp_leg_dist_m'] = np.array(self.leg_distances_m)
+        d['total_time_s'] = np.float64(self.total_time_s)
+        d['total_distance_m'] = np.float64(self.total_distance_m)
+        d['avg_sog_kt'] = np.float64(self.avg_sog_knots)
+        d['boat_speed_kt'] = np.float64(self.boat_speed_knots)
+        d['nodes_explored'] = np.int64(self.nodes_explored)
+
+        # Per-leg headings and turn angles
+        if len(wps_utm) >= 2:
+            dx = np.diff(wps_utm[:, 0])
+            dy = np.diff(wps_utm[:, 1])
+            d['wp_heading_deg'] = np.degrees(np.arctan2(dx, dy)) % 360.0
+            if len(wps_utm) >= 3:
+                h = d['wp_heading_deg']
+                raw_diff = np.abs(np.diff(h))
+                d['wp_turn_deg'] = np.minimum(raw_diff, 360.0 - raw_diff)
+
+        # Cumulative arrival time at each waypoint
+        if self.leg_times_s:
+            cum = np.concatenate([[0.0], np.cumsum(self.leg_times_s)])
+            d['wp_arrival_s'] = cum
+
+        # Simulated track
+        if self.simulated_track:
+            trk = np.array(self.simulated_track)
+            d['track_x'] = trk[:, 0]
+            d['track_y'] = trk[:, 1]
+        if self.simulated_track_times:
+            d['track_time_s'] = np.array(self.simulated_track_times)
+
+        # Merge debug dict (raw path, smoothed path, explored, perf, …)
+        if self.debug:
+            for k, v in self.debug.items():
+                if isinstance(v, np.ndarray):
+                    d[k] = v
+                elif isinstance(v, (list, tuple)):
+                    try:
+                        d[k] = np.asarray(v)
+                    except (ValueError, TypeError):
+                        pass
+                elif isinstance(v, dict):
+                    for sk, sv in v.items():
+                        d[f'{k}_{sk}'] = np.float64(sv) if np.isscalar(sv) else np.asarray(sv)
+                elif np.isscalar(v):
+                    d[k] = np.asarray(v)
+
+        np.savez_compressed(path, **d)
+        print(f"Route NPZ saved → {Path(path).name}  "
+              f"({len(d)} arrays, {sum(v.nbytes for v in d.values()) / 1024:.0f} KB)")
 
 
 # ===================================================================
@@ -1047,6 +1122,703 @@ def build_mesh_adjacency(delaunay, valid_mask):
                 edge_dist[key] = np.hypot(dx, dy)
 
     return dict(adj), edge_dist
+
+
+# ===================================================================
+#  CSR adjacency builder (used by MeshRouter + Numba kernel)
+# ===================================================================
+
+def _build_csr_adjacency(adj, n_nodes):
+    """Convert adjacency dict-of-sets to CSR (Compressed Sparse Row) format.
+
+    Returns
+    -------
+    offsets : int32[n_nodes+1]
+        offsets[i] is the start index in ``targets`` for node i's neighbors.
+    targets : int32[total_edges]
+        Neighbor node ids, grouped by source node.
+    """
+    offsets = np.zeros(n_nodes + 1, dtype=np.int32)
+    for node, neighbors in adj.items():
+        offsets[node + 1] = len(neighbors)
+    np.cumsum(offsets, out=offsets)
+
+    total_edges = int(offsets[n_nodes])
+    targets = np.empty(total_edges, dtype=np.int32)
+
+    pos = offsets[:-1].copy().astype(np.int64)
+    for node, neighbors in adj.items():
+        for nbr in neighbors:
+            targets[pos[node]] = nbr
+            pos[node] += 1
+
+    return offsets, targets
+
+
+# ===================================================================
+#  Numba A* kernel (no-polar / fixed boat speed through water)
+# ===================================================================
+
+if _NUMBA_AVAILABLE:
+    @_numba_mod.njit(cache=True)
+    def _mesh_astar_jit(
+        adj_offsets,        # int32[n_nodes+1]  — CSR row offsets
+        adj_targets,        # int32[n_edges]    — CSR column indices
+        node_x,             # float64[n_nodes]  — UTM easting
+        node_y,             # float64[n_nodes]  — UTM northing
+        u_frames,           # float64[n_frames, n_nodes]
+        v_frames,           # float64[n_frames, n_nodes]
+        frame_times,        # float64[n_frames]
+        start_node,         # int
+        end_node,           # int
+        start_time_s,       # float
+        boat_speed_ms,      # float  — fixed speed through water
+        max_speed,          # float  — boat + max current (for heuristic)
+        tack_penalty_s,     # float
+        tack_threshold_deg, # float
+        n_bearing_buckets,  # int    — e.g. 16
+        start_sentinel,     # int    — sentinel bucket for start node (= n_bearing_buckets)
+        max_iterations,     # int
+    ):
+        """Numba-compiled time-dependent A* on the SSCOFS mesh.
+
+        Uses pre-allocated numpy arrays instead of Python dicts, and a
+        manual binary min-heap instead of Python heapq.  Only handles the
+        fixed-boat-speed (no polar/wind) case.
+
+        Returns
+        -------
+        best_cost        : float64[n_nodes, n_buckets]
+        arrival_time     : float64[n_nodes, n_buckets]
+        came_from_node   : int32[n_nodes, n_buckets]   (-1 = no predecessor)
+        came_from_bucket : int32[n_nodes, n_buckets]
+        explored         : int  (-1 if max_iterations exceeded)
+        """
+        n_nodes = node_x.shape[0]
+        n_frames = frame_times.shape[0]
+        n_buckets = n_bearing_buckets + 1
+        INF = np.inf
+        BUCKET_DEG = 360.0 / n_bearing_buckets
+        bs2 = boat_speed_ms * boat_speed_ms
+        goal_x = node_x[end_node]
+        goal_y = node_y[end_node]
+
+        # State arrays [n_nodes × n_buckets] — replaces Python dicts
+        best_cost = np.full((n_nodes, n_buckets), INF)
+        arrival_time = np.full((n_nodes, n_buckets), INF)
+        came_from_node = np.full((n_nodes, n_buckets), -1, dtype=np.int32)
+        came_from_bucket = np.full((n_nodes, n_buckets), -1, dtype=np.int32)
+
+        best_cost[start_node, start_sentinel] = 0.0
+        arrival_time[start_node, start_sentinel] = start_time_s
+
+        # Binary min-heap rows: [f_cost, g_cost, float(node), float(bucket)]
+        max_heap = max(n_nodes * 8, 500000)
+        heap = np.empty((max_heap, 4), dtype=np.float64)
+        heap_size = 0
+
+        hdx0 = goal_x - node_x[start_node]
+        hdy0 = goal_y - node_y[start_node]
+        heap[0, 0] = np.sqrt(hdx0 * hdx0 + hdy0 * hdy0) / max_speed
+        heap[0, 1] = 0.0
+        heap[0, 2] = float(start_node)
+        heap[0, 3] = float(start_sentinel)
+        heap_size = 1
+
+        explored = 0
+
+        while heap_size > 0:
+            if explored >= max_iterations:
+                explored = -1
+                break
+
+            # Pop minimum (move last element to root, sift down)
+            cost = heap[0, 1]
+            node = int(heap[0, 2])
+            bucket_in = int(heap[0, 3])
+            heap_size -= 1
+            if heap_size > 0:
+                heap[0, 0] = heap[heap_size, 0]
+                heap[0, 1] = heap[heap_size, 1]
+                heap[0, 2] = heap[heap_size, 2]
+                heap[0, 3] = heap[heap_size, 3]
+                i = 0
+                while True:
+                    left = 2 * i + 1
+                    right = 2 * i + 2
+                    smallest = i
+                    if left < heap_size and heap[left, 0] < heap[smallest, 0]:
+                        smallest = left
+                    if right < heap_size and heap[right, 0] < heap[smallest, 0]:
+                        smallest = right
+                    if smallest == i:
+                        break
+                    for col in range(4):
+                        tmp = heap[i, col]
+                        heap[i, col] = heap[smallest, col]
+                        heap[smallest, col] = tmp
+                    i = smallest
+
+            # Lazy deletion: skip if a better path was already found
+            if cost > best_cost[node, bucket_in]:
+                continue
+
+            explored += 1
+
+            if node == end_node:
+                break
+
+            arr_t = arrival_time[node, bucket_in]
+
+            # Expand neighbors (CSR format — no Python dict lookup)
+            for edge_i in range(adj_offsets[node], adj_offsets[node + 1]):
+                nb = int(adj_targets[edge_i])
+
+                # Outgoing bearing bucket
+                ndx = node_x[nb] - node_x[node]
+                ndy = node_y[nb] - node_y[node]
+                dist = np.sqrt(ndx * ndx + ndy * ndy)
+                if dist < 1e-6:
+                    continue
+                bearing = np.degrees(np.arctan2(ndx, ndy)) % 360.0
+                bucket_out = int(bearing / BUCKET_DEG) % n_bearing_buckets
+
+                d_hat_x = ndx / dist
+                d_hat_y = ndy / dist
+
+                # Time-interpolated current at edge midpoint
+                t = arr_t
+                if t < frame_times[0]:
+                    t = frame_times[0]
+                elif t > frame_times[-1]:
+                    t = frame_times[-1]
+
+                if n_frames == 1:
+                    ua = u_frames[0, node]
+                    va = v_frames[0, node]
+                    ub = u_frames[0, nb]
+                    vb = v_frames[0, nb]
+                else:
+                    # Binary search for frame bracket
+                    lo = 0
+                    hi = n_frames - 1
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        if frame_times[mid] <= t:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    fi = lo
+                    if fi >= n_frames - 1:
+                        fi = n_frames - 2
+                    t0f = frame_times[fi]
+                    t1f = frame_times[fi + 1]
+                    alpha = (t - t0f) / (t1f - t0f) if t1f > t0f else 0.0
+                    om = 1.0 - alpha
+                    ua = u_frames[fi, node] * om + u_frames[fi + 1, node] * alpha
+                    va = v_frames[fi, node] * om + v_frames[fi + 1, node] * alpha
+                    ub = u_frames[fi, nb] * om + u_frames[fi + 1, nb] * alpha
+                    vb = v_frames[fi, nb] * om + v_frames[fi + 1, nb] * alpha
+
+                cu = 0.5 * (ua + ub)
+                cv = 0.5 * (va + vb)
+
+                # Fixed-speed SOG (crabbing to cancel cross-track current)
+                c_par = cu * d_hat_x + cv * d_hat_y
+                c_perp_x = cu - c_par * d_hat_x
+                c_perp_y = cv - c_par * d_hat_y
+                c_perp_sq = c_perp_x * c_perp_x + c_perp_y * c_perp_y
+                if c_perp_sq >= bs2:
+                    continue
+                v_sog = np.sqrt(bs2 - c_perp_sq) + c_par
+                if v_sog <= 0.01:
+                    continue
+
+                dt = dist / v_sog
+
+                # Tacking penalty
+                penalty = 0.0
+                if tack_penalty_s > 0.0 and bucket_in != start_sentinel:
+                    diff = abs(bucket_in - bucket_out)
+                    if diff > n_bearing_buckets // 2:
+                        diff = n_bearing_buckets - diff
+                    if float(diff) * BUCKET_DEG > tack_threshold_deg:
+                        penalty = tack_penalty_s
+
+                new_cost = cost + dt + penalty
+                if new_cost < best_cost[nb, bucket_out]:
+                    best_cost[nb, bucket_out] = new_cost
+                    arrival_time[nb, bucket_out] = arr_t + dt
+                    came_from_node[nb, bucket_out] = node
+                    came_from_bucket[nb, bucket_out] = bucket_in
+
+                    if heap_size < max_heap:
+                        hdx2 = goal_x - node_x[nb]
+                        hdy2 = goal_y - node_y[nb]
+                        new_f = new_cost + np.sqrt(hdx2 * hdx2 + hdy2 * hdy2) / max_speed
+                        heap[heap_size, 0] = new_f
+                        heap[heap_size, 1] = new_cost
+                        heap[heap_size, 2] = float(nb)
+                        heap[heap_size, 3] = float(bucket_out)
+                        heap_size += 1
+                        # Sift up
+                        i = heap_size - 1
+                        while i > 0:
+                            parent = (i - 1) // 2
+                            if heap[i, 0] < heap[parent, 0]:
+                                for col in range(4):
+                                    tmp = heap[i, col]
+                                    heap[i, col] = heap[parent, col]
+                                    heap[parent, col] = tmp
+                                i = parent
+                            else:
+                                break
+
+        return best_cost, arrival_time, came_from_node, came_from_bucket, explored
+
+else:
+    _mesh_astar_jit = None
+
+
+# ===================================================================
+#  Vectorized sector graph builder (for SectorRouter + Numba kernel)
+# ===================================================================
+
+def _build_corridor_sector_graph(
+    node_x, node_y, tree, delaunay, valid_triangle,
+    corridor_mask,
+    n_sectors, sector_width,
+    k_candidates, min_edge_m, max_edge_m, n_los_samples,
+):
+    """Build sector adjacency for corridor nodes using vectorized ops.
+
+    Instead of per-node lazy discovery with individual KD-tree + LOS queries,
+    this does one bulk KD-tree call and one batch ``find_simplex`` for all
+    line-of-sight checks.
+
+    Returns
+    -------
+    offsets  : int32[n_nodes+1]   — CSR row offsets (global node indices)
+    targets  : int32[n_edges]     — neighbor global node ids
+    distances: float64[n_edges]   — edge distances in metres
+    sectors  : int32[n_edges]     — sector index of each edge
+    """
+    n_nodes = len(node_x)
+    corridor_ids = np.where(corridor_mask)[0]
+    n_corridor = len(corridor_ids)
+
+    empty = (np.zeros(n_nodes + 1, dtype=np.int32),
+             np.empty(0, dtype=np.int32),
+             np.empty(0, dtype=np.float64),
+             np.empty(0, dtype=np.int32))
+    if n_corridor == 0:
+        return empty
+
+    pts = np.column_stack([node_x[corridor_ids], node_y[corridor_ids]])
+    dists_all, idxs_all = tree.query(pts, k=k_candidates)
+
+    dx = node_x[idxs_all] - node_x[corridor_ids, np.newaxis]
+    dy = node_y[idxs_all] - node_y[corridor_ids, np.newaxis]
+    bearings = np.degrees(np.arctan2(dx, dy)) % 360.0
+    sec_all = (bearings / sector_width).astype(np.int32) % n_sectors
+
+    valid_cand = ((idxs_all != corridor_ids[:, np.newaxis]) &
+                  (dists_all >= min_edge_m) & (dists_all <= max_edge_m))
+
+    best_nb = np.full((n_corridor, n_sectors), -1, dtype=np.int32)
+    best_d = np.full((n_corridor, n_sectors), np.inf)
+
+    for s in range(n_sectors):
+        s_mask = (sec_all == s) & valid_cand
+        d_m = np.where(s_mask, dists_all, np.inf)
+        bk = np.argmin(d_m, axis=1)
+        bd = np.take_along_axis(d_m, bk[:, np.newaxis], axis=1)[:, 0]
+        bi = np.take_along_axis(idxs_all, bk[:, np.newaxis], axis=1)[:, 0]
+        ok = bd < np.inf
+        best_nb[ok, s] = bi[ok]
+        best_d[ok, s] = bd[ok]
+
+    has_edge = best_nb >= 0
+    ci_idx, s_idx = np.nonzero(has_edge)
+    if len(ci_idx) == 0:
+        return empty
+    edge_dst = best_nb[ci_idx, s_idx].astype(np.int32)
+    edge_dis = best_d[ci_idx, s_idx]
+    edge_sec = s_idx.astype(np.int32)
+    edge_src = corridor_ids[ci_idx].astype(np.int32)
+    n_cand = len(edge_dst)
+
+    # Batch LOS via Delaunay find_simplex
+    fracs = np.linspace(0, 1, n_los_samples)
+    sx = node_x[edge_src]
+    sy = node_y[edge_src]
+    ex = node_x[edge_dst]
+    ey = node_y[edge_dst]
+
+    samp_x = sx[:, np.newaxis] + fracs[np.newaxis, :] * (ex - sx)[:, np.newaxis]
+    samp_y = sy[:, np.newaxis] + fracs[np.newaxis, :] * (ey - sy)[:, np.newaxis]
+    flat_pts = np.column_stack([samp_x.ravel(), samp_y.ravel()])
+
+    CHUNK = 5_000_000
+    flat_ok = np.zeros(len(flat_pts), dtype=bool)
+    for c0 in range(0, len(flat_pts), CHUNK):
+        c1 = min(c0 + CHUNK, len(flat_pts))
+        simplex = delaunay.find_simplex(flat_pts[c0:c1])
+        in_hull = simplex >= 0
+        flat_ok[c0:c1][in_hull] = valid_triangle[simplex[in_hull]]
+
+    los_pass = flat_ok.reshape(n_cand, n_los_samples).all(axis=1)
+
+    f_src = edge_src[los_pass]
+    f_dst = edge_dst[los_pass]
+    f_dis = edge_dis[los_pass]
+    f_sec = edge_sec[los_pass]
+
+    order = np.argsort(f_src, kind='stable')
+    f_src = f_src[order]
+    f_dst = f_dst[order]
+    f_dis = f_dis[order]
+    f_sec = f_sec[order]
+
+    counts = np.bincount(f_src, minlength=n_nodes).astype(np.int32)
+    offsets = np.zeros(n_nodes + 1, dtype=np.int32)
+    np.cumsum(counts, out=offsets[1:])
+
+    return offsets, f_dst, f_dis, f_sec
+
+
+# ===================================================================
+#  Numba A* kernel for SectorRouter (fixed-speed AND polar+wind)
+# ===================================================================
+
+_KNOTS_TO_MS_C = KNOTS_TO_MS
+_MS_TO_KNOTS_C = MS_TO_KNOTS
+
+if _NUMBA_AVAILABLE:
+    @_numba_mod.njit(cache=True)
+    def _sector_astar_jit(
+        adj_offsets, adj_targets, adj_dists, adj_sectors,
+        node_x, node_y,
+        u_frames, v_frames, frame_times,
+        start_node, end_node, start_time_s,
+        boat_speed_ms, max_speed,
+        # Polar table (pass empty arrays + has_polar=False to disable)
+        has_polar, polar_twas, polar_twss, polar_speeds, polar_min_twa,
+        sweep_hx, sweep_hy, sweep_rads, n_sweep,
+        # Wind at nodes (pass empty arrays + has_wind=False to disable)
+        has_wind, wind_wu_nodes, wind_wv_nodes, wind_frame_times_w,
+        # Routing params
+        tack_penalty_s, tack_threshold_deg,
+        n_sectors, start_sentinel, max_iterations,
+    ):
+        """Numba-compiled A* for the sector-graph router.
+
+        Handles both fixed-speed (no polar) and polar + wind modes.
+        Edge velocity is averaged from the two endpoint node values
+        (no IDW / KD-tree during search).
+        """
+        n_nodes = node_x.shape[0]
+        n_frames = frame_times.shape[0]
+        n_buckets = n_sectors + 1
+        INF = np.inf
+        PI = np.float64(3.141592653589793)
+        KNOTS_TO_MS_L = np.float64(0.514444)
+        MS_TO_KNOTS_L = np.float64(1.0 / 0.514444)
+        SECTOR_WIDTH = 360.0 / n_sectors
+        bs2 = boat_speed_ms * boat_speed_ms
+        goal_x = node_x[end_node]
+        goal_y = node_y[end_node]
+
+        best_cost = np.full((n_nodes, n_buckets), INF)
+        arrival_time = np.full((n_nodes, n_buckets), INF)
+        came_from_node = np.full((n_nodes, n_buckets), -1, dtype=np.int32)
+        came_from_bucket = np.full((n_nodes, n_buckets), -1, dtype=np.int32)
+
+        best_cost[start_node, start_sentinel] = 0.0
+        arrival_time[start_node, start_sentinel] = start_time_s
+
+        max_heap = max(n_nodes * 4, 500000)
+        heap = np.empty((max_heap, 4), dtype=np.float64)
+        hdx0 = goal_x - node_x[start_node]
+        hdy0 = goal_y - node_y[start_node]
+        heap[0, 0] = np.sqrt(hdx0 * hdx0 + hdy0 * hdy0) / max_speed
+        heap[0, 1] = 0.0
+        heap[0, 2] = float(start_node)
+        heap[0, 3] = float(start_sentinel)
+        heap_size = 1
+        explored = 0
+
+        # Pre-compute TWS bracket if polar + wind
+        # (TWS bracket is recomputed per-edge since wind varies spatially)
+
+        while heap_size > 0:
+            if explored >= max_iterations:
+                explored = -1
+                break
+
+            cost = heap[0, 1]
+            node = int(heap[0, 2])
+            bucket_in = int(heap[0, 3])
+            heap_size -= 1
+            if heap_size > 0:
+                heap[0, 0] = heap[heap_size, 0]
+                heap[0, 1] = heap[heap_size, 1]
+                heap[0, 2] = heap[heap_size, 2]
+                heap[0, 3] = heap[heap_size, 3]
+                i = 0
+                while True:
+                    left = 2 * i + 1
+                    right = 2 * i + 2
+                    sm = i
+                    if left < heap_size and heap[left, 0] < heap[sm, 0]:
+                        sm = left
+                    if right < heap_size and heap[right, 0] < heap[sm, 0]:
+                        sm = right
+                    if sm == i:
+                        break
+                    for col in range(4):
+                        tmp = heap[i, col]
+                        heap[i, col] = heap[sm, col]
+                        heap[sm, col] = tmp
+                    i = sm
+
+            if cost > best_cost[node, bucket_in]:
+                continue
+
+            explored += 1
+            if node == end_node:
+                break
+
+            arr_t = arrival_time[node, bucket_in]
+
+            # Time-interpolated current at this node
+            t_c = arr_t
+            if t_c < frame_times[0]:
+                t_c = frame_times[0]
+            elif t_c > frame_times[-1]:
+                t_c = frame_times[-1]
+            if n_frames == 1:
+                u_node = u_frames[0, node]
+                v_node = v_frames[0, node]
+            else:
+                lo, hi = 0, n_frames - 1
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if frame_times[mid] <= t_c:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                fi = lo
+                if fi >= n_frames - 1:
+                    fi = n_frames - 2
+                alpha_c = ((t_c - frame_times[fi]) /
+                           (frame_times[fi + 1] - frame_times[fi])
+                           if frame_times[fi + 1] > frame_times[fi] else 0.0)
+                om_c = 1.0 - alpha_c
+                u_node = u_frames[fi, node] * om_c + u_frames[fi + 1, node] * alpha_c
+                v_node = v_frames[fi, node] * om_c + v_frames[fi + 1, node] * alpha_c
+
+            # Wind at this node (if applicable)
+            wu_node = 0.0
+            wv_node = 0.0
+            if has_wind:
+                n_wf = wind_frame_times_w.shape[0]
+                t_w = arr_t
+                if t_w < wind_frame_times_w[0]:
+                    t_w = wind_frame_times_w[0]
+                elif t_w > wind_frame_times_w[-1]:
+                    t_w = wind_frame_times_w[-1]
+                if n_wf == 1:
+                    wu_node = wind_wu_nodes[0, node]
+                    wv_node = wind_wv_nodes[0, node]
+                else:
+                    lo2, hi2 = 0, n_wf - 1
+                    while lo2 < hi2:
+                        mid2 = (lo2 + hi2 + 1) // 2
+                        if wind_frame_times_w[mid2] <= t_w:
+                            lo2 = mid2
+                        else:
+                            hi2 = mid2 - 1
+                    wi = lo2
+                    if wi >= n_wf - 1:
+                        wi = n_wf - 2
+                    aw = ((t_w - wind_frame_times_w[wi]) /
+                          (wind_frame_times_w[wi + 1] - wind_frame_times_w[wi])
+                          if wind_frame_times_w[wi + 1] > wind_frame_times_w[wi]
+                          else 0.0)
+                    omw = 1.0 - aw
+                    wu_node = wind_wu_nodes[wi, node] * omw + wind_wu_nodes[wi + 1, node] * aw
+                    wv_node = wind_wv_nodes[wi, node] * omw + wind_wv_nodes[wi + 1, node] * aw
+
+            for ei in range(adj_offsets[node], adj_offsets[node + 1]):
+                nb = int(adj_targets[ei])
+                dist = adj_dists[ei]
+                sector_out = int(adj_sectors[ei])
+
+                if dist < 1e-6:
+                    continue
+
+                d_hat_x = (node_x[nb] - node_x[node]) / dist
+                d_hat_y = (node_y[nb] - node_y[node]) / dist
+
+                # Neighbor current (time-interpolated)
+                if n_frames == 1:
+                    u_nb = u_frames[0, nb]
+                    v_nb = v_frames[0, nb]
+                else:
+                    u_nb = u_frames[fi, nb] * om_c + u_frames[fi + 1, nb] * alpha_c
+                    v_nb = v_frames[fi, nb] * om_c + v_frames[fi + 1, nb] * alpha_c
+
+                cu = 0.5 * (u_node + u_nb)
+                cv = 0.5 * (v_node + v_nb)
+
+                # Neighbor wind (if applicable)
+                wu_mid = wu_node
+                wv_mid = wv_node
+                if has_wind:
+                    if n_wf == 1:
+                        wu_nb = wind_wu_nodes[0, nb]
+                        wv_nb = wind_wv_nodes[0, nb]
+                    else:
+                        wu_nb = wind_wu_nodes[wi, nb] * omw + wind_wu_nodes[wi + 1, nb] * aw
+                        wv_nb = wind_wv_nodes[wi, nb] * omw + wind_wv_nodes[wi + 1, nb] * aw
+                    wu_mid = 0.5 * (wu_node + wu_nb)
+                    wv_mid = 0.5 * (wv_node + wv_nb)
+
+                # ----- Edge cost: compute SOG -----
+                best_sog = 0.0
+
+                if has_polar:
+                    tws_ms = np.sqrt(wu_mid * wu_mid + wv_mid * wv_mid)
+                    tws_kt = tws_ms * MS_TO_KNOTS_L
+                    if tws_kt < 1e-3:
+                        # No wind — use base speed
+                        c_par = cu * d_hat_x + cv * d_hat_y
+                        c_px = cu - c_par * d_hat_x
+                        c_py = cv - c_par * d_hat_y
+                        c_perp_sq = c_px * c_px + c_py * c_py
+                        if c_perp_sq < bs2:
+                            s = np.sqrt(bs2 - c_perp_sq) + c_par
+                            if s > 0.01:
+                                best_sog = s
+                    else:
+                        wind_from_rad = np.arctan2(-wv_mid, -wu_mid)
+                        tws_c = tws_kt
+                        if tws_c < polar_twss[0]:
+                            tws_c = polar_twss[0]
+                        elif tws_c > polar_twss[-1]:
+                            tws_c = polar_twss[-1]
+                        n_tws = polar_twss.shape[0]
+                        j0 = 0
+                        for jj in range(n_tws - 1, 0, -1):
+                            if polar_twss[jj] <= tws_c:
+                                j0 = jj
+                                break
+                        if j0 >= n_tws - 1:
+                            j0 = n_tws - 2
+                        j1 = j0 + 1
+                        beta_p = ((tws_c - polar_twss[j0]) /
+                                  (polar_twss[j1] - polar_twss[j0])
+                                  if polar_twss[j1] > polar_twss[j0] else 0.0)
+                        omb = 1.0 - beta_p
+
+                        for h in range(n_sweep):
+                            delta_h = sweep_rads[h] - wind_from_rad
+                            delta_h = (delta_h + PI) % (2.0 * PI) - PI
+                            twa_deg = np.abs(delta_h) * (180.0 / PI)
+
+                            if twa_deg < polar_min_twa:
+                                V_ms = 0.0
+                            else:
+                                twa_c = twa_deg
+                                if twa_c < polar_twas[0]:
+                                    twa_c = polar_twas[0]
+                                elif twa_c > polar_twas[-1]:
+                                    twa_c = polar_twas[-1]
+                                n_twa = polar_twas.shape[0]
+                                i0 = 0
+                                for ii in range(n_twa - 1, 0, -1):
+                                    if polar_twas[ii] <= twa_c:
+                                        i0 = ii
+                                        break
+                                if i0 >= n_twa - 1:
+                                    i0 = n_twa - 2
+                                i1 = i0 + 1
+                                alpha_p = ((twa_c - polar_twas[i0]) /
+                                           (polar_twas[i1] - polar_twas[i0])
+                                           if polar_twas[i1] > polar_twas[i0]
+                                           else 0.0)
+                                oma = 1.0 - alpha_p
+                                V_kt = (oma * omb * polar_speeds[i0, j0] +
+                                        alpha_p * omb * polar_speeds[i1, j0] +
+                                        oma * beta_p * polar_speeds[i0, j1] +
+                                        alpha_p * beta_p * polar_speeds[i1, j1])
+                                V_ms = V_kt * KNOTS_TO_MS_L
+
+                            gx = V_ms * sweep_hx[h] + cu
+                            gy = V_ms * sweep_hy[h] + cv
+                            sog_h = gx * d_hat_x + gy * d_hat_y
+                            drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
+                            prog = max(sog_h, 1e-6)
+                            if sog_h > 0.01 and drift_h <= 0.10 * prog:
+                                if sog_h > best_sog:
+                                    best_sog = sog_h
+
+                else:
+                    # Fixed speed (no polar)
+                    c_par = cu * d_hat_x + cv * d_hat_y
+                    c_px = cu - c_par * d_hat_x
+                    c_py = cv - c_par * d_hat_y
+                    c_perp_sq = c_px * c_px + c_py * c_py
+                    if c_perp_sq < bs2:
+                        s = np.sqrt(bs2 - c_perp_sq) + c_par
+                        if s > 0.01:
+                            best_sog = s
+
+                if best_sog <= 0.01:
+                    continue
+                dt = dist / best_sog
+
+                penalty = 0.0
+                if tack_penalty_s > 0.0 and bucket_in != start_sentinel:
+                    diff = abs(bucket_in - sector_out)
+                    if diff > n_sectors // 2:
+                        diff = n_sectors - diff
+                    if float(diff) * SECTOR_WIDTH > tack_threshold_deg:
+                        penalty = tack_penalty_s
+
+                new_cost = cost + dt + penalty
+                if new_cost < best_cost[nb, sector_out]:
+                    best_cost[nb, sector_out] = new_cost
+                    arrival_time[nb, sector_out] = arr_t + dt
+                    came_from_node[nb, sector_out] = node
+                    came_from_bucket[nb, sector_out] = bucket_in
+
+                    if heap_size < max_heap:
+                        hdx2 = goal_x - node_x[nb]
+                        hdy2 = goal_y - node_y[nb]
+                        new_f = new_cost + np.sqrt(hdx2 * hdx2 + hdy2 * hdy2) / max_speed
+                        heap[heap_size, 0] = new_f
+                        heap[heap_size, 1] = new_cost
+                        heap[heap_size, 2] = float(nb)
+                        heap[heap_size, 3] = float(sector_out)
+                        heap_size += 1
+                        i = heap_size - 1
+                        while i > 0:
+                            parent = (i - 1) // 2
+                            if heap[i, 0] < heap[parent, 0]:
+                                for col in range(4):
+                                    tmp = heap[i, col]
+                                    heap[i, col] = heap[parent, col]
+                                    heap[parent, col] = tmp
+                                i = parent
+                            else:
+                                break
+
+        return best_cost, arrival_time, came_from_node, came_from_bucket, explored
+
+else:
+    _sector_astar_jit = None
 
 
 # ===================================================================
@@ -1844,6 +2616,14 @@ class MeshRouter:
         self.node_y = current_field._y_utm
         self.n_nodes = len(self.node_x)
 
+        # Pre-build CSR adjacency for Numba kernel (built once, reused every route)
+        self._adj_csr_offsets, self._adj_csr_targets = _build_csr_adjacency(
+            self.adj, self.n_nodes)
+
+        # Stack current frames into contiguous 2D arrays: shape (n_frames, n_nodes)
+        self._u_frames_2d = np.stack(current_field.u_frames).astype(np.float64)
+        self._v_frames_2d = np.stack(current_field.v_frames).astype(np.float64)
+
     @property
     def _use_polar(self):
         return self.wind is not None and self.boat.polar is not None
@@ -2086,14 +2866,19 @@ class MeshRouter:
             Hard limit on A* iterations.
         return_debug : bool
             If True, returns a 5th element: dict with 'raw_path' (node ids),
-            'raw_times', and 'explored_nodes' (set of node ids).
+            'raw_times', 'smoothed_path', and 'perf' timing breakdown.
 
         Returns
         -------
         (Route, xs, ys, water_mask[, debug_info])
         """
-        t_wall_0 = _time.monotonic()
+        _perf = {}
+        t_total = _time.monotonic()
 
+        # ------------------------------------------------------------------
+        # Setup: coordinate transform + snap start/end to mesh nodes
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
         transformer = self.cf.transformer
         sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
         ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
@@ -2111,102 +2896,153 @@ class MeshRouter:
         goal_x, goal_y = self.node_x[end_node], self.node_y[end_node]
         boat_speed = self.boat.speed()
         max_speed = boat_speed + self.cf.max_current_speed
+        _perf['setup'] = _time.monotonic() - t0
 
-        print(f"MeshRouter: {self.n_nodes:,} nodes, {len(self.adj):,} with edges")
+        _use_numba = _NUMBA_AVAILABLE and not self._use_polar and _mesh_astar_jit is not None
+        _mode = ('Numba JIT' if _use_numba
+                 else ('Python + polar' if self._use_polar else 'Python'))
+        print(f"MeshRouter: {self.n_nodes:,} nodes, {len(self.adj):,} with edges  [{_mode}]")
         print(f"Start node: {start_node}, End node: {end_node}")
 
-        INF = float('inf')
-        N_BUCKETS = self.N_BEARING_BUCKETS + 1
+        # ------------------------------------------------------------------
+        # A* search
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
 
-        best_cost = {}
-        came_from = {}
-        arrival_time = {}
+        if _use_numba:
+            best_cost_arr, arrival_arr, cf_node_arr, cf_bucket_arr, explored = \
+                _mesh_astar_jit(
+                    self._adj_csr_offsets, self._adj_csr_targets,
+                    self.node_x, self.node_y,
+                    self._u_frames_2d, self._v_frames_2d,
+                    self.cf.frame_times,
+                    start_node, end_node,
+                    start_time_s, boat_speed, max_speed,
+                    self.tack_penalty_s, self.tack_threshold_deg,
+                    self.N_BEARING_BUCKETS, self.START_SENTINEL,
+                    max_iterations,
+                )
+            explored = int(explored)
+            _perf['astar'] = _time.monotonic() - t0
 
-        start_state = (start_node, self.START_SENTINEL)
-        best_cost[start_state] = 0.0
-        arrival_time[start_state] = start_time_s
+            if explored < 0:
+                raise RuntimeError(
+                    f"A* exceeded {max_iterations} iterations (Numba kernel) -- "
+                    "route may be unreachable.")
 
-        open_set = [(self._heuristic(start_node, goal_x, goal_y, max_speed),
-                     0.0, start_node, self.START_SENTINEL)]
-        explored = 0
-        explored_nodes = set()
+            # Path reconstruction from numpy arrays
+            t0 = _time.monotonic()
+            n_buckets = self.N_BEARING_BUCKETS + 1
+            goal_costs = best_cost_arr[end_node, :]
+            final_bucket = int(np.argmin(goal_costs))
+            if not np.isfinite(goal_costs[final_bucket]):
+                raise RuntimeError("No path found between start and end")
 
-        while open_set:
-            if explored >= max_iterations:
-                raise RuntimeError(f"A* exceeded {max_iterations} iterations")
+            raw_path = []
+            raw_times = []
+            node = end_node
+            bucket = final_bucket
+            while True:
+                raw_path.append(node)
+                raw_times.append(float(arrival_arr[node, bucket]))
+                prev_node = int(cf_node_arr[node, bucket])
+                if prev_node < 0:
+                    break
+                prev_bucket = int(cf_bucket_arr[node, bucket])
+                node = prev_node
+                bucket = prev_bucket
+            raw_path.reverse()
+            raw_times.reverse()
+            _perf['reconstruct'] = _time.monotonic() - t0
 
-            _, cost, node, bucket_in = heapq.heappop(open_set)
-            state = (node, bucket_in)
+        else:
+            # Python fallback (also handles polar/wind mode)
+            INF = float('inf')
+            N_BUCKETS = self.N_BEARING_BUCKETS + 1
+            best_cost = {}
+            came_from = {}
+            arrival_time = {}
+            start_state = (start_node, self.START_SENTINEL)
+            best_cost[start_state] = 0.0
+            arrival_time[start_state] = start_time_s
+            open_set = [(self._heuristic(start_node, goal_x, goal_y, max_speed),
+                         0.0, start_node, self.START_SENTINEL)]
+            explored = 0
 
-            if cost > best_cost.get(state, INF):
-                continue
-
-            explored += 1
-            explored_nodes.add(node)
-
-            if node == end_node:
-                break
-
-            arr_t = arrival_time[state]
-
-            for neighbor in self.adj.get(node, []):
-                dx = self.node_x[neighbor] - self.node_x[node]
-                dy = self.node_y[neighbor] - self.node_y[node]
-                bucket_out = self._bearing_bucket(dx, dy)
-
-                dt = self._edge_cost(node, neighbor, arr_t)
-                if dt == INF:
+            while open_set:
+                if explored >= max_iterations:
+                    raise RuntimeError(f"A* exceeded {max_iterations} iterations")
+                _, cost, node, bucket_in = heapq.heappop(open_set)
+                state = (node, bucket_in)
+                if cost > best_cost.get(state, INF):
                     continue
+                explored += 1
+                if node == end_node:
+                    break
+                arr_t = arrival_time[state]
+                for neighbor in self.adj.get(node, []):
+                    dx = self.node_x[neighbor] - self.node_x[node]
+                    dy = self.node_y[neighbor] - self.node_y[node]
+                    bucket_out = self._bearing_bucket(dx, dy)
+                    dt = self._edge_cost(node, neighbor, arr_t)
+                    if dt == INF:
+                        continue
+                    penalty = 0.0
+                    angle_diff = self._bucket_angle_diff(bucket_in, bucket_out)
+                    if self.tack_penalty_s > 0 and angle_diff > self.tack_threshold_deg:
+                        penalty = self.tack_penalty_s
+                    new_cost = cost + dt + penalty
+                    new_state = (neighbor, bucket_out)
+                    if new_cost < best_cost.get(new_state, INF):
+                        best_cost[new_state] = new_cost
+                        arrival_time[new_state] = arr_t + dt
+                        came_from[new_state] = state
+                        h = self._heuristic(neighbor, goal_x, goal_y, max_speed)
+                        heapq.heappush(open_set, (new_cost + h, new_cost, neighbor, bucket_out))
 
-                penalty = 0.0
-                angle_diff = self._bucket_angle_diff(bucket_in, bucket_out)
-                if self.tack_penalty_s > 0 and angle_diff > self.tack_threshold_deg:
-                    penalty = self.tack_penalty_s
+            _perf['astar'] = _time.monotonic() - t0
 
-                new_cost = cost + dt + penalty
-                new_state = (neighbor, bucket_out)
+            goal_states = [(best_cost.get((end_node, b), INF), b)
+                           for b in range(N_BUCKETS)]
+            best_goal_cost, final_bucket = min(goal_states)
+            if best_goal_cost == INF:
+                raise RuntimeError("No path found between start and end")
 
-                if new_cost < best_cost.get(new_state, INF):
-                    best_cost[new_state] = new_cost
-                    arrival_time[new_state] = arr_t + dt
-                    came_from[new_state] = state
-                    h = self._heuristic(neighbor, goal_x, goal_y, max_speed)
-                    heapq.heappush(open_set, (new_cost + h, new_cost, neighbor, bucket_out))
+            t0 = _time.monotonic()
+            raw_path = []
+            raw_times = []
+            state = (end_node, final_bucket)
+            while state in came_from or state == start_state:
+                node, _ = state
+                raw_path.append(node)
+                raw_times.append(arrival_time.get(state, start_time_s))
+                if state == start_state:
+                    break
+                state = came_from.get(state)
+                if state is None:
+                    break
+            raw_path.reverse()
+            raw_times.reverse()
+            _perf['reconstruct'] = _time.monotonic() - t0
 
-        goal_states = [(best_cost.get((end_node, b), INF), b)
-                       for b in range(N_BUCKETS)]
-        best_goal_cost, final_bucket = min(goal_states)
-
-        if best_goal_cost == INF:
-            raise RuntimeError("No path found between start and end")
-
-        raw_path = []
-        raw_times = []
-        state = (end_node, final_bucket)
-        while state in came_from or state == start_state:
-            node, _ = state
-            raw_path.append(node)
-            raw_times.append(arrival_time.get(state, start_time_s))
-            if state == start_state:
-                break
-            state = came_from.get(state)
-            if state is None:
-                break
-        raw_path.reverse()
-        raw_times.reverse()
-
+        # ------------------------------------------------------------------
+        # Path smoothing
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
         path_nodes = self._smooth_path(raw_path, raw_times)
         path_nodes = self._remove_stubs(path_nodes)
+        _perf['smooth'] = _time.monotonic() - t0
 
+        # ------------------------------------------------------------------
+        # Route timing and waypoints
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
         inv_transformer = Transformer.from_crs(
             transformer.target_crs, transformer.source_crs, always_xy=True)
 
         def _compute_leg_times(nodes):
-            """Compute leg times for a list of path nodes."""
             wps = [(self.node_x[n], self.node_y[n]) for n in nodes]
-            times = []
-            dists = []
-            t = start_time_s
+            times, dists, t = [], [], start_time_s
             for k in range(len(wps) - 1):
                 x1, y1 = wps[k]
                 x2, y2 = wps[k + 1]
@@ -2217,10 +3053,8 @@ class MeshRouter:
             return wps, times, dists
 
         def _use_astar_times(nodes, arr_times):
-            """Use the A* arrival times directly (fallback)."""
             wps = [(self.node_x[n], self.node_y[n]) for n in nodes]
-            times = []
-            dists = []
+            times, dists = [], []
             for k in range(len(wps) - 1):
                 x1, y1 = wps[k]
                 x2, y2 = wps[k + 1]
@@ -2230,21 +3064,27 @@ class MeshRouter:
 
         waypoints_utm, leg_times, leg_dists = _compute_leg_times(path_nodes)
         total_time = sum(leg_times)
-
         if not np.isfinite(total_time):
             path_nodes = raw_path
             waypoints_utm, leg_times, leg_dists = _use_astar_times(path_nodes, raw_times)
             total_time = sum(leg_times)
 
         total_dist = sum(leg_dists)
-        avg_sog = (total_dist / total_time * MS_TO_KNOTS) if total_time > 0 and np.isfinite(total_time) else 0.0
+        avg_sog = (total_dist / total_time * MS_TO_KNOTS) if (
+            total_time > 0 and np.isfinite(total_time)) else 0.0
 
         waypoints_latlon = []
         for x, y in waypoints_utm:
             lon, lat = inv_transformer.transform(x, y)
             waypoints_latlon.append((lat, lon))
+        _perf['route_time'] = _time.monotonic() - t0
 
+        # ------------------------------------------------------------------
+        # Track simulation and plotting grid
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
         sim_track, sim_track_times = self._simulate_track(waypoints_utm, start_time_s)
+        _perf['simulate'] = _time.monotonic() - t0
 
         route = Route(
             waypoints_utm=waypoints_utm,
@@ -2260,13 +3100,30 @@ class MeshRouter:
             simulated_track_times=sim_track_times,
         )
 
+        t0 = _time.monotonic()
         xs, ys, water_mask = self._build_grid_for_plotting(
             waypoints_utm, start_latlon, end_latlon)
+        _perf['plot_grid'] = _time.monotonic() - t0
 
-        wall_s = _time.monotonic() - t_wall_0
+        # ------------------------------------------------------------------
+        # Performance report
+        # ------------------------------------------------------------------
+        wall_s = _time.monotonic() - t_total
+        _perf['total'] = wall_s
         n_raw = len(raw_path)
         n_smooth = len(path_nodes)
-        print(f"\nMesh A* completed in {wall_s:.2f}s, explored {explored} nodes")
+
+        print(f"\nMesh A* completed in {wall_s:.2f}s ({_mode}), explored {explored:,} nodes")
+        print(f"  Setup:               {_perf['setup']:.3f}s")
+        print(f"  A* search:           {_perf['astar']:.3f}s")
+        print(f"  Path reconstruction: {_perf['reconstruct']:.3f}s")
+        print(f"  Path smoothing:      {_perf['smooth']:.3f}s")
+        print(f"  Route timing:        {_perf['route_time']:.3f}s")
+        print(f"  Track simulation:    {_perf['simulate']:.3f}s")
+        print(f"  Plotting grid:       {_perf['plot_grid']:.3f}s")
+        print(f"  TOTAL:               {wall_s:.3f}s")
+        if _use_numba and _perf['astar'] > 8.0:
+            print("  (Numba JIT compiled on this run — subsequent runs use cache)")
         print(f"Path smoothing: {n_raw} -> {n_smooth} waypoints")
         print(route.summary())
 
@@ -2274,8 +3131,9 @@ class MeshRouter:
             debug_info = {
                 'raw_path': raw_path,
                 'raw_times': raw_times,
-                'explored_nodes': explored_nodes,
+                'explored_nodes': set(raw_path),
                 'smoothed_path': path_nodes,
+                'perf': _perf,
             }
             return route, xs, ys, water_mask, debug_info
 
@@ -2432,9 +3290,53 @@ class SectorRouter:
         # Line-of-sight samples per edge
         self._los_samples = 15
 
+        # Pre-stacked current frames for Numba kernel: (n_frames, n_nodes)
+        self._u_frames_2d = np.stack(current_field.u_frames).astype(np.float64)
+        self._v_frames_2d = np.stack(current_field.v_frames).astype(np.float64)
+
+        # Pre-compute wind values at SSCOFS nodes for Numba kernel
+        self._wind_at_nodes_wu = None  # shape (n_wind_frames, n_nodes)
+        self._wind_at_nodes_wv = None
+        self._wind_frame_times = None
+        self._numba_wind_ready = False
+        if wind is not None:
+            self._precompute_wind_at_nodes()
+
     @property
     def _use_polar(self):
         return self.wind is not None and self.boat.polar is not None
+
+    def _precompute_wind_at_nodes(self):
+        """Map wind field onto SSCOFS node positions for Numba kernel."""
+        w = self.wind
+        if w._mode == 'constant':
+            self._wind_at_nodes_wu = np.full(
+                (1, self.n_nodes), w._wu, dtype=np.float64)
+            self._wind_at_nodes_wv = np.full(
+                (1, self.n_nodes), w._wv, dtype=np.float64)
+            self._wind_frame_times = np.array([0.0], dtype=np.float64)
+            self._numba_wind_ready = True
+        elif w._mode == 'temporal_const':
+            nf = len(w._wu_frames)
+            wu = np.empty((nf, self.n_nodes), dtype=np.float64)
+            wv = np.empty((nf, self.n_nodes), dtype=np.float64)
+            for i in range(nf):
+                wu[i, :] = float(w._wu_frames[i])
+                wv[i, :] = float(w._wv_frames[i])
+            self._wind_at_nodes_wu = wu
+            self._wind_at_nodes_wv = wv
+            self._wind_frame_times = w._frame_times.astype(np.float64)
+            self._numba_wind_ready = True
+        elif w._mode == 'temporal_nodes' and w._node_tree is not None:
+            pts = np.column_stack([self.node_x, self.node_y])
+            _, nn = w._node_tree.query(pts)
+            nn = np.asarray(nn, dtype=np.int64).ravel()
+            self._wind_at_nodes_wu = np.ascontiguousarray(
+                w._wu_frames[:, nn].astype(np.float64))
+            self._wind_at_nodes_wv = np.ascontiguousarray(
+                w._wv_frames[:, nn].astype(np.float64))
+            self._wind_frame_times = w._frame_times.astype(np.float64)
+            self._numba_wind_ready = True
 
     def _bearing_to_sector(self, dx, dy):
         """Convert a direction vector to a sector index (0-15).
@@ -2599,6 +3501,145 @@ class SectorRouter:
 
         return total_time, dist
 
+    # ------------------------------------------------------------------
+    # Sailable route builder (replaces old smooth → stub → tack pipeline)
+    # ------------------------------------------------------------------
+
+    def _build_sailable_route(self, raw_path, raw_times):
+        """Convert raw A* path into a simplified, fully-sailable route.
+
+        Every segment between consecutive output waypoints is verified
+        sailable (finite ``_segment_travel_time``).  The route preserves
+        genuine tack points and follows the actual sailing curve within
+        each tack leg.
+
+        Algorithm
+        ---------
+        1. Detect tack points in the raw path (heading change >= threshold).
+        2. Merge nearby tacks that are closer than min spacing.
+        3. For each inter-tack segment, run Douglas-Peucker-like
+           simplification where the split criterion is **sailability**:
+           a segment is kept as-is only if ``_segment_travel_time`` is
+           finite (sailable heading, no land crossing) *and* the path
+           deviation is small.  Otherwise, split at the most-deviating
+           raw node and recurse.
+        """
+        if len(raw_path) <= 2:
+            return list(raw_path)
+
+        n = len(raw_path)
+        px = np.array([self.node_x[nd] for nd in raw_path])
+        py = np.array([self.node_y[nd] for nd in raw_path])
+
+        tack_threshold = self.SMOOTH_TACK_THRESHOLD_DEG
+        min_spacing    = self.SMOOTH_MIN_TACK_SPACING_M
+        shape_tol      = self.SMOOTH_DP_EPSILON_M
+
+        # ── 1. Compute per-segment headings ─────────────────────────────
+        dx = np.diff(px)
+        dy = np.diff(py)
+        headings = np.degrees(np.arctan2(dx, dy)) % 360.0  # len = n-1
+
+        def _hdiff(h1, h2):
+            d = abs(h2 - h1)
+            return d if d <= 180.0 else 360.0 - d
+
+        # ── 2. Detect raw tack indices ──────────────────────────────────
+        raw_tacks = []
+        for i in range(1, len(headings)):
+            if _hdiff(headings[i - 1], headings[i]) >= tack_threshold:
+                raw_tacks.append(i)
+
+        # ── 3. Merge nearby tacks ───────────────────────────────────────
+        seg_dists = np.hypot(dx, dy)
+        cum_dist  = np.concatenate([[0.0], np.cumsum(seg_dists)])
+
+        merged = []
+        for ti in raw_tacks:
+            if merged and cum_dist[ti] - cum_dist[merged[-1]] < min_spacing:
+                prev_ti = merged[-1]
+                prev_h_before = headings[max(0, prev_ti - 1)]
+                prev_h_after  = headings[min(prev_ti, len(headings) - 1)]
+                this_h_before = headings[max(0, ti - 1)]
+                this_h_after  = headings[min(ti, len(headings) - 1)]
+                if _hdiff(this_h_before, this_h_after) > \
+                   _hdiff(prev_h_before, prev_h_after):
+                    merged[-1] = ti
+            else:
+                merged.append(ti)
+
+        # Segment boundaries: start, tack points, end
+        boundaries = sorted(set([0] + merged + [n - 1]))
+
+        # ── 4. Sailable DP simplification per tack segment ──────────────
+        _seg_time = self._segment_travel_time
+
+        def _sailable_dp(seg_nodes, t_start):
+            """Simplify seg_nodes keeping every segment sailable."""
+            if len(seg_nodes) <= 2:
+                return list(seg_nodes)
+
+            first, last = seg_nodes[0], seg_nodes[-1]
+            x1, y1 = self.node_x[first], self.node_y[first]
+            x2, y2 = self.node_x[last],  self.node_y[last]
+
+            sailable = False
+            t_direct, _ = _seg_time(x1, y1, x2, y2, t_start)
+            if np.isfinite(t_direct):
+                seg_len = np.hypot(x2 - x1, y2 - y1)
+                if seg_len < 1e-6:
+                    return [first, last]
+                spx = np.array([self.node_x[nd] for nd in seg_nodes])
+                spy = np.array([self.node_y[nd] for nd in seg_nodes])
+                devs = np.abs((x2 - x1) * (y1 - spy) -
+                              (x1 - spx) * (y2 - y1)) / seg_len
+                if devs.max() <= shape_tol:
+                    sailable = True
+
+            if sailable:
+                return [first, last]
+
+            # Must split — pick most-deviating point
+            spx = np.array([self.node_x[nd] for nd in seg_nodes])
+            spy = np.array([self.node_y[nd] for nd in seg_nodes])
+            seg_len = np.hypot(x2 - x1, y2 - y1)
+            if seg_len < 1e-6:
+                return [first, last]
+
+            devs = np.abs((x2 - x1) * (y1 - spy) -
+                          (x1 - spx) * (y2 - y1)) / seg_len
+            devs[0] = devs[-1] = 0.0
+            split_idx = int(np.argmax(devs))
+            if split_idx == 0:
+                split_idx = len(seg_nodes) // 2
+
+            left  = _sailable_dp(seg_nodes[:split_idx + 1], t_start)
+
+            t_at_split = t_start
+            t_left, _ = _seg_time(x1, y1,
+                                  self.node_x[seg_nodes[split_idx]],
+                                  self.node_y[seg_nodes[split_idx]],
+                                  t_start)
+            if np.isfinite(t_left):
+                t_at_split = t_start + t_left
+
+            right = _sailable_dp(seg_nodes[split_idx:], t_at_split)
+
+            return left + right[1:]
+
+        result = []
+        for i in range(len(boundaries) - 1):
+            s, e = boundaries[i], boundaries[i + 1]
+            seg = [raw_path[j] for j in range(s, e + 1)]
+            t0 = raw_times[s] if raw_times else 0.0
+            simplified = _sailable_dp(seg, t0)
+            if result and result[-1] == simplified[0]:
+                result.extend(simplified[1:])
+            else:
+                result.extend(simplified)
+
+        return result
+
     def _smooth_path(self, path_nodes, arrival_times,
                       tack_threshold_deg=None, dp_epsilon_m=None,
                       min_tack_spacing_m=None):
@@ -2743,28 +3784,97 @@ class SectorRouter:
         result.append(path_nodes[-1])
         return result
 
+    TACK_ONLY_MIN_ANGLE = 30.0
+    TACK_ONLY_MIN_LEG_M = 400.0
+
+    def _tack_only_filter(self, path_nodes,
+                          min_angle_deg=None, min_leg_m=None):
+        """Keep only start, end, and genuine tack waypoints.
+
+        Pass 1 — drop every waypoint whose turn angle (measured from
+                 the previous *kept* point) is below min_angle_deg.
+        Pass 2 — iteratively remove tack points that create legs shorter
+                 than min_leg_m, collapsing micro-tack sequences.
+
+        Land avoidance is handled downstream by ``_compute_leg_times``,
+        which falls back to raw sub-paths when a simplified leg crosses
+        land.  So this filter can be aggressive.
+        """
+        if min_angle_deg is None:
+            min_angle_deg = self.TACK_ONLY_MIN_ANGLE
+        if min_leg_m is None:
+            min_leg_m = self.TACK_ONLY_MIN_LEG_M
+
+        if len(path_nodes) <= 2:
+            return path_nodes
+
+        def _turn(a, b, c):
+            h1 = np.degrees(np.arctan2(
+                self.node_x[b] - self.node_x[a],
+                self.node_y[b] - self.node_y[a])) % 360.0
+            h2 = np.degrees(np.arctan2(
+                self.node_x[c] - self.node_x[b],
+                self.node_y[c] - self.node_y[b])) % 360.0
+            d = abs(h2 - h1)
+            return d if d <= 180 else 360 - d
+
+        def _dist(a, b):
+            return np.hypot(self.node_x[b] - self.node_x[a],
+                            self.node_y[b] - self.node_y[a])
+
+        # Pass 1: keep only real tacks
+        kept = [path_nodes[0]]
+        for i in range(1, len(path_nodes) - 1):
+            prev = kept[-1]
+            curr = path_nodes[i]
+            nxt = path_nodes[i + 1]
+            if _turn(prev, curr, nxt) >= min_angle_deg:
+                kept.append(curr)
+        kept.append(path_nodes[-1])
+
+        # Pass 2: iteratively merge short tack legs (but preserve
+        # approach tacks whose short leg connects to start or end)
+        start_node, end_node = kept[0], kept[-1]
+        changed = True
+        while changed and len(kept) > 2:
+            changed = False
+            new_kept = [kept[0]]
+            i = 1
+            while i < len(kept) - 1:
+                prev = new_kept[-1]
+                curr = kept[i]
+                nxt = kept[i + 1]
+                leg_in = _dist(prev, curr)
+                leg_out = _dist(curr, nxt)
+
+                touches_endpoint = (prev == start_node or
+                                    nxt == end_node)
+                if (min(leg_in, leg_out) < min_leg_m
+                        and not touches_endpoint):
+                    changed = True
+                    i += 1
+                    continue
+                new_kept.append(curr)
+                i += 1
+            new_kept.append(kept[-1])
+            kept = new_kept
+
+        return kept
+
     def find_route(self, start_latlon, end_latlon, start_time_s=0.0,
                    max_iterations=2_000_000, return_debug=False):
         """Find the time-optimal route between two lat/lon points.
 
-        Parameters
-        ----------
-        start_latlon : (lat, lon)
-        end_latlon : (lat, lon)
-        start_time_s : float
-            Elapsed seconds from the forecast reference time at departure.
-        max_iterations : int
-            Hard limit on A* iterations.
-        return_debug : bool
-            If True, returns a 5th element: dict with 'raw_path', 'raw_times',
-            'explored_nodes', 'smoothed_path'.
-
-        Returns
-        -------
-        (Route, xs, ys, water_mask[, debug_info])
+        Uses a vectorized sector graph + Numba A* kernel when available,
+        falling back to the original Python A* loop otherwise.
         """
-        t_wall_0 = _time.monotonic()
+        _perf = {}
+        t_total = _time.monotonic()
 
+        # ------------------------------------------------------------------
+        # Setup
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
         transformer = self.cf.transformer
         sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
         ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
@@ -2774,7 +3884,6 @@ class SectorRouter:
         start_node = int(start_node)
         end_node = int(end_node)
 
-        # Validate start/end are over water
         cu, _ = self.cf.query(self.node_x[start_node], self.node_y[start_node])
         if np.isnan(cu):
             raise ValueError(f"Start point snapped to land node {start_node}")
@@ -2789,163 +3898,365 @@ class SectorRouter:
         else:
             max_boat_speed = boat_speed
         max_speed = max_boat_speed + self.cf.max_current_speed
+        _perf['setup'] = _time.monotonic() - t0
 
-        print(f"SectorRouter: {self.n_nodes:,} nodes, {self.N_SECTORS} sectors/node")
+        _can_numba = (_NUMBA_AVAILABLE and _sector_astar_jit is not None
+                      and self.cf.delaunay is not None
+                      and self.cf.valid_triangle is not None
+                      and (not self._use_polar
+                           or (self._numba_wind_ready and self.boat.polar is not None)))
+        _mode = 'Numba JIT' if _can_numba else 'Python'
+        print(f"SectorRouter: {self.n_nodes:,} nodes, {self.N_SECTORS} sectors/node  [{_mode}]")
         print(f"Start node: {start_node}, End node: {end_node}")
 
-        INF = float('inf')
-        N_BUCKETS = self.N_SECTORS + 1
+        # ------------------------------------------------------------------
+        # A* search
+        # ------------------------------------------------------------------
+        if _can_numba:
+            # Build corridor: generous bounding box around start/end
+            t0 = _time.monotonic()
+            route_dist = np.hypot(ex - sx, ey - sy)
+            pad = max(route_dist * 1.0, self.max_edge_m * 5, 5000.0)
+            x_lo = min(sx, ex) - pad
+            x_hi = max(sx, ex) + pad
+            y_lo = min(sy, ey) - pad
+            y_hi = max(sy, ey) + pad
+            corridor = ((self.node_x >= x_lo) & (self.node_x <= x_hi) &
+                        (self.node_y >= y_lo) & (self.node_y <= y_hi))
+            n_corr = int(corridor.sum())
+            _perf['corridor'] = _time.monotonic() - t0
 
-        best_cost = {}
-        came_from = {}
-        arrival_time = {}
+            t0 = _time.monotonic()
+            g_off, g_tgt, g_dis, g_sec = _build_corridor_sector_graph(
+                self.node_x, self.node_y, self.cf.tree,
+                self.cf.delaunay, self.cf.valid_triangle,
+                corridor, self.N_SECTORS, self.SECTOR_WIDTH,
+                self.k_candidates, self.min_edge_m, self.max_edge_m,
+                self._los_samples,
+            )
+            n_edges = len(g_tgt)
+            _perf['graph_build'] = _time.monotonic() - t0
+            print(f"Corridor: {n_corr:,} nodes, {n_edges:,} edges "
+                  f"(built in {_perf['graph_build']:.2f}s)")
 
-        start_state = (start_node, self.START_SENTINEL)
-        best_cost[start_state] = 0.0
-        arrival_time[start_state] = start_time_s
+            # Prepare polar arrays (dummy if no polar)
+            has_polar = self._use_polar
+            if has_polar:
+                p = self.boat.polar
+                polar_twas = np.ascontiguousarray(p._twas.astype(np.float64))
+                polar_twss = np.ascontiguousarray(p._twss.astype(np.float64))
+                polar_speeds = np.ascontiguousarray(p._speeds.astype(np.float64))
+                polar_min_twa = float(p.minimum_twa)
+            else:
+                polar_twas = np.empty(0, dtype=np.float64)
+                polar_twss = np.empty(0, dtype=np.float64)
+                polar_speeds = np.empty((0, 0), dtype=np.float64)
+                polar_min_twa = 0.0
 
-        open_set = [(self._heuristic(start_node, goal_x, goal_y, max_speed),
-                     0.0, start_node, self.START_SENTINEL)]
-        explored = 0
-        explored_nodes = set()
+            has_wind = self._numba_wind_ready
+            if has_wind:
+                wind_wu = self._wind_at_nodes_wu
+                wind_wv = self._wind_at_nodes_wv
+                wind_ft = self._wind_frame_times
+            else:
+                wind_wu = np.empty((0, 0), dtype=np.float64)
+                wind_wv = np.empty((0, 0), dtype=np.float64)
+                wind_ft = np.empty(0, dtype=np.float64)
 
-        while open_set:
-            if explored >= max_iterations:
-                raise RuntimeError(f"A* exceeded {max_iterations} iterations")
+            t0 = _time.monotonic()
+            best_cost_arr, arrival_arr, cf_node_arr, cf_bucket_arr, explored = \
+                _sector_astar_jit(
+                    g_off, g_tgt, g_dis, g_sec,
+                    self.node_x, self.node_y,
+                    self._u_frames_2d, self._v_frames_2d,
+                    self.cf.frame_times,
+                    start_node, end_node, start_time_s,
+                    boat_speed, max_speed,
+                    has_polar, polar_twas, polar_twss, polar_speeds,
+                    polar_min_twa,
+                    _SWEEP_HX, _SWEEP_HY, _SWEEP_RADS, len(_SWEEP_HX),
+                    has_wind, wind_wu, wind_wv, wind_ft,
+                    self.tack_penalty_s, self.tack_threshold_deg,
+                    self.N_SECTORS, self.START_SENTINEL, max_iterations,
+                )
+            explored = int(explored)
+            _perf['astar'] = _time.monotonic() - t0
 
-            _, cost, node, sector_in = heapq.heappop(open_set)
-            state = (node, sector_in)
+            if explored < 0:
+                raise RuntimeError(
+                    f"A* exceeded {max_iterations} iterations (Numba) -- "
+                    "route may be unreachable.")
 
-            if cost > best_cost.get(state, INF):
-                continue
+            # Reconstruct path
+            t0 = _time.monotonic()
+            n_buckets = self.N_SECTORS + 1
+            gc = best_cost_arr[end_node, :]
+            final_sector = int(np.argmin(gc))
+            if not np.isfinite(gc[final_sector]):
+                raise RuntimeError("No path found between start and end")
 
-            explored += 1
-            explored_nodes.add(node)
+            raw_path = []
+            raw_times = []
+            node = end_node
+            bucket = final_sector
+            while True:
+                raw_path.append(node)
+                raw_times.append(float(arrival_arr[node, bucket]))
+                pn = int(cf_node_arr[node, bucket])
+                if pn < 0:
+                    break
+                pb = int(cf_bucket_arr[node, bucket])
+                node = pn
+                bucket = pb
+            raw_path.reverse()
+            raw_times.reverse()
 
-            if node == end_node:
-                break
+            # All nodes that were reached by A* (any bucket with finite cost)
+            explored_mask = np.any(best_cost_arr < np.inf, axis=1)
+            explored_nodes = set(np.where(explored_mask)[0].tolist())
+            _perf['reconstruct'] = _time.monotonic() - t0
 
-            arr_t = arrival_time[state]
+        else:
+            # ---- Python fallback ----
+            _perf['corridor'] = 0.0
+            _perf['graph_build'] = 0.0
+            t0 = _time.monotonic()
+            INF = float('inf')
+            N_BUCKETS = self.N_SECTORS + 1
+            best_cost = {}
+            came_from = {}
+            arrival_time_d = {}
+            start_state = (start_node, self.START_SENTINEL)
+            best_cost[start_state] = 0.0
+            arrival_time_d[start_state] = start_time_s
+            open_set = [(self._heuristic(start_node, goal_x, goal_y, max_speed),
+                         0.0, start_node, self.START_SENTINEL)]
+            explored = 0
+            explored_nodes = set()
 
-            # Get neighbors for this node (lazy computation)
-            neighbors = self._find_sector_neighbors(node)
-
-            for neighbor, sector_out, dist in neighbors:
-                dt = self._edge_cost(node, neighbor, dist, arr_t)
-                if dt == INF:
+            while open_set:
+                if explored >= max_iterations:
+                    raise RuntimeError(f"A* exceeded {max_iterations} iterations")
+                _, cost, node, sector_in = heapq.heappop(open_set)
+                state = (node, sector_in)
+                if cost > best_cost.get(state, INF):
                     continue
+                explored += 1
+                explored_nodes.add(node)
+                if node == end_node:
+                    break
+                arr_t = arrival_time_d[state]
+                neighbors = self._find_sector_neighbors(node)
+                for neighbor, sector_out, dist in neighbors:
+                    dt = self._edge_cost(node, neighbor, dist, arr_t)
+                    if dt == INF:
+                        continue
+                    penalty = 0.0
+                    angle_diff = self._sector_angle_diff(sector_in, sector_out)
+                    if self.tack_penalty_s > 0 and angle_diff > self.tack_threshold_deg:
+                        penalty = self.tack_penalty_s
+                    new_cost = cost + dt + penalty
+                    new_state = (neighbor, sector_out)
+                    if new_cost < best_cost.get(new_state, INF):
+                        best_cost[new_state] = new_cost
+                        arrival_time_d[new_state] = arr_t + dt
+                        came_from[new_state] = state
+                        h = self._heuristic(neighbor, goal_x, goal_y, max_speed)
+                        heapq.heappush(open_set,
+                                       (new_cost + h, new_cost, neighbor, sector_out))
 
-                penalty = 0.0
-                angle_diff = self._sector_angle_diff(sector_in, sector_out)
-                if self.tack_penalty_s > 0 and angle_diff > self.tack_threshold_deg:
-                    penalty = self.tack_penalty_s
+            _perf['astar'] = _time.monotonic() - t0
+            goal_states = [(best_cost.get((end_node, b), INF), b)
+                           for b in range(N_BUCKETS)]
+            best_goal_cost, final_sector = min(goal_states)
+            if best_goal_cost == INF:
+                raise RuntimeError("No path found between start and end")
 
-                new_cost = cost + dt + penalty
-                new_state = (neighbor, sector_out)
+            t0 = _time.monotonic()
+            raw_path = []
+            raw_times = []
+            state = (end_node, final_sector)
+            while state in came_from or state == start_state:
+                node, _ = state
+                raw_path.append(node)
+                raw_times.append(arrival_time_d.get(state, start_time_s))
+                if state == start_state:
+                    break
+                state = came_from.get(state)
+                if state is None:
+                    break
+            raw_path.reverse()
+            raw_times.reverse()
+            _perf['reconstruct'] = _time.monotonic() - t0
 
-                if new_cost < best_cost.get(new_state, INF):
-                    best_cost[new_state] = new_cost
-                    arrival_time[new_state] = arr_t + dt
-                    came_from[new_state] = state
-                    h = self._heuristic(neighbor, goal_x, goal_y, max_speed)
-                    heapq.heappush(open_set, (new_cost + h, new_cost, neighbor, sector_out))
+        # ------------------------------------------------------------------
+        # Sailable route simplification
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
+        path_nodes = self._build_sailable_route(raw_path, raw_times)
+        _perf['smooth'] = _time.monotonic() - t0
 
-        # Find best goal state
-        goal_states = [(best_cost.get((end_node, b), INF), b)
-                       for b in range(N_BUCKETS)]
-        best_goal_cost, final_sector = min(goal_states)
-
-        if best_goal_cost == INF:
-            raise RuntimeError("No path found between start and end")
-
-        # Reconstruct path
-        raw_path = []
-        raw_times = []
-        state = (end_node, final_sector)
-        while state in came_from or state == start_state:
-            node, _ = state
-            raw_path.append(node)
-            raw_times.append(arrival_time.get(state, start_time_s))
-            if state == start_state:
-                break
-            state = came_from.get(state)
-            if state is None:
-                break
-        raw_path.reverse()
-        raw_times.reverse()
-
-        # Smooth and remove stubs
-        path_nodes = self._smooth_path(raw_path, raw_times)
-        path_nodes = self._remove_stubs(path_nodes)
-
+        # ------------------------------------------------------------------
+        # Route timing and waypoints
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
         inv_transformer = Transformer.from_crs(
             transformer.target_crs, transformer.source_crs, always_xy=True)
 
         def _compute_leg_times(nodes):
-            """Compute leg times; fall back per-leg to raw sub-path if over land."""
+            """Compute per-leg timing.  Every segment should be sailable;
+            fall back to raw sub-path summation only as a safety net."""
             raw_node_idx = {nd: i for i, nd in enumerate(raw_path)}
-            final_nodes = []
-            wps = []
-            times = []
-            dists = []
+            wps, times, dists = [], [], []
+            fallback_speed = max(self.boat.base_speed_knots * 0.514, 0.1)
             t = start_time_s
-
             for k in range(len(nodes) - 1):
                 na, nb = nodes[k], nodes[k + 1]
                 x1, y1 = self.node_x[na], self.node_y[na]
                 x2, y2 = self.node_x[nb], self.node_y[nb]
                 t_seg, d_seg = self._segment_travel_time(x1, y1, x2, y2, t)
-
                 if np.isfinite(t_seg):
-                    if not final_nodes:
-                        final_nodes.append(na)
-                    elif final_nodes[-1] != na:
-                        final_nodes.append(na)
-                    final_nodes.append(nb)
                     wps.append((x1, y1))
                     times.append(t_seg)
                     dists.append(d_seg)
                     t += t_seg
                 else:
-                    # Smoothed leg crosses land — reinsert original raw sub-path
                     ia = raw_node_idx.get(na, -1)
                     ib = raw_node_idx.get(nb, -1)
                     sub = raw_path[ia:ib + 1] if (ia >= 0 and ib > ia) else [na, nb]
+                    leg_t = 0.0
+                    leg_d = 0.0
                     for j in range(len(sub) - 1):
-                        sx1, sy1 = self.node_x[sub[j]],   self.node_y[sub[j]]
-                        sx2, sy2 = self.node_x[sub[j+1]], self.node_y[sub[j+1]]
-                        t_s, d_s = self._segment_travel_time(sx1, sy1, sx2, sy2, t)
-                        if not final_nodes:
-                            final_nodes.append(sub[j])
-                        elif final_nodes[-1] != sub[j]:
-                            final_nodes.append(sub[j])
-                        final_nodes.append(sub[j + 1])
-                        wps.append((sx1, sy1))
+                        sx1 = self.node_x[sub[j]]
+                        sy1 = self.node_y[sub[j]]
+                        sx2 = self.node_x[sub[j + 1]]
+                        sy2 = self.node_y[sub[j + 1]]
+                        t_s, _ = self._segment_travel_time(
+                            sx1, sy1, sx2, sy2, t + leg_t)
                         d_s = np.hypot(sx2 - sx1, sy2 - sy1)
-                        t_s = t_s if np.isfinite(t_s) else (
-                            d_s / max(self.boat.base_speed_knots * 0.514, 0.1))
-                        times.append(t_s)
-                        dists.append(d_s)
-                        t += t_s
+                        if not np.isfinite(t_s):
+                            t_s = d_s / fallback_speed
+                        leg_t += t_s
+                        leg_d += d_s
+                    wps.append((x1, y1))
+                    times.append(leg_t)
+                    dists.append(leg_d)
+                    t += leg_t
+            wps.append((self.node_x[nodes[-1]],
+                        self.node_y[nodes[-1]]))
+            return list(nodes), wps, times, dists
 
-            if final_nodes:
-                wps.append((self.node_x[final_nodes[-1]],
-                            self.node_y[final_nodes[-1]]))
-            return final_nodes, wps, times, dists
-
+        smooth_ids_before_timing = list(path_nodes)
         path_nodes, waypoints_utm, leg_times, leg_dists = _compute_leg_times(path_nodes)
         total_time = sum(leg_times) if leg_times else float('nan')
-
         total_dist = sum(leg_dists)
-        avg_sog = (total_dist / total_time * MS_TO_KNOTS) if total_time > 0 and np.isfinite(total_time) else 0.0
+        avg_sog = (total_dist / total_time * MS_TO_KNOTS) if (
+            total_time > 0 and np.isfinite(total_time)) else 0.0
 
         waypoints_latlon = []
         for x, y in waypoints_utm:
             lon, lat = inv_transformer.transform(x, y)
             waypoints_latlon.append((lat, lon))
+        _perf['route_time'] = _time.monotonic() - t0
 
-        sim_track, sim_track_times = self._simulate_track(waypoints_utm, start_time_s)
+        # ------------------------------------------------------------------
+        # Track from raw A* path (follows actual tacking, correct timing)
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
+        sim_track = [(self.node_x[n], self.node_y[n]) for n in raw_path]
+        sim_track_times = list(raw_times)
+        _perf['simulate'] = _time.monotonic() - t0
 
+        # ------------------------------------------------------------------
+        # Build rich diagnostics (always collected, cheap)
+        # ------------------------------------------------------------------
+        t0 = _time.monotonic()
+        _dbg = {}
+
+        # ---- Raw A* path (before smoothing) ----
+        raw_ids = np.array(raw_path, dtype=np.int32)
+        _dbg['raw_node_ids'] = raw_ids
+        _dbg['raw_x'] = self.node_x[raw_ids]
+        _dbg['raw_y'] = self.node_y[raw_ids]
+        _dbg['raw_arrival_s'] = np.array(raw_times, dtype=np.float64)
+
+        raw_ll = np.empty((len(raw_ids), 2))
+        for ri, nid in enumerate(raw_ids):
+            lon, lat = inv_transformer.transform(
+                self.node_x[nid], self.node_y[nid])
+            raw_ll[ri] = [lat, lon]
+        _dbg['raw_lat'] = raw_ll[:, 0]
+        _dbg['raw_lon'] = raw_ll[:, 1]
+
+        if len(raw_ids) >= 2:
+            rdx = np.diff(_dbg['raw_x'])
+            rdy = np.diff(_dbg['raw_y'])
+            _dbg['raw_heading_deg'] = np.degrees(np.arctan2(rdx, rdy)) % 360.0
+            _dbg['raw_seg_dist_m'] = np.hypot(rdx, rdy)
+            if len(raw_ids) >= 3:
+                rh = _dbg['raw_heading_deg']
+                rd = np.abs(np.diff(rh))
+                _dbg['raw_turn_deg'] = np.minimum(rd, 360.0 - rd)
+
+        # Current and wind at each raw-path node at its arrival time
+        n_raw = len(raw_ids)
+        raw_cu = np.empty(n_raw)
+        raw_cv = np.empty(n_raw)
+        raw_wu = np.zeros(n_raw)
+        raw_wv = np.zeros(n_raw)
+        for ri in range(n_raw):
+            nid = int(raw_ids[ri])
+            et = float(_dbg['raw_arrival_s'][ri])
+            cu_v, cv_v = self.cf.query(self.node_x[nid], self.node_y[nid],
+                                       elapsed_s=et)
+            raw_cu[ri] = cu_v
+            raw_cv[ri] = cv_v
+            if self.wind is not None:
+                wu_v, wv_v = self.wind.query(self.node_x[nid],
+                                             self.node_y[nid], elapsed_s=et)
+                raw_wu[ri] = wu_v
+                raw_wv[ri] = wv_v
+        _dbg['raw_cu'] = raw_cu
+        _dbg['raw_cv'] = raw_cv
+        if self.wind is not None:
+            _dbg['raw_wu'] = raw_wu
+            _dbg['raw_wv'] = raw_wv
+
+        # Per-segment SOG along the raw path
+        if n_raw >= 2:
+            raw_dt = np.diff(_dbg['raw_arrival_s'])
+            raw_dd = _dbg['raw_seg_dist_m']
+            with np.errstate(divide='ignore', invalid='ignore'):
+                _dbg['raw_sog_kt'] = np.where(
+                    raw_dt > 0, raw_dd / raw_dt * MS_TO_KNOTS, 0.0)
+
+        # ---- Smoothed path (after smooth + stub + tack filter, before leg timing) ----
+        smooth_ids = np.array(smooth_ids_before_timing, dtype=np.int32)
+        _dbg['smooth_node_ids'] = smooth_ids
+        _dbg['smooth_x'] = self.node_x[smooth_ids]
+        _dbg['smooth_y'] = self.node_y[smooth_ids]
+
+        # ---- Explored nodes ----
+        exp_arr = np.array(sorted(explored_nodes), dtype=np.int32)
+        _dbg['explored_node_ids'] = exp_arr
+        _dbg['explored_x'] = self.node_x[exp_arr]
+        _dbg['explored_y'] = self.node_y[exp_arr]
+
+        # ---- Scalars / metadata ----
+        _dbg['start_node'] = np.int32(start_node)
+        _dbg['end_node'] = np.int32(end_node)
+        _dbg['start_time_s'] = np.float64(start_time_s)
+        _dbg['n_nodes_total'] = np.int32(self.n_nodes)
+        _dbg['router_mode'] = np.array(_mode)
+
+        # ---- Performance timings ----
+        _dbg['perf'] = _perf
+
+        _perf['diagnostics'] = _time.monotonic() - t0
+
+        # ------------------------------------------------------------------
+        # Assemble Route
+        # ------------------------------------------------------------------
         route = Route(
             waypoints_utm=waypoints_utm,
             waypoints_latlon=waypoints_latlon,
@@ -2958,28 +4269,42 @@ class SectorRouter:
             nodes_explored=explored,
             simulated_track=sim_track,
             simulated_track_times=sim_track_times,
+            debug=_dbg,
         )
 
+        t0 = _time.monotonic()
         xs, ys, water_mask = self._build_grid_for_plotting(
             waypoints_utm, start_latlon, end_latlon)
+        _perf['plot_grid'] = _time.monotonic() - t0
 
-        wall_s = _time.monotonic() - t_wall_0
-        n_raw = len(raw_path)
-        n_smooth = len(path_nodes)
-        n_cached = len(self._neighbor_cache)
-        print(f"\nSector A* completed in {wall_s:.2f}s, explored {explored} nodes")
-        print(f"Neighbor cache: {n_cached} nodes")
-        print(f"Path smoothing: {n_raw} -> {n_smooth} waypoints")
+        # ------------------------------------------------------------------
+        # Performance report
+        # ------------------------------------------------------------------
+        wall_s = _time.monotonic() - t_total
+        _perf['total'] = wall_s
+        n_raw_ct = len(raw_path)
+        n_smooth_ct = len(smooth_ids_before_timing)
+
+        print(f"\nSector A* completed in {wall_s:.2f}s ({_mode}), explored {explored:,} nodes")
+        print(f"  Setup:               {_perf['setup']:.3f}s")
+        if _can_numba:
+            print(f"  Corridor select:     {_perf['corridor']:.3f}s")
+            print(f"  Graph build:         {_perf['graph_build']:.3f}s")
+        print(f"  A* search:           {_perf['astar']:.3f}s")
+        print(f"  Path reconstruction: {_perf['reconstruct']:.3f}s")
+        print(f"  Path smoothing:      {_perf['smooth']:.3f}s")
+        print(f"  Route timing:        {_perf['route_time']:.3f}s")
+        print(f"  Track simulation:    {_perf['simulate']:.3f}s")
+        print(f"  Diagnostics:         {_perf['diagnostics']:.3f}s")
+        print(f"  Plotting grid:       {_perf['plot_grid']:.3f}s")
+        print(f"  TOTAL:               {wall_s:.3f}s")
+        if _can_numba and _perf['astar'] > 10.0:
+            print("  (Numba JIT compiled on this run — subsequent runs use cache)")
+        print(f"Path smoothing: {n_raw_ct} -> {n_smooth_ct} waypoints")
         print(route.summary())
 
         if return_debug:
-            debug_info = {
-                'raw_path': raw_path,
-                'raw_times': raw_times,
-                'explored_nodes': explored_nodes,
-                'smoothed_path': path_nodes,
-            }
-            return route, xs, ys, water_mask, debug_info
+            return route, xs, ys, water_mask, _dbg
 
         return route, xs, ys, water_mask
 
@@ -3086,29 +4411,8 @@ def plot_route(route, xs, ys, water_mask, current_field,
     speed_grid = np.sqrt(u_grid**2 + v_grid**2) * MS_TO_KNOTS
     speed_grid[~water_mask] = np.nan
 
-    shoreline_path = Path(__file__).parent / "data" / "shoreline_puget.geojson"
-
     def _draw_shoreline(ax):
-        if shoreline_path.exists():
-            try:
-                import geopandas as gpd
-                shore = gpd.read_file(shoreline_path)
-                for geom in shore.geometry:
-                    if geom is None:
-                        continue
-                    lines = []
-                    if geom.geom_type == 'LineString':
-                        lines = [geom]
-                    elif geom.geom_type == 'MultiLineString':
-                        lines = list(geom.geoms)
-                    for line in lines:
-                        coords = np.array(line.coords)
-                        sx_arr, sy_arr = transformer.transform(
-                            coords[:, 0], coords[:, 1])
-                        ax.plot(sx_arr, sy_arr, color='#3d3d3d',
-                                linewidth=0.7, zorder=2)
-            except Exception:
-                pass
+        draw_shoreline(ax, transformer)
 
     def _draw_route(ax, show_legend=True):
         if route.simulated_track and len(route.simulated_track) > 1:
