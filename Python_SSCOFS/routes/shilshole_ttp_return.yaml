@@ -1,15 +1,15 @@
-# Shilshole to Alki and back — March 7 2026
+# Shilshole to Three Tree Point and back — March 7 2026
 #
 # Start/end: Shilshole Bay Marina (47.6829, -122.4123)
-# Turnaround: Alki area 47.60507010977899, -122.39781093087466
+# Turnaround: Alki area (47.4495, -122.3843)
 #
 # Run with:
 #   conda run -n anaconda python run_route.py routes/shilshole_alki_return.yaml
 
 task:
-  name: "Shilshole → Alki → Shilshole"
+  name: "Shilshole → Three Tree Point → Shilshole"
   description: >
-    Down Puget Sound from Shilshole Bay Marina to just south of Alki Point,
+    Down Puget Sound from Shilshole Bay Marina to just south of Three Tree Point,
     then return.  Useful for checking how tidal currents affect timing on a
     southbound vs northbound leg.
 
@@ -19,7 +19,7 @@ departure:
 
 waypoints:
   - [47.682919, -122.412349]    # Shilshole Bay Marina (start/finish)
-  - [47.60507010977899, -122.39781093087466]    # Alki area turnaround  
+  - [47.449485, -122.384278]    # Three Tree Point area turnaround  
   - [47.682919, -122.412349]    # Return to Shilshole
 
 boat:
