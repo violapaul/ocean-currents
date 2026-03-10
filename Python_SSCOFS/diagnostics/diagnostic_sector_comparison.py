@@ -23,15 +23,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sail_routing import (
     SectorRouter, BoatModel,
     load_current_field, MS_TO_KNOTS,
 )
 from run_route import build_boat_and_wind, load_task
+from shoreline_utils import draw_shoreline
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).parent.parent
 YAML_PATH = HERE / "routes" / "shilshole_alki_return.yaml"
 
 # Shorter test endpoint (~4 nm south of Shilshole, confirmed in-water)
@@ -112,8 +113,7 @@ def run_diagnostic():
 
     def make_plot(xlim, ylim, suffix, title_extra="", annotate_raw=True):
         fig, ax = plt.subplots(figsize=(13, 13))
-        fig.patch.set_facecolor("#1a1a2e")
-        ax.set_facecolor("#0f1923")
+        ax.set_facecolor("#f5f8fc")
 
         # Raw path (orange)
         rx = [p[0] for p in raw_utm]
@@ -129,37 +129,38 @@ def run_diagnostic():
                 if xlim[0] <= px_pt <= xlim[1] and ylim[0] <= py_pt <= ylim[1]:
                     ax.annotate(str(idx), (px_pt, py_pt),
                                 textcoords="offset points", xytext=(-5, -9),
-                                fontsize=5, color="#ffcc66",
-                                fontfamily="monospace", alpha=0.7)
+                                fontsize=5, color="#885500",
+                                fontfamily="monospace", alpha=0.8)
 
         # Smoothed path (green)
         smx = [p[0] for p in smooth_utm]
         smy = [p[1] for p in smooth_utm]
-        ax.plot(smx, smy, '-', color="#00ff88", linewidth=2.2, alpha=0.9,
+        ax.plot(smx, smy, '-', color="#007744", linewidth=2.2, alpha=0.9,
                 zorder=7, label=f"Smoothed ({len(smooth_path)} waypoints)",
-                path_effects=[pe.Stroke(linewidth=3.5, foreground="#000000",
-                                        alpha=0.4), pe.Normal()])
+                path_effects=[pe.Stroke(linewidth=3.5, foreground="white",
+                                        alpha=0.6), pe.Normal()])
 
         # Mark smoothed waypoints — colour by type: tack (red) vs. curve (cyan)
         for wi, node in enumerate(smooth_path):
             px_pt, py_pt = node_x[node], node_y[node]
             ri = raw_list.index(node) if node in raw_list else -1
             is_tack = node in tack_nodes
-            colour  = "#ff4466" if is_tack else "#00ccff"
+            colour  = "#cc2244" if is_tack else "#0077cc"
             marker  = "^" if is_tack else "s"
             ax.scatter([px_pt], [py_pt], s=90, c=colour, marker=marker,
                        zorder=9, edgecolors="white", linewidths=1.3)
             lbl = f"{wi}(r{ri})" + (" T" if is_tack else "")
             ax.annotate(lbl, (px_pt, py_pt),
                         textcoords="offset points", xytext=(8, 7),
-                        fontsize=7, color="white", fontfamily="monospace",
+                        fontsize=7, color="#222222", fontfamily="monospace",
                         bbox=dict(boxstyle="round,pad=0.18",
-                                  facecolor="#000000", alpha=0.65))
+                                  facecolor="white", alpha=0.8,
+                                  edgecolor="#cccccc"))
 
         # Legend proxy for tack vs curve
-        ax.scatter([], [], s=90, c="#ff4466", marker="^",
+        ax.scatter([], [], s=90, c="#cc2244", marker="^",
                    edgecolors="white", linewidths=1.3, label="Tack waypoint")
-        ax.scatter([], [], s=90, c="#00ccff", marker="s",
+        ax.scatter([], [], s=90, c="#0077cc", marker="s",
                    edgecolors="white", linewidths=1.3, label="Curve waypoint (DP)")
 
         # Start / end
@@ -168,19 +169,20 @@ def run_diagnostic():
         ax.plot(ex, ey, "s", color="#e74c3c", markersize=14, zorder=10,
                 markeredgecolor="white", markeredgewidth=2.5, label="End")
 
+        draw_shoreline(ax, transformer, zorder=4)
+
         ax.set_xlim(xlim);  ax.set_ylim(ylim);  ax.set_aspect("equal")
-        ax.set_xlabel("Easting (m, UTM)",  color="#aaaaaa", fontsize=9)
-        ax.set_ylabel("Northing (m, UTM)", color="#aaaaaa", fontsize=9)
-        ax.tick_params(colors="#666666", labelsize=8)
+        ax.set_xlabel("Easting (m, UTM)", fontsize=9)
+        ax.set_ylabel("Northing (m, UTM)", fontsize=9)
+        ax.tick_params(labelsize=8)
         for spine in ax.spines.values():
-            spine.set_edgecolor("#334455")
-        ax.grid(True, alpha=0.1, color="#445566")
+            spine.set_edgecolor("#cccccc")
+        ax.grid(True, alpha=0.25, color="#aaaaaa")
 
         ax.set_title(f"SectorRouter — two-pass smoothing{title_extra}",
-                     color="white", fontsize=13, pad=10)
-        ax.legend(loc="upper left", framealpha=0.85,
-                  facecolor="#0d1b2a", edgecolor="#334455",
-                  labelcolor="white", fontsize=8.5, ncol=2)
+                     fontsize=13, pad=10)
+        ax.legend(loc="upper left", framealpha=0.9,
+                  facecolor="white", edgecolor="#cccccc", fontsize=8.5, ncol=2)
 
         info = (
             f"Raw: {len(raw_path)} nodes\n"
@@ -190,15 +192,14 @@ def run_diagnostic():
             f"SOG: {route.avg_sog_knots:.2f} kt"
         )
         ax.text(0.98, 0.02, info, transform=ax.transAxes,
-                fontsize=8, va="bottom", ha="right", color="white",
+                fontsize=8, va="bottom", ha="right", color="#222222",
                 fontfamily="monospace",
-                bbox=dict(boxstyle="round,pad=0.4", facecolor="#0d1b2a",
-                          alpha=0.9, edgecolor="#334455"))
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                          alpha=0.9, edgecolor="#cccccc"))
 
         plt.tight_layout()
         out = HERE / "routes" / "output" / f"diagnostic_sector_{suffix}.png"
-        fig.savefig(out, dpi=150, bbox_inches="tight",
-                    facecolor=fig.get_facecolor())
+        fig.savefig(out, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved: {out}")
 

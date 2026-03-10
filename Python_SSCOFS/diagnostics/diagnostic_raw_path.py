@@ -18,14 +18,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sail_routing import (
     Router, BoatModel, load_current_field, KNOTS_TO_MS, MS_TO_KNOTS,
 )
 from run_route import build_boat_and_wind, load_task
+from shoreline_utils import draw_shoreline
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).parent.parent
 YAML_PATH = HERE / "routes" / "shilshole_alki_return.yaml"
 
 
@@ -91,8 +92,7 @@ def run_diagnostic():
     # ── Full-route overview ──────────────────────────────────────────────
     def make_plot(xlim, ylim, suffix, title_extra=""):
         fig, ax = plt.subplots(figsize=(14, 14))
-        fig.patch.set_facecolor("#1a1a2e")
-        ax.set_facecolor("#0f1923")
+        ax.set_facecolor("#f5f8fc")
 
         # Water mask background
         ax.pcolormesh(xs, ys, np.where(water_mask, 0.3, np.nan),
@@ -121,11 +121,11 @@ def run_diagnostic():
         # Smoothed path (green line + squares)
         sx_pts = [p[0] for p in smooth_utm]
         sy_pts = [p[1] for p in smooth_utm]
-        ax.plot(sx_pts, sy_pts, '-', color="#00ff88", linewidth=2.5, alpha=0.9,
+        ax.plot(sx_pts, sy_pts, '-', color="#007744", linewidth=2.5, alpha=0.9,
                 zorder=7, label=f"Smoothed ({len(smooth_rc)} waypoints)",
-                path_effects=[pe.Stroke(linewidth=4, foreground="#000000",
-                                        alpha=0.4), pe.Normal()])
-        ax.scatter(sx_pts, sy_pts, s=80, c="#00ff88", marker="s", zorder=8,
+                path_effects=[pe.Stroke(linewidth=4, foreground="white",
+                                        alpha=0.6), pe.Normal()])
+        ax.scatter(sx_pts, sy_pts, s=80, c="#007744", marker="s", zorder=8,
                    edgecolors="white", linewidths=1.5)
 
         # Label smoothed waypoints with their raw-path index
@@ -137,9 +137,10 @@ def run_diagnostic():
             x_pt, y_pt = xs[rc[1]], ys[rc[0]]
             ax.annotate(f"{i}(r{raw_idx})", (x_pt, y_pt),
                         textcoords="offset points", xytext=(8, 8),
-                        fontsize=7, color="white", fontfamily="monospace",
+                        fontsize=7, color="#333333", fontfamily="monospace",
                         bbox=dict(boxstyle="round,pad=0.2",
-                                  facecolor="#000000", alpha=0.7))
+                                  facecolor="white", alpha=0.75,
+                                  edgecolor="#cccccc"))
 
         # Start / end
         s_x, s_y = transformer.transform(start_ll[1], start_ll[0])
@@ -149,26 +150,26 @@ def run_diagnostic():
         ax.plot(e_x, e_y, "s", color="#e74c3c", markersize=14, zorder=10,
                 markeredgecolor="white", markeredgewidth=2.5, label="End")
 
+        draw_shoreline(ax, transformer, zorder=4)
+
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
         ax.set_aspect("equal")
-        ax.set_xlabel("Easting (m, UTM)", color="#aaaaaa", fontsize=9)
-        ax.set_ylabel("Northing (m, UTM)", color="#aaaaaa", fontsize=9)
-        ax.tick_params(colors="#666666", labelsize=8)
+        ax.set_xlabel("Easting (m, UTM)", fontsize=9)
+        ax.set_ylabel("Northing (m, UTM)", fontsize=9)
+        ax.tick_params(labelsize=8)
         for spine in ax.spines.values():
-            spine.set_edgecolor("#334455")
-        ax.grid(True, alpha=0.1, color="#445566")
+            spine.set_edgecolor("#cccccc")
+        ax.grid(True, alpha=0.25, color="#aaaaaa")
 
         title = f"Grid Router: Raw 8-connected vs Smoothed{title_extra}"
-        ax.set_title(title, color="white", fontsize=13, pad=10)
-        ax.legend(loc="upper left", framealpha=0.85,
-                  facecolor="#0d1b2a", edgecolor="#334455",
-                  labelcolor="white", fontsize=9)
+        ax.set_title(title, fontsize=13, pad=10)
+        ax.legend(loc="upper left", framealpha=0.9,
+                  facecolor="white", edgecolor="#cccccc", fontsize=9)
 
         plt.tight_layout()
         out = HERE / "routes" / "output" / f"diagnostic_grid_{suffix}.png"
-        fig.savefig(out, dpi=150, bbox_inches="tight",
-                    facecolor=fig.get_facecolor())
+        fig.savefig(out, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved: {out}")
 
