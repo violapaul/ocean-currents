@@ -251,9 +251,11 @@ of 180 candidate headings** at 2° resolution.  For each heading `θ`:
 4. Compute along-track SOG = `gx * d̂x + gy * d̂y`.
 5. Compute cross-track drift = `|gx * (-d̂y) + gy * d̂x|`.
 
-Accept a heading if: `SOG > 0.01 m/s` **and** `drift ≤ 0.10 * SOG`.
-The drift tolerance (10%) allows realistic crabbing angles while rejecting
-headings that push the boat far off course.
+Accept a heading if: `SOG > 0.01 m/s` **and** `drift ≤ 0.50 * SOG`.
+The drift tolerance (50%, ~27° max crab angle) accommodates Puget Sound's
+strong tidal currents (up to 2.5 kt) while rejecting headings that produce
+unrealistic ground tracks.  See [POLAR_SWEEP_OPTIMIZATIONS.md](POLAR_SWEEP_OPTIMIZATIONS.md)
+for the history and rationale of this threshold.
 
 The **best SOG** across all accepted headings is used as the edge cost
 divisor: `edge_time = dist / max_SOG`.
@@ -490,8 +492,12 @@ implementation reduces this with:
 
 - adaptive corridor retries (`corridor_pad_factors`, tight-to-wide),
 - in-memory corridor graph caching (`corridor_cache_max`),
-- optional coarse polar heading sweep (`polar_sweep_coarse_step`), and
+- pre-baked dense polar table (`use_dense_polar`) replacing binary search,
+- forward-hemisphere dot filter (`use_dot_filter`) skipping ~90 headings,
+- coarse polar heading sweep (`polar_sweep_coarse_step`), and
 - Numba kernels for expansion and polar/wind cost evaluation.
+
+See [POLAR_SWEEP_OPTIMIZATIONS.md](POLAR_SWEEP_OPTIMIZATIONS.md) for benchmarks.
 
 ### CLI usage
 
@@ -506,9 +512,11 @@ python sail_routing.py \
 
 ```yaml
 routing:
-  router_type: "sector"  # only supported value in run_route.py
+  router_type: "sector"
   tack_penalty_s: 60
-  polar_sweep_coarse_step: 5
+  use_dense_polar: true
+  use_dot_filter: true
+  polar_sweep_coarse_step: 3
   corridor_pad_factors: [0.85, 1.0, 1.35]
   corridor_cache_max: 4
 ```

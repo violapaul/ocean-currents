@@ -963,6 +963,8 @@ def main():
         r_cfg.get("polar_sweep_coarse_step",
                   SectorRouter.POLAR_SWEEP_COARSE_STEP)
     )
+    use_dense_polar = bool(r_cfg.get("use_dense_polar", False))
+    use_dot_filter  = bool(r_cfg.get("use_dot_filter", False))
     corridor_pad_factors_raw = r_cfg.get("corridor_pad_factors")
     corridor_pad_factors = None
     if corridor_pad_factors_raw is not None:
@@ -1020,7 +1022,9 @@ def main():
                           tack_penalty_s=tack_penalty,
                           polar_sweep_coarse_step=polar_sweep_coarse_step,
                           corridor_pad_factors=corridor_pad_factors,
-                          corridor_cache_max=corridor_cache_max)
+                          corridor_cache_max=corridor_cache_max,
+                          use_dense_polar=use_dense_polar,
+                          use_dot_filter=use_dot_filter)
 
     # ---- Run each leg ----
     routes = []

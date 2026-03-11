@@ -192,17 +192,21 @@ wind:
   # output_netcdf: ".wind_cache/my_route_wind.nc"
 ```
 
-`run_route.py` uses `SectorRouter` only. Optional routing performance knobs:
+`run_route.py` uses `SectorRouter` only. Routing performance knobs:
 
 ```yaml
 routing:
   router_type: "sector"
   tack_penalty_s: 60
   duration_hours: 10
-  polar_sweep_coarse_step: 5         # 1 = exact full sweep, >1 = faster approximate
+  use_dense_polar: true              # pre-baked 1°×1kt polar table (eliminates binary search)
+  use_dot_filter: true               # skip backward-hemisphere headings (~2× fewer evaluations)
+  polar_sweep_coarse_step: 3         # 1 = exact, 3 = recommended (fast, negligible quality loss)
   corridor_pad_factors: [0.85, 1.0, 1.35]
   corridor_cache_max: 4
 ```
+
+See [POLAR_SWEEP_OPTIMIZATIONS.md](POLAR_SWEEP_OPTIMIZATIONS.md) for benchmarks and details.
 
 ---
 

@@ -1,10 +1,7 @@
-# Shilshole to Three Tree Point and back — March 7 2026
-#
-# Start/end: Shilshole Bay Marina (47.6829, -122.4123)
-# Turnaround: Alki area (47.4495, -122.3843)
+# Shilshole to Three Tree Point and back
 #
 # Run with:
-#   conda run -n anaconda python run_route.py routes/shilshole_alki_return.yaml
+#   conda run -n anaconda python run_route.py routes/shilshole_ttp_return.yaml
 
 task:
   name: "Shilshole → Three Tree Point → Shilshole"
@@ -19,22 +16,25 @@ departure:
 
 waypoints:
   - [47.682919, -122.412349]    # Shilshole Bay Marina (start/finish)
-  - [47.449485, -122.384278]    # Three Tree Point area turnaround  
+  - [47.449485, -122.384278]    # Three Tree Point area turnaround
   - [47.682919, -122.412349]    # Return to Shilshole
 
 boat:
-  speed_kt: 6.0             # fallback if polar isn't used
-  polar: "../../j105_new_polars.csv"        # sail-config polar with Best Performance envelope
-  minimum_twa: 38             # J/105 beat target ~39°; no-go below that
+  speed_kt: 6.0
+  polar: "../../j105_new_polars.csv"
+  minimum_twa: 38
 
 wind:
   source: "open_meteo_ecmwf"
 
 routing:
-  router_type: "sector"       # only supported router
+  router_type: "sector"
   tack_penalty_s: 60
-  duration_hours: 10          # forecast window to load per leg
+  duration_hours: 10
+  polar_sweep_coarse_step: 3
+  use_dense_polar: true
+  use_dot_filter: true
 
 output:
-  save_plots: true          # save a PNG for each leg
-  plot_dir: "routes/output" # relative to the Python_SSCOFS directory
+  save_plots: true
+  plot_dir: "routes/output"

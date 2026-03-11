@@ -122,6 +122,69 @@ class PolarTable:
         self.max_speed_kt = float(np.nanmax(self._speeds))
         self.max_speed_ms = self.max_speed_kt * KNOTS_TO_MS
 
+        self._build_dense_lookup()
+
+    # ------------------------------------------------------------------
+
+    def _build_dense_lookup(self, max_tws_kt: int = 60):
+        """Pre-bake a dense (1° TWA × 1 kt TWS) lookup array.
+
+        Evaluates the full bilinear interpolation from the sparse polar grid
+        once at startup, producing ``self._polar_dense`` of shape
+        ``(182, max_tws_kt + 2)``.  During A* the Numba kernel can then look
+        up boat speed with direct integer indexing — no binary search needed.
+
+        Index semantics
+        ---------------
+        TWA axis  : row index = int(twa_deg), valid 0..181 (clamped at 181)
+        TWS axis  : col index = int(tws_kt),  valid 0..max_tws_kt (clamped)
+        Fractional bilinear blending still uses the sub-integer remainders
+        so accuracy matches the original sparse-grid interpolation.
+        """
+        n_twa = 182                      # rows: TWA 0 .. 181°
+        n_tws = max_tws_kt + 2           # cols: TWS 0 .. max_tws_kt+1 kt
+        dense = np.zeros((n_twa, n_tws), dtype=np.float64)
+
+        twa_pts = np.arange(n_twa, dtype=np.float64)
+        twa_c = np.clip(twa_pts, self._twas[0], self._twas[-1])
+
+        # TWA bracket for every row — vectorised
+        i0 = np.clip(
+            np.searchsorted(self._twas, twa_c, side='right') - 1,
+            0, len(self._twas) - 2,
+        ).astype(int)
+        i1 = i0 + 1
+        denom_twa = self._twas[i1] - self._twas[i0]
+        alpha = np.where(denom_twa > 0,
+                         (twa_c - self._twas[i0]) / denom_twa,
+                         0.0)
+
+        for col in range(n_tws):
+            tws = float(col)
+            tws_c = float(np.clip(tws, self._twss[0], self._twss[-1]))
+            j0 = int(np.clip(
+                np.searchsorted(self._twss, tws_c, side='right') - 1,
+                0, len(self._twss) - 2,
+            ))
+            j1 = j0 + 1
+            denom_tws = self._twss[j1] - self._twss[j0]
+            beta = (tws_c - self._twss[j0]) / denom_tws if denom_tws > 0 else 0.0
+            oma, omb = 1.0 - alpha, 1.0 - beta
+            dense[:, col] = (
+                oma * omb * self._speeds[i0, j0] +
+                alpha * omb * self._speeds[i1, j0] +
+                oma * beta * self._speeds[i0, j1] +
+                alpha * beta * self._speeds[i1, j1]
+            )
+
+        # Enforce the no-go zone already applied to _speeds.
+        if self.minimum_twa > 0:
+            cutoff = min(int(np.ceil(self.minimum_twa)), n_twa)
+            dense[:cutoff, :] = 0.0
+
+        self._polar_dense = dense
+        self._polar_dense_max_tws = max_tws_kt
+
     # ------------------------------------------------------------------
 
     def _load_simple(self, all_rows):
@@ -1560,62 +1623,249 @@ if _NUMBA_AVAILABLE:
         # Polar table (pass empty arrays + has_polar=False to disable)
         has_polar, polar_twas, polar_twss, polar_speeds, polar_min_twa,
         sweep_hx, sweep_hy, sweep_rads, n_sweep, polar_coarse_step,
+        # Dense pre-baked polar (pass empty array + use_dense_polar=False to disable)
+        use_dense_polar, polar_dense, polar_dense_max_tws,
+        # Forward-hemisphere filter: skip headings pointing away from the target
+        use_dot_filter,
         # Wind at nodes (pass empty arrays + has_wind=False to disable)
         has_wind, wind_wu_nodes, wind_wv_nodes, wind_frame_times_w,
         # Routing params
         tack_penalty_s, tack_threshold_deg,
         n_sectors, start_sentinel, max_iterations,
     ):
-        """Numba-compiled A* for the sector-graph router.
+        """Numba-compiled time-dependent A* over a sector graph.
 
-        Handles both fixed-speed (no polar) and polar + wind modes.
-        Edge velocity is averaged from the two endpoint node values
-        (no IDW / KD-tree during search).
+        Finds the minimum travel-time path from ``start_node`` to ``end_node``
+        through a navigation graph whose edge costs depend on ocean current,
+        wind, and boat polar performance.  The entire function is compiled to
+        native code with ``@njit`` so all data structures are plain NumPy
+        arrays and all loops are scalar.
+
+        State space
+        -----------
+        Each A* state is a (node, sector_bucket) pair.  ``sector_bucket``
+        encodes the compass sector (0 .. n_sectors-1) the boat was travelling
+        in when it *arrived* at the node.  This lets the search track direction
+        changes so a tack penalty can be applied when the outgoing sector on
+        the next edge differs by more than ``tack_threshold_deg``.  The special
+        value ``start_sentinel = n_sectors`` is used for the start node, which
+        has no incoming direction.
+
+        Graph representation (CSR adjacency)
+        -------------------------------------
+        adj_offsets : shape (n_nodes+1,)
+            adj_offsets[i] .. adj_offsets[i+1] are the indices into
+            adj_targets/adj_dists/adj_sectors for node i's outgoing edges.
+        adj_targets : shape (n_edges,)  int32
+            Neighbour node index for each edge.
+        adj_dists   : shape (n_edges,)  float64
+            Edge length in metres.
+        adj_sectors : shape (n_edges,)  int32
+            Compass sector (0-based) of the edge direction.
+
+        Time-interpolated fields
+        ------------------------
+        u_frames, v_frames : shape (n_frames, n_nodes)
+            Ocean current east/north components (m/s) sampled at ``frame_times``.
+        frame_times : shape (n_frames,)
+            Epoch-seconds for each current frame.
+        wind_wu_nodes, wind_wv_nodes : shape (n_wind_frames, n_nodes)
+            Wind east/north components (m/s), only used when ``has_wind=True``.
+        wind_frame_times_w : shape (n_wind_frames,)
+            Epoch-seconds for each wind frame.
+
+        At each node expansion the current at the *arrival time* is linearly
+        interpolated between the two bracketing frames using a binary-search
+        bracket (lo/hi bisection).  Edge current is the average of the current
+        at the two endpoint nodes; edge wind is averaged the same way.
+
+        Edge cost calculation
+        ---------------------
+        For each outgoing edge the code computes ``best_sog`` — the maximum
+        speed-over-ground achievable along the edge direction — then sets
+        ``dt = dist / best_sog``.
+
+        Polar + wind mode (``has_polar=True``, ``has_wind=True``):
+            1. Compute mid-edge TWS (true wind speed) and look up the TWS
+               bracket (j0/j1) in the polar table once per edge.
+            2. Sweep all ``n_sweep`` candidate headings (every 2° around the
+               full circle) in two passes:
+               - Coarse pass: step through headings ``polar_coarse_step``
+                 apart (default 5 → 10° steps → 18 evaluations) to find the
+                 approximate best-heading index.
+               - Refine pass: re-evaluate the (2*coarse_step - 1) headings
+                 surrounding the coarse winner at full 2° resolution.
+            3. For each candidate heading compute the TWA, look up the TWA
+               bracket (i0/i1) in the polar table, bilinearly interpolate the
+               boat speed in knots, convert to m/s, add the mid-edge current
+               vector to get the ground velocity, and measure its along-track
+               component (SOG) and cross-track drift.  Accept the heading only
+               if ``sog > 0.01 m/s`` and ``drift <= 0.10 * sog``.
+            4. Special case: if TWS < 0.001 kt fall back to the fixed-speed
+               crabbing formula below.
+
+        Fixed-speed mode (``has_polar=False`` or no wind):
+            Decompose the current into along-track and cross-track components.
+            The cross-track component must be overcome by crabbing; if it
+            exceeds ``boat_speed_ms`` the edge is impassable.  SOG is
+            ``sqrt(boat_speed^2 - c_perp^2) + c_par``.
+
+        Tack penalty
+        ------------
+        After ``dt`` is computed, if the angular difference between
+        ``bucket_in`` (arrival sector) and ``sector_out`` (departure sector)
+        exceeds ``tack_threshold_deg``, ``tack_penalty_s`` seconds are added
+        to the edge cost.  No penalty is applied from the start node.
+
+        Priority queue
+        --------------
+        A hand-rolled binary min-heap stored in ``heap`` (shape
+        ``(max_heap, 4)``): columns are (f_score, g_cost, node, bucket).
+        ``f_score = g_cost + heuristic`` where the heuristic is
+        ``straight_line_distance / max_speed`` (admissible, so A* is optimal).
+        Sift-down is performed on pop; sift-up on push.
+
+        Parameters
+        ----------
+        adj_offsets, adj_targets, adj_dists, adj_sectors
+            CSR adjacency arrays (see above).
+        node_x, node_y : shape (n_nodes,)
+            Node positions in metres (UTM or similar projected CRS).
+        u_frames, v_frames : shape (n_frames, n_nodes)
+            Time-series ocean current east/north (m/s).
+        frame_times : shape (n_frames,)
+            Epoch-seconds corresponding to each current frame.
+        start_node, end_node : int
+            Source and destination node indices.
+        start_time_s : float
+            Departure time in epoch-seconds.
+        boat_speed_ms : float
+            Nominal boat speed through water (m/s), used as fixed speed when
+            ``has_polar=False`` and as fallback when wind is negligible.
+        max_speed : float
+            Upper-bound speed (m/s) used only for the A* admissible heuristic.
+        has_polar : bool
+            Enable polar-based boat speed (requires ``has_wind=True`` in
+            practice).
+        polar_twas : shape (n_twa,)
+            True-wind-angle breakpoints in the polar table (degrees, 0-180).
+        polar_twss : shape (n_tws,)
+            True-wind-speed breakpoints in the polar table (knots).
+        polar_speeds : shape (n_twa, n_tws)
+            Boat speeds (knots) at each (TWA, TWS) grid point.
+        polar_min_twa : float
+            Headings within this many degrees of dead upwind give zero speed.
+        sweep_hx, sweep_hy : shape (n_sweep,)
+            Pre-computed unit vectors (east, north) for every candidate
+            heading.  Typically the module-level ``_SWEEP_HX/_SWEEP_HY``
+            (180 headings at 2° spacing).
+        sweep_rads : shape (n_sweep,)
+            Corresponding angles in radians.
+        n_sweep : int
+            Number of candidate headings (len of sweep arrays).
+        polar_coarse_step : int
+            Step size for the coarse heading pass.  1 = exact (no coarse);
+            5 = 10° coarse pass followed by 2° refine.
+        use_dense_polar : bool
+            When True, use the pre-baked dense lookup (``polar_dense``)
+            instead of the sparse binary-search path.  Eliminates the TWA
+            and TWS bracket searches from the hot loop.
+        polar_dense : shape (182, polar_dense_max_tws+2)
+            Dense lookup array at 1° TWA × 1 kt TWS resolution, in knots.
+            Row index = int(twa_deg), column index = int(tws_kt).
+        polar_dense_max_tws : int
+            Maximum TWS column index (= number of 1-kt TWS steps covered).
+        use_dot_filter : bool
+            When True, skip any candidate heading whose unit vector has a
+            negative dot product with ``d_hat`` (the desired ground track).
+            This discards the entire backward hemisphere (~90 headings) with a
+            single multiply-add per candidate before doing any polar work.
+            Can be combined with ``polar_coarse_step`` and
+            ``use_dense_polar``.  The filter is exact — no valid heading is
+            discarded — because a heading pointing away from the target can
+            never produce positive SOG along the track.
+        has_wind : bool
+            Whether wind arrays are populated and should be used.
+        wind_wu_nodes, wind_wv_nodes : shape (n_wf, n_nodes)
+            Wind east/north (m/s) at each node and wind frame.
+        wind_frame_times_w : shape (n_wf,)
+            Epoch-seconds for wind frames.
+        tack_penalty_s : float
+            Extra seconds added for each tack/gybe (0 to disable).
+        tack_threshold_deg : float
+            Minimum direction change (degrees) that triggers the tack penalty.
+        n_sectors : int
+            Number of compass sectors for state-space bucketing (e.g. 32).
+        start_sentinel : int
+            Bucket index used for the start node (= n_sectors).
+        max_iterations : int
+            Hard cap on node expansions; returns ``explored = -1`` if hit.
+
+        Returns
+        -------
+        best_cost : ndarray, shape (n_nodes, n_sectors+1)
+            Minimum travel time (seconds) to reach each (node, bucket) state.
+        arrival_time : ndarray, shape (n_nodes, n_sectors+1)
+            Wall-clock arrival time (epoch-seconds) for each state.
+        came_from_node : ndarray int32, shape (n_nodes, n_sectors+1)
+            Parent node index for path reconstruction (-1 = unvisited).
+        came_from_bucket : ndarray int32, shape (n_nodes, n_sectors+1)
+            Parent bucket index for path reconstruction (-1 = unvisited).
+        explored : int
+            Number of node expansions completed.  Special values:
+            -1 = max_iterations reached; -2 = heap overflow (path aborted).
         """
         n_nodes = node_x.shape[0]
         n_frames = frame_times.shape[0]
-        n_buckets = n_sectors + 1
+        n_buckets = n_sectors + 1          # sectors 0..n_sectors-1 + start_sentinel
         INF = np.inf
         PI = np.float64(3.141592653589793)
         KNOTS_TO_MS_L = np.float64(0.514444)
         MS_TO_KNOTS_L = np.float64(1.0 / 0.514444)
-        SECTOR_WIDTH = 360.0 / n_sectors
-        bs2 = boat_speed_ms * boat_speed_ms
+        SECTOR_WIDTH = 360.0 / n_sectors   # degrees per sector bucket
+        bs2 = boat_speed_ms * boat_speed_ms  # boat speed squared, reused in crabbing formula
         goal_x = node_x[end_node]
         goal_y = node_y[end_node]
 
+        # Per-(node, bucket) best travel-time and wall-clock arrival time found so far.
         best_cost = np.full((n_nodes, n_buckets), INF)
         arrival_time = np.full((n_nodes, n_buckets), INF)
+        # Parent pointers for path reconstruction after the search completes.
         came_from_node = np.full((n_nodes, n_buckets), -1, dtype=np.int32)
         came_from_bucket = np.full((n_nodes, n_buckets), -1, dtype=np.int32)
 
         best_cost[start_node, start_sentinel] = 0.0
         arrival_time[start_node, start_sentinel] = start_time_s
 
+        # Min-heap rows: [f_score, g_cost, node (float), bucket (float)].
+        # Stored as float64 so Numba can use a single typed array.
         max_heap = max(n_nodes * 4, 500000)
         heap = np.empty((max_heap, 4), dtype=np.float64)
         hdx0 = goal_x - node_x[start_node]
         hdy0 = goal_y - node_y[start_node]
+        # f = g + h;  h = straight-line distance / max_speed (admissible heuristic).
         heap[0, 0] = np.sqrt(hdx0 * hdx0 + hdy0 * hdy0) / max_speed
-        heap[0, 1] = 0.0
+        heap[0, 1] = 0.0                   # g = 0 at start
         heap[0, 2] = float(start_node)
         heap[0, 3] = float(start_sentinel)
         heap_size = 1
         explored = 0
 
-        # Pre-compute TWS bracket if polar + wind
-        # (TWS bracket is recomputed per-edge since wind varies spatially)
+        # TWS bracket (j0, beta_p) is recomputed per edge because wind varies
+        # spatially; there is no single value we can hoist out of the main loop.
 
         while heap_size > 0:
             if explored >= max_iterations:
                 explored = -1
                 break
 
-            cost = heap[0, 1]
+            # --- Pop minimum f-score state from heap ---
+            cost = heap[0, 1]              # g_cost of this state
             node = int(heap[0, 2])
-            bucket_in = int(heap[0, 3])
+            bucket_in = int(heap[0, 3])    # sector the boat arrived from
             heap_size -= 1
             if heap_size > 0:
+                # Move last entry to root, then sift down to restore heap order.
                 heap[0, 0] = heap[heap_size, 0]
                 heap[0, 1] = heap[heap_size, 1]
                 heap[0, 2] = heap[heap_size, 2]
@@ -1637,6 +1887,7 @@ if _NUMBA_AVAILABLE:
                         heap[sm, col] = tmp
                     i = sm
 
+            # Stale entry: a cheaper path to this (node, bucket) was already found.
             if cost > best_cost[node, bucket_in]:
                 continue
 
@@ -1644,9 +1895,10 @@ if _NUMBA_AVAILABLE:
             if node == end_node:
                 break
 
-            arr_t = arrival_time[node, bucket_in]
+            arr_t = arrival_time[node, bucket_in]  # wall-clock time we arrive here
 
-            # Time-interpolated current at this node
+            # --- Time-interpolate ocean current at this node ---
+            # Clamp to the available frame range so edge cases don't extrapolate.
             t_c = arr_t
             if t_c < frame_times[0]:
                 t_c = frame_times[0]
@@ -1656,6 +1908,8 @@ if _NUMBA_AVAILABLE:
                 u_node = u_frames[0, node]
                 v_node = v_frames[0, node]
             else:
+                # Binary search for the bracketing frame index fi such that
+                # frame_times[fi] <= t_c < frame_times[fi+1].
                 lo, hi = 0, n_frames - 1
                 while lo < hi:
                     mid = (lo + hi + 1) // 2
@@ -1669,11 +1923,11 @@ if _NUMBA_AVAILABLE:
                 alpha_c = ((t_c - frame_times[fi]) /
                            (frame_times[fi + 1] - frame_times[fi])
                            if frame_times[fi + 1] > frame_times[fi] else 0.0)
-                om_c = 1.0 - alpha_c
+                om_c = 1.0 - alpha_c       # weight for frame fi
                 u_node = u_frames[fi, node] * om_c + u_frames[fi + 1, node] * alpha_c
                 v_node = v_frames[fi, node] * om_c + v_frames[fi + 1, node] * alpha_c
 
-            # Wind at this node (if applicable)
+            # --- Time-interpolate wind at this node (same pattern as current) ---
             wu_node = 0.0
             wv_node = 0.0
             if has_wind:
@@ -1705,18 +1959,21 @@ if _NUMBA_AVAILABLE:
                     wu_node = wind_wu_nodes[wi, node] * omw + wind_wu_nodes[wi + 1, node] * aw
                     wv_node = wind_wv_nodes[wi, node] * omw + wind_wv_nodes[wi + 1, node] * aw
 
+            # --- Expand all outgoing edges from the current node ---
             for ei in range(adj_offsets[node], adj_offsets[node + 1]):
                 nb = int(adj_targets[ei])
                 dist = adj_dists[ei]
-                sector_out = int(adj_sectors[ei])
+                sector_out = int(adj_sectors[ei])  # compass sector of this edge's direction
 
                 if dist < 1e-6:
                     continue
 
+                # Unit vector pointing from node → neighbour (desired ground-track direction).
                 d_hat_x = (node_x[nb] - node_x[node]) / dist
                 d_hat_y = (node_y[nb] - node_y[node]) / dist
 
-                # Neighbor current (time-interpolated)
+                # Reuse the same frame bracket (fi, alpha_c) computed for the current node;
+                # the neighbour is evaluated at the same arrival time.
                 if n_frames == 1:
                     u_nb = u_frames[0, nb]
                     v_nb = v_frames[0, nb]
@@ -1724,10 +1981,11 @@ if _NUMBA_AVAILABLE:
                     u_nb = u_frames[fi, nb] * om_c + u_frames[fi + 1, nb] * alpha_c
                     v_nb = v_frames[fi, nb] * om_c + v_frames[fi + 1, nb] * alpha_c
 
+                # Mid-edge current: simple average of the two endpoint values.
                 cu = 0.5 * (u_node + u_nb)
                 cv = 0.5 * (v_node + v_nb)
 
-                # Neighbor wind (if applicable)
+                # Mid-edge wind: default to node wind, then average with neighbour if available.
                 wu_mid = wu_node
                 wv_mid = wv_node
                 if has_wind:
@@ -1740,14 +1998,14 @@ if _NUMBA_AVAILABLE:
                     wu_mid = 0.5 * (wu_node + wu_nb)
                     wv_mid = 0.5 * (wv_node + wv_nb)
 
-                # ----- Edge cost: compute SOG -----
+                # ----- Edge cost: find the best achievable SOG along d_hat -----
                 best_sog = 0.0
 
                 if has_polar:
                     tws_ms = np.sqrt(wu_mid * wu_mid + wv_mid * wv_mid)
                     tws_kt = tws_ms * MS_TO_KNOTS_L
                     if tws_kt < 1e-3:
-                        # No wind — use base speed
+                        # Wind negligible — fall back to fixed-speed crabbing.
                         c_par = cu * d_hat_x + cv * d_hat_y
                         c_px = cu - c_par * d_hat_x
                         c_py = cv - c_par * d_hat_y
@@ -1757,77 +2015,30 @@ if _NUMBA_AVAILABLE:
                             if s > 0.01:
                                 best_sog = s
                     else:
+                        # Direction the wind blows FROM (radians), used to compute TWA.
                         wind_from_rad = np.arctan2(-wv_mid, -wu_mid)
-                        tws_c = tws_kt
-                        if tws_c < polar_twss[0]:
-                            tws_c = polar_twss[0]
-                        elif tws_c > polar_twss[-1]:
-                            tws_c = polar_twss[-1]
-                        n_tws = polar_twss.shape[0]
-                        j0 = 0
-                        for jj in range(n_tws - 1, 0, -1):
-                            if polar_twss[jj] <= tws_c:
-                                j0 = jj
-                                break
-                        if j0 >= n_tws - 1:
-                            j0 = n_tws - 2
-                        j1 = j0 + 1
-                        beta_p = ((tws_c - polar_twss[j0]) /
-                                  (polar_twss[j1] - polar_twss[j0])
-                                  if polar_twss[j1] > polar_twss[j0] else 0.0)
-                        omb = 1.0 - beta_p
                         coarse_step = polar_coarse_step
                         if coarse_step < 1:
                             coarse_step = 1
-                        best_idx = -1
+                        best_idx = -1      # index of the best heading found so far (-1 = none)
 
-                        # Coarse sweep first, then local refine around best heading.
-                        for h in range(0, n_sweep, coarse_step):
-                            delta_h = sweep_rads[h] - wind_from_rad
-                            delta_h = (delta_h + PI) % (2.0 * PI) - PI
-                            twa_deg = np.abs(delta_h) * (180.0 / PI)
+                        if use_dense_polar:
+                            # ---- Dense path: direct integer index, no binary search ----
+                            # TWS bracket via direct integer index into dense array.
+                            j_d = int(tws_kt)
+                            if j_d >= polar_dense_max_tws:
+                                j_d = polar_dense_max_tws - 1
+                            j_d1 = j_d + 1
+                            beta_d = tws_kt - float(j_d)   # fractional TWS within 1-kt cell
+                            omb_d = 1.0 - beta_d
 
-                            if twa_deg < polar_min_twa:
-                                V_ms = 0.0
-                            else:
-                                twa_c = twa_deg
-                                if twa_c < polar_twas[0]:
-                                    twa_c = polar_twas[0]
-                                elif twa_c > polar_twas[-1]:
-                                    twa_c = polar_twas[-1]
-                                n_twa = polar_twas.shape[0]
-                                i0 = 0
-                                for ii in range(n_twa - 1, 0, -1):
-                                    if polar_twas[ii] <= twa_c:
-                                        i0 = ii
-                                        break
-                                if i0 >= n_twa - 1:
-                                    i0 = n_twa - 2
-                                i1 = i0 + 1
-                                alpha_p = ((twa_c - polar_twas[i0]) /
-                                           (polar_twas[i1] - polar_twas[i0])
-                                           if polar_twas[i1] > polar_twas[i0]
-                                           else 0.0)
-                                oma = 1.0 - alpha_p
-                                V_kt = (oma * omb * polar_speeds[i0, j0] +
-                                        alpha_p * omb * polar_speeds[i1, j0] +
-                                        oma * beta_p * polar_speeds[i0, j1] +
-                                        alpha_p * beta_p * polar_speeds[i1, j1])
-                                V_ms = V_kt * KNOTS_TO_MS_L
-
-                            gx = V_ms * sweep_hx[h] + cu
-                            gy = V_ms * sweep_hy[h] + cv
-                            sog_h = gx * d_hat_x + gy * d_hat_y
-                            drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
-                            prog = max(sog_h, 1e-6)
-                            if sog_h > 0.01 and drift_h <= 0.10 * prog:
-                                if sog_h > best_sog:
-                                    best_sog = sog_h
-                                    best_idx = h
-
-                        if coarse_step > 1 and best_idx >= 0:
-                            for off in range(-(coarse_step - 1), coarse_step):
-                                h = (best_idx + off) % n_sweep
+                            # --- Pass 1: coarse sweep (dense) ---
+                            for h in range(0, n_sweep, coarse_step):
+                                # Forward-hemisphere filter: a heading pointing away
+                                # from d_hat can never produce positive SOG along it.
+                                if use_dot_filter and (sweep_hx[h] * d_hat_x +
+                                                       sweep_hy[h] * d_hat_y) < 0.0:
+                                    continue
                                 delta_h = sweep_rads[h] - wind_from_rad
                                 delta_h = (delta_h + PI) % (2.0 * PI) - PI
                                 twa_deg = np.abs(delta_h) * (180.0 / PI)
@@ -1835,11 +2046,113 @@ if _NUMBA_AVAILABLE:
                                 if twa_deg < polar_min_twa:
                                     V_ms = 0.0
                                 else:
+                                    # Direct index — no search needed.
+                                    i_d = int(twa_deg)
+                                    if i_d > 181:
+                                        i_d = 181
+                                    i_d1 = i_d + 1
+                                    if i_d1 > 181:
+                                        i_d1 = 181
+                                    alpha_d = twa_deg - float(i_d)  # sub-degree fraction
+                                    oma_d = 1.0 - alpha_d
+                                    V_kt = (oma_d * omb_d * polar_dense[i_d,  j_d] +
+                                            alpha_d * omb_d * polar_dense[i_d1, j_d] +
+                                            oma_d * beta_d * polar_dense[i_d,  j_d1] +
+                                            alpha_d * beta_d * polar_dense[i_d1, j_d1])
+                                    V_ms = V_kt * KNOTS_TO_MS_L
+
+                                gx = V_ms * sweep_hx[h] + cu
+                                gy = V_ms * sweep_hy[h] + cv
+                                sog_h = gx * d_hat_x + gy * d_hat_y
+                                drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
+                                prog = max(sog_h, 1e-6)
+                                if sog_h > 0.01 and drift_h <= 0.50 * prog:
+                                    if sog_h > best_sog:
+                                        best_sog = sog_h
+                                        best_idx = h
+
+                            # --- Pass 2: refine (dense) ---
+                            # Dot filter not applied here: the refine window is small
+                            # and centred on the coarse winner which already passed.
+                            if coarse_step > 1 and best_idx >= 0:
+                                for off in range(-(coarse_step - 1), coarse_step):
+                                    h = (best_idx + off) % n_sweep
+                                    delta_h = sweep_rads[h] - wind_from_rad
+                                    delta_h = (delta_h + PI) % (2.0 * PI) - PI
+                                    twa_deg = np.abs(delta_h) * (180.0 / PI)
+
+                                    if twa_deg < polar_min_twa:
+                                        V_ms = 0.0
+                                    else:
+                                        i_d = int(twa_deg)
+                                        if i_d > 181:
+                                            i_d = 181
+                                        i_d1 = i_d + 1
+                                        if i_d1 > 181:
+                                            i_d1 = 181
+                                        alpha_d = twa_deg - float(i_d)
+                                        oma_d = 1.0 - alpha_d
+                                        V_kt = (oma_d * omb_d * polar_dense[i_d,  j_d] +
+                                                alpha_d * omb_d * polar_dense[i_d1, j_d] +
+                                                oma_d * beta_d * polar_dense[i_d,  j_d1] +
+                                                alpha_d * beta_d * polar_dense[i_d1, j_d1])
+                                        V_ms = V_kt * KNOTS_TO_MS_L
+
+                                    gx = V_ms * sweep_hx[h] + cu
+                                    gy = V_ms * sweep_hy[h] + cv
+                                    sog_h = gx * d_hat_x + gy * d_hat_y
+                                    drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
+                                    prog = max(sog_h, 1e-6)
+                                    if sog_h > 0.01 and drift_h <= 0.50 * prog:
+                                        if sog_h > best_sog:
+                                            best_sog = sog_h
+
+                        else:
+                            # ---- Sparse path: binary search on TWS then TWA ----
+                            # Clamp TWS to the range covered by the polar table.
+                            tws_c = tws_kt
+                            if tws_c < polar_twss[0]:
+                                tws_c = polar_twss[0]
+                            elif tws_c > polar_twss[-1]:
+                                tws_c = polar_twss[-1]
+                            # Find the TWS bracket (j0, j1) in the polar table.
+                            # This is done once per edge; beta_p/omb are reused for every heading.
+                            n_tws = polar_twss.shape[0]
+                            j0 = 0
+                            for jj in range(n_tws - 1, 0, -1):
+                                if polar_twss[jj] <= tws_c:
+                                    j0 = jj
+                                    break
+                            if j0 >= n_tws - 1:
+                                j0 = n_tws - 2
+                            j1 = j0 + 1
+                            beta_p = ((tws_c - polar_twss[j0]) /
+                                      (polar_twss[j1] - polar_twss[j0])
+                                      if polar_twss[j1] > polar_twss[j0] else 0.0)
+                            omb = 1.0 - beta_p  # complement weight for j0 column
+
+                            # --- Pass 1: coarse heading sweep ---
+                            # Step through every coarse_step-th heading index (e.g. step=5
+                            # → every 10°) to locate the approximate best heading cheaply.
+                            for h in range(0, n_sweep, coarse_step):
+                                if use_dot_filter and (sweep_hx[h] * d_hat_x +
+                                                       sweep_hy[h] * d_hat_y) < 0.0:
+                                    continue
+                                delta_h = sweep_rads[h] - wind_from_rad
+                                delta_h = (delta_h + PI) % (2.0 * PI) - PI  # wrap to [-π, π]
+                                twa_deg = np.abs(delta_h) * (180.0 / PI)
+
+                                if twa_deg < polar_min_twa:
+                                    # Too close to dead upwind — polar gives zero speed.
+                                    V_ms = 0.0
+                                else:
+                                    # Clamp TWA to the range covered by the polar table.
                                     twa_c = twa_deg
                                     if twa_c < polar_twas[0]:
                                         twa_c = polar_twas[0]
                                     elif twa_c > polar_twas[-1]:
                                         twa_c = polar_twas[-1]
+                                    # Find bracketing TWA row (i0, i1) via reverse linear scan.
                                     n_twa = polar_twas.shape[0]
                                     i0 = 0
                                     for ii in range(n_twa - 1, 0, -1):
@@ -1849,51 +2162,114 @@ if _NUMBA_AVAILABLE:
                                     if i0 >= n_twa - 1:
                                         i0 = n_twa - 2
                                     i1 = i0 + 1
+                                    # Fractional position along the TWA axis.
                                     alpha_p = ((twa_c - polar_twas[i0]) /
                                                (polar_twas[i1] - polar_twas[i0])
                                                if polar_twas[i1] > polar_twas[i0]
                                                else 0.0)
                                     oma = 1.0 - alpha_p
+                                    # Bilinear interpolation over the 2×2 polar cell.
+                                    # Rows = TWA axis (i0/i1), columns = TWS axis (j0/j1).
                                     V_kt = (oma * omb * polar_speeds[i0, j0] +
                                             alpha_p * omb * polar_speeds[i1, j0] +
                                             oma * beta_p * polar_speeds[i0, j1] +
                                             alpha_p * beta_p * polar_speeds[i1, j1])
                                     V_ms = V_kt * KNOTS_TO_MS_L
 
+                                # Ground velocity = boat-through-water vector + current vector.
                                 gx = V_ms * sweep_hx[h] + cu
                                 gy = V_ms * sweep_hy[h] + cv
+                                # Along-track component of ground velocity.
                                 sog_h = gx * d_hat_x + gy * d_hat_y
+                                # Cross-track component — reject if it swamps forward progress.
                                 drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
                                 prog = max(sog_h, 1e-6)
-                                if sog_h > 0.01 and drift_h <= 0.10 * prog:
+                                if sog_h > 0.01 and drift_h <= 0.50 * prog:
                                     if sog_h > best_sog:
                                         best_sog = sog_h
+                                        best_idx = h
+
+                            # --- Pass 2: refine around the coarse winner ---
+                            # Re-evaluate the (2*coarse_step - 1) headings bracketing
+                            # best_idx at full 2° resolution to recover the true optimum.
+                            if coarse_step > 1 and best_idx >= 0:
+                                for off in range(-(coarse_step - 1), coarse_step):
+                                    h = (best_idx + off) % n_sweep  # wraps at 360°
+                                    delta_h = sweep_rads[h] - wind_from_rad
+                                    delta_h = (delta_h + PI) % (2.0 * PI) - PI
+                                    twa_deg = np.abs(delta_h) * (180.0 / PI)
+
+                                    if twa_deg < polar_min_twa:
+                                        V_ms = 0.0
+                                    else:
+                                        twa_c = twa_deg
+                                        if twa_c < polar_twas[0]:
+                                            twa_c = polar_twas[0]
+                                        elif twa_c > polar_twas[-1]:
+                                            twa_c = polar_twas[-1]
+                                        n_twa = polar_twas.shape[0]
+                                        i0 = 0
+                                        for ii in range(n_twa - 1, 0, -1):
+                                            if polar_twas[ii] <= twa_c:
+                                                i0 = ii
+                                                break
+                                        if i0 >= n_twa - 1:
+                                            i0 = n_twa - 2
+                                        i1 = i0 + 1
+                                        alpha_p = ((twa_c - polar_twas[i0]) /
+                                                   (polar_twas[i1] - polar_twas[i0])
+                                                   if polar_twas[i1] > polar_twas[i0]
+                                                   else 0.0)
+                                        oma = 1.0 - alpha_p
+                                        V_kt = (oma * omb * polar_speeds[i0, j0] +
+                                                alpha_p * omb * polar_speeds[i1, j0] +
+                                                oma * beta_p * polar_speeds[i0, j1] +
+                                                alpha_p * beta_p * polar_speeds[i1, j1])
+                                        V_ms = V_kt * KNOTS_TO_MS_L
+
+                                    gx = V_ms * sweep_hx[h] + cu
+                                    gy = V_ms * sweep_hy[h] + cv
+                                    sog_h = gx * d_hat_x + gy * d_hat_y
+                                    drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
+                                    prog = max(sog_h, 1e-6)
+                                    if sog_h > 0.01 and drift_h <= 0.50 * prog:
+                                        if sog_h > best_sog:
+                                            best_sog = sog_h
 
                 else:
-                    # Fixed speed (no polar)
-                    c_par = cu * d_hat_x + cv * d_hat_y
-                    c_px = cu - c_par * d_hat_x
-                    c_py = cv - c_par * d_hat_y
+                    # --- Fixed-speed mode (no polar): crabbing formula ---
+                    # Decompose current into along-track and cross-track components.
+                    # The boat crabs to cancel c_perp; if c_perp >= boat_speed the
+                    # edge is impassable (current sweeps the boat sideways faster
+                    # than it can swim).
+                    c_par = cu * d_hat_x + cv * d_hat_y   # current along desired track
+                    c_px = cu - c_par * d_hat_x            # cross-track current (east)
+                    c_py = cv - c_par * d_hat_y            # cross-track current (north)
                     c_perp_sq = c_px * c_px + c_py * c_py
                     if c_perp_sq < bs2:
+                        # SOG = water-speed component along track + along-track current.
                         s = np.sqrt(bs2 - c_perp_sq) + c_par
                         if s > 0.01:
                             best_sog = s
 
                 if best_sog <= 0.01:
-                    continue
-                dt = dist / best_sog
+                    continue                         # edge is impassable; skip
+                dt = dist / best_sog                # travel time for this edge (seconds)
 
+                # --- Tack penalty ---
+                # Apply a time penalty when the boat changes direction by more than
+                # tack_threshold_deg between the incoming and outgoing sectors.
                 penalty = 0.0
                 if tack_penalty_s > 0.0 and bucket_in != start_sentinel:
                     diff = abs(bucket_in - sector_out)
                     if diff > n_sectors // 2:
-                        diff = n_sectors - diff
+                        diff = n_sectors - diff      # shortest angular distance across sectors
                     if float(diff) * SECTOR_WIDTH > tack_threshold_deg:
                         penalty = tack_penalty_s
 
                 new_cost = cost + dt + penalty
                 if new_cost < best_cost[nb, sector_out]:
+                    # Better path found — update tables and push to heap.
                     best_cost[nb, sector_out] = new_cost
                     arrival_time[nb, sector_out] = arr_t + dt + penalty
                     came_from_node[nb, sector_out] = node
@@ -1902,12 +2278,14 @@ if _NUMBA_AVAILABLE:
                     if heap_size < max_heap:
                         hdx2 = goal_x - node_x[nb]
                         hdy2 = goal_y - node_y[nb]
+                        # f = g + h (admissible heuristic: straight-line / max_speed).
                         new_f = new_cost + np.sqrt(hdx2 * hdx2 + hdy2 * hdy2) / max_speed
                         heap[heap_size, 0] = new_f
                         heap[heap_size, 1] = new_cost
                         heap[heap_size, 2] = float(nb)
                         heap[heap_size, 3] = float(sector_out)
                         heap_size += 1
+                        # Sift the new entry up to restore the min-heap property.
                         i = heap_size - 1
                         while i > 0:
                             parent = (i - 1) // 2
@@ -1924,6 +2302,8 @@ if _NUMBA_AVAILABLE:
                         return (best_cost, arrival_time,
                                 came_from_node, came_from_bucket, -2)
 
+        # explored >= 0 : normal exit (goal reached or graph exhausted)
+        # explored == -1: max_iterations cap hit
         return best_cost, arrival_time, came_from_node, came_from_bucket, explored
 
 else:
@@ -3367,7 +3747,9 @@ class SectorRouter:
                  k_candidates: int = 50,
                  polar_sweep_coarse_step: int | None = None,
                  corridor_pad_factors: tuple[float, ...] | list[float] | None = None,
-                 corridor_cache_max: int | None = None):
+                 corridor_cache_max: int | None = None,
+                 use_dense_polar: bool = False,
+                 use_dot_filter: bool = False):
         """
         Parameters
         ----------
@@ -3395,6 +3777,17 @@ class SectorRouter:
             base pad. Defaults to class constant CORRIDOR_PAD_FACTORS.
         corridor_cache_max : int, optional
             Maximum number of corridor graphs to keep in memory cache.
+        use_dense_polar : bool, optional
+            When True, use the pre-baked 1°×1kt dense polar lookup table
+            instead of binary search for every heading evaluation.  Eliminates
+            both the TWS bracket search (per edge) and the TWA bracket search
+            (per heading) from the Numba hot loop.  Default False.
+        use_dot_filter : bool, optional
+            When True, skip any candidate heading whose unit vector has a
+            negative dot product with the desired ground track, pruning the
+            backward hemisphere (~90 of 180 headings) with a single
+            multiply-add.  Works with both dense and sparse polar paths.
+            Default False.
         """
         self.cf = current_field
         self.boat = boat
@@ -3444,6 +3837,25 @@ class SectorRouter:
         self._numba_wind_ready = False
         if wind is not None:
             self._precompute_wind_at_nodes()
+
+        # Dense polar lookup arrays for the Numba kernel
+        self._use_dense_polar = bool(use_dense_polar)
+        if use_dense_polar and boat.polar is not None:
+            self._polar_dense_arr = boat.polar._polar_dense.astype(np.float64)
+            self._polar_dense_max_tws = int(boat.polar._polar_dense_max_tws)
+            print(f"Dense polar lookup enabled "
+                  f"({self._polar_dense_arr.shape[0]}×{self._polar_dense_arr.shape[1]} table)")
+        else:
+            # Pass dummy arrays when not used; Numba requires concrete types.
+            self._polar_dense_arr = np.zeros((1, 1), dtype=np.float64)
+            self._polar_dense_max_tws = 0
+            self._use_dense_polar = False
+
+        # Dot-product forward-hemisphere filter (works with both dense and sparse paths)
+        self._use_dot_filter = bool(use_dot_filter)
+        if self._use_dot_filter:
+            mode = "dense" if self._use_dense_polar else "sparse"
+            print(f"Dot-product forward-hemisphere filter enabled ({mode} polar path)")
 
     @property
     def _use_polar(self):
@@ -4230,6 +4642,9 @@ class SectorRouter:
                         polar_min_twa,
                         _SWEEP_HX, _SWEEP_HY, _SWEEP_RADS, len(_SWEEP_HX),
                         self._polar_sweep_coarse_step,
+                        self._use_dense_polar, self._polar_dense_arr,
+                        self._polar_dense_max_tws,
+                        self._use_dot_filter,
                         has_wind, wind_wu, wind_wv, wind_ft,
                         self.tack_penalty_s, self.tack_threshold_deg,
                         self.N_SECTORS, self.START_SENTINEL, max_iterations,
