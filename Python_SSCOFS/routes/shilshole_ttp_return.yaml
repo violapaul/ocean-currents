@@ -31,9 +31,7 @@ wind:
   source: "open_meteo_ecmwf"
 
 routing:
-  router_type: "sector"       # "sector" (default), "mesh", or "grid" (legacy)
-  grid_resolution_m: 300      # only used for grid router
-  padding_m: 5000             # only used for grid router
+  router_type: "sector"       # only supported router
   tack_penalty_s: 60
   duration_hours: 10          # forecast window to load per leg
 

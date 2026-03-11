@@ -40,13 +40,16 @@ YAML schema:
       # padding_deg: 0.25
       # duration_hours: 12
       # buffer_hours: 2
+      # use_cached_netcdf: true        # reuse existing output_netcdf when present
 
     routing:
-      router_type: "sector"           # "sector" (default), "mesh", or "grid" (legacy)
-      grid_resolution_m: 300          # only used for grid router
-      padding_m: 5000                 # only used for grid router
+      router_type: "sector"           # required; only supported router
       tack_penalty_s: 60
       duration_hours: 10              # forecast window to load per leg
+      # Optional performance knobs (all have safe defaults):
+      # polar_sweep_coarse_step: 5    # 1=exact, >1 faster approximate
+      # corridor_pad_factors: [0.85, 1.0, 1.35]
+      # corridor_cache_max: 4
 
     output:
       save_plots: true
@@ -64,7 +67,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 from sail_routing import (
-    PolarTable, WindField, BoatModel, Router, MeshRouter, SectorRouter,
+    PolarTable, WindField, BoatModel, SectorRouter,
     load_current_field, plot_route,
     KNOTS_TO_MS, MS_TO_KNOTS,
     CurrentField,
@@ -104,6 +107,7 @@ def load_task(yaml_path: Path) -> dict:
 def _build_openmeteo_route_wind(wind_cfg: dict, ctx: dict) -> WindField:
     """Build a dynamic wind field by fetching Open-Meteo ECMWF nodes."""
     from ecmwf_wind import fetch_route_wind_dataset, DEFAULT_TIMEZONE
+    import xarray as xr
 
     tz_req = str(wind_cfg.get("timezone", ctx.get("tz_str", DEFAULT_TIMEZONE)))
     padding_deg = float(wind_cfg.get("padding_deg", 0.25))
@@ -144,25 +148,32 @@ def _build_openmeteo_route_wind(wind_cfg: dict, ctx: dict) -> WindField:
         if not out_csv_path.is_absolute():
             out_csv_path = HERE / out_csv_path
 
-    print("Fetching route-local ECMWF wind nodes…")
-    _, ds, nodes = fetch_route_wind_dataset(
-        waypoints_latlon=ctx["waypoints"],
-        nodes_csv=nodes_csv,
-        timezone=tz_req,
-        padding_deg=padding_deg,
-        step_deg=step_deg,
-        chunk_size=chunk_size,
-        start_date=start_date,
-        end_date=end_date,
-        forecast_days=forecast_days,
-        past_days=past_days,
-        models=models,
-        min_non_null_coverage=min_non_null_coverage,
-        output_csv=out_csv_path,
-        output_netcdf=out_nc_path,
-        use_cached_nodes=(not ctx["no_cache"]),
-        verbose=True,
-    )
+    use_cached_netcdf = bool(wind_cfg.get("use_cached_netcdf", True))
+    if use_cached_netcdf and (not ctx["no_cache"]) and out_nc_path.exists():
+        print(f"Using cached wind dataset: {out_nc_path}")
+        ds = xr.load_dataset(out_nc_path)
+        nodes_count = int(ds.sizes.get("point", len(ds["latitude"].values)))
+    else:
+        print("Fetching route-local ECMWF wind nodes…")
+        _, ds, nodes = fetch_route_wind_dataset(
+            waypoints_latlon=ctx["waypoints"],
+            nodes_csv=nodes_csv,
+            timezone=tz_req,
+            padding_deg=padding_deg,
+            step_deg=step_deg,
+            chunk_size=chunk_size,
+            start_date=start_date,
+            end_date=end_date,
+            forecast_days=forecast_days,
+            past_days=past_days,
+            models=models,
+            min_non_null_coverage=min_non_null_coverage,
+            output_csv=out_csv_path,
+            output_netcdf=out_nc_path,
+            use_cached_nodes=(not ctx["no_cache"]),
+            verbose=True,
+        )
+        nodes_count = len(nodes)
 
     time_vals = np.asarray(ds["time"].values, dtype="datetime64[s]")
     if time_vals.size == 0:
@@ -193,7 +204,7 @@ def _build_openmeteo_route_wind(wind_cfg: dict, ctx: dict) -> WindField:
         wv_frames=wv_frames,
         frame_times_s=frame_times_s,
     )
-    print(f"Wind field ready: {len(nodes)} nodes, {len(frame_times_s)} hourly frames, "
+    print(f"Wind field ready: {nodes_count} nodes, {len(frame_times_s)} hourly frames, "
           f"model={ds.attrs.get('model', 'unknown')}")
     return wind
 
@@ -256,7 +267,7 @@ def build_boat_and_wind(doc: dict, context: dict | None = None):
 # Single-leg routing
 # ---------------------------------------------------------------------------
 
-def run_leg(router: Router, start_ll, end_ll, start_time_s: float,
+def run_leg(router: SectorRouter, start_ll, end_ll, start_time_s: float,
             leg_num: int, leg_label: str) -> tuple:
     """Run A* for one leg. Returns (route, xs, ys, water_mask)."""
     print(f"\n{'─'*60}")
@@ -906,8 +917,6 @@ def main():
                         help="Force fresh SSCOFS download (ignore local cache)")
     parser.add_argument("--no-plots", action="store_true",
                         help="Skip all matplotlib output")
-    parser.add_argument("--resolution", type=float, default=None,
-                        help="Override grid resolution in metres")
     args = parser.parse_args()
 
     yaml_path = Path(args.yaml_file)
@@ -942,11 +951,36 @@ def main():
 
     # ---- Routing config ----
     r_cfg = doc.get("routing", {})
-    resolution_m = args.resolution or float(r_cfg.get("grid_resolution_m", 300))
-    padding_m    = float(r_cfg.get("padding_m", 5000))
     tack_penalty = float(r_cfg.get("tack_penalty_s", 60))
     duration_h   = int(r_cfg.get("duration_hours", 10))
-    router_type  = r_cfg.get("router_type", "sector")  # "sector", "mesh", or "grid"
+    router_type  = str(r_cfg.get("router_type", "sector")).strip().lower()
+    if router_type != "sector":
+        raise ValueError(
+            f"Unsupported routing.router_type={router_type!r}. "
+            "Only 'sector' is supported."
+        )
+    polar_sweep_coarse_step = int(
+        r_cfg.get("polar_sweep_coarse_step",
+                  SectorRouter.POLAR_SWEEP_COARSE_STEP)
+    )
+    corridor_pad_factors_raw = r_cfg.get("corridor_pad_factors")
+    corridor_pad_factors = None
+    if corridor_pad_factors_raw is not None:
+        if isinstance(corridor_pad_factors_raw, (int, float)):
+            corridor_pad_factors = (float(corridor_pad_factors_raw),)
+        elif isinstance(corridor_pad_factors_raw, str):
+            parts = [p.strip() for p in corridor_pad_factors_raw.split(",")]
+            corridor_pad_factors = tuple(float(p) for p in parts if p)
+        elif isinstance(corridor_pad_factors_raw, (list, tuple)):
+            corridor_pad_factors = tuple(float(v) for v in corridor_pad_factors_raw)
+        else:
+            raise ValueError(
+                "routing.corridor_pad_factors must be a number, comma-separated "
+                "string, or list of numbers."
+            )
+    corridor_cache_max = r_cfg.get("corridor_cache_max")
+    if corridor_cache_max is not None:
+        corridor_cache_max = int(corridor_cache_max)
 
     # ---- Output config ----
     out_cfg = doc.get("output", {})
@@ -981,21 +1015,12 @@ def main():
     )
 
     # ---- Build router ----
-    if router_type == "sector":
-        print("Using SectorRouter (16-sector heading-binned connectivity)")
-        router = SectorRouter(cf, boat, wind=wind,
-                              tack_penalty_s=tack_penalty)
-    elif router_type == "mesh":
-        print("Using MeshRouter (A* on SSCOFS Delaunay mesh)")
-        router = MeshRouter(cf, boat, wind=wind,
-                            tack_penalty_s=tack_penalty)
-    else:
-        print("Using Router (8-connected grid, legacy)")
-        router = Router(cf, boat,
-                        resolution_m=resolution_m,
-                        padding_m=padding_m,
-                        wind=wind,
-                        tack_penalty_s=tack_penalty)
+    print(f"Using SectorRouter ({SectorRouter.N_SECTORS}-sector heading-binned connectivity)")
+    router = SectorRouter(cf, boat, wind=wind,
+                          tack_penalty_s=tack_penalty,
+                          polar_sweep_coarse_step=polar_sweep_coarse_step,
+                          corridor_pad_factors=corridor_pad_factors,
+                          corridor_cache_max=corridor_cache_max)
 
     # ---- Run each leg ----
     routes = []

@@ -73,7 +73,7 @@ runs take 1–10 seconds on a laptop).
 | `PolarTable` | Stores boat speed vs TWA/TWS from CSV; bilinear interpolation |
 | `WindField` | Stores wind velocity; constant, spatial-grid, or temporal modes |
 | `BoatModel` | Wraps polar + fallback fixed speed; single `speed()` method |
-| `SectorRouter` | **Default.** 16-sector heading-binned connectivity on SSCOFS nodes |
+| `SectorRouter` | **Default.** 32-sector heading-binned connectivity on SSCOFS nodes |
 | `Router` | Legacy 8-connected UTM grid router |
 | `MeshRouter` | Legacy Delaunay mesh edge router |
 | `Route` | Result container with waypoints, leg times, SOG stats |
@@ -398,22 +398,11 @@ The same greedy string-pulling approach as the grid router, but:
   calling `CurrentField.query()` — any NaN (land) rejects the shortcut.
 - **Stub removal** uses the same geometric heuristic (leg ratio + turn angle).
 
-### CLI usage
+### Status in current entrypoints
 
-```bash
-python sail_routing.py \
-    --start-lat 47.63 --start-lon -122.40 \
-    --end-lat 47.75 --end-lon -122.42 \
-    --mesh
-```
-
-### YAML usage (`run_route.py`)
-
-```yaml
-routing:
-  router_type: "mesh"  # legacy; use "sector" instead
-  tack_penalty_s: 60
-```
+`MeshRouter` remains in the codebase for reference and diagnostics, but the
+current `sail_routing.py` CLI and `run_route.py` YAML entrypoint are configured
+to use `SectorRouter`.
 
 ---
 
@@ -421,7 +410,7 @@ routing:
 
 `SectorRouter` is the recommended router.  It uses SSCOFS element centers as
 routing nodes (inheriting their adaptive density: ~100 m near shore, ~500 m
-offshore) but replaces Delaunay edge adjacency with **16-sector heading-binned
+offshore) but replaces Delaunay edge adjacency with **32-sector heading-binned
 connectivity**.
 
 ### Why SectorRouter?
@@ -430,11 +419,11 @@ The grid router (8 directions) forces zigzag paths that must be heavily
 smoothed.  The mesh router (Delaunay edges, 3–6 directions) has arbitrary angles
 tied to the PDE mesh, causing path wobble.
 
-SectorRouter gives the A\* **16 angular choices** (22.5° sectors) at every node:
+SectorRouter gives the A\* **32 angular choices** (11.25° sectors) at every node:
 
 ```
 For each node, connect to the nearest reachable neighbor in each sector:
-    0 = North, 1 = NNE, 2 = NE, ..., 15 = NNW
+    0 = North, 1 = N by E, 2 = NNE, ..., 31
 ```
 
 This decouples the navigation action lattice from both grid geometry and mesh
@@ -444,9 +433,9 @@ topology, producing paths that already represent reasonable sailing headings.
 
 | Aspect | SectorRouter | MeshRouter | Grid Router |
 |--------|--------------|------------|-------------|
-| Directions per node | 16 | 3–6 | 8 |
+| Directions per node | 32 | 3–6 | 8 |
 | Edge cost eval | `cf.query` at midpoint | Averaged node velocities | `cf.query` at midpoint |
-| Graph build | Lazy (during A\*) | Eager (all edges) | Eager (full grid) |
+| Graph build | Adaptive corridor + cached sector graph | Eager (all edges) | Eager (full grid) |
 | Smoothing | Two-pass (tack-aware DP, ~74% reduction) | Heavy greedy string-pull (217→17 typical) | Heavy greedy string-pull (120→29 typical) |
 
 ### Lazy neighbor discovery
@@ -457,9 +446,9 @@ Neighbors are computed on-demand during A\*:
 def _find_sector_neighbors(self, node_id):
     1. Query KD-tree for k_candidates nearest nodes (default 50)
     2. Filter by distance: min_edge_m < dist < max_edge_m
-    3. Assign each candidate to its heading sector (0–15)
-    4. Keep nearest candidate per sector
-    5. Validate with line-of-sight water check
+    3. Assign each candidate to its heading sector (0–31)
+    4. Try nearest candidate in each sector
+    5. If LOS fails, retry next-nearest candidate in that sector
     6. Cache and return list of (neighbor_id, sector, distance)
 ```
 
@@ -479,16 +468,16 @@ cu, cv = cf.query(mx, my, elapsed_s=arrival_time)
 
 ### Tacking penalty
 
-Same 16-bucket system as MeshRouter, but buckets map directly to sectors:
+Same bucket system as MeshRouter, but buckets map directly to sectors:
 
 ```
-angle_diff = |sector_in - sector_out| * 22.5°
+angle_diff = |sector_in - sector_out| * 11.25°
 if angle_diff > tack_threshold_deg: add tack_penalty_s
 ```
 
 ### Path quality
 
-Because the raw A\* path already has 16 heading options per step, the output
+Because the raw A\* path already has 32 heading options per step, the output
 is cleaner than grid or mesh routing.  A two-pass smoothing step (§11) further
 reduces the waypoint count by ~70–80% on typical Puget Sound routes while
 correctly preserving tacks and handling land avoidance.
@@ -496,33 +485,32 @@ Example: a 4 nm upwind beat produces ~57 raw nodes → 15 smoothed waypoints.
 
 ### Performance
 
-SectorRouter is slower than MeshRouter (~300s vs ~70s for a 20 nm route) due to
-line-of-sight validation during neighbor discovery (~16 × 15 samples × explored
-nodes).  This is acceptable for planning routes; for real-time use, caching or
-pre-building the sector graph would help.
+SectorRouter performance is dominated by A\* state expansion. The current
+implementation reduces this with:
+
+- adaptive corridor retries (`corridor_pad_factors`, tight-to-wide),
+- in-memory corridor graph caching (`corridor_cache_max`),
+- optional coarse polar heading sweep (`polar_sweep_coarse_step`), and
+- Numba kernels for expansion and polar/wind cost evaluation.
 
 ### CLI usage
 
 ```bash
-# SectorRouter is the default (no flag needed)
+# SectorRouter is the active router (no selection flag needed)
 python sail_routing.py \
     --start-lat 47.63 --start-lon -122.40 \
     --end-lat 47.75 --end-lon -122.42
-
-# Explicitly select sector router
-python sail_routing.py ... --sector
-
-# Use legacy routers
-python sail_routing.py ... --mesh   # MeshRouter
-python sail_routing.py ... --grid   # Grid Router
 ```
 
 ### YAML usage (`run_route.py`)
 
 ```yaml
 routing:
-  router_type: "sector"  # default; or "mesh" / "grid" for legacy
+  router_type: "sector"  # only supported value in run_route.py
   tack_penalty_s: 60
+  polar_sweep_coarse_step: 5
+  corridor_pad_factors: [0.85, 1.0, 1.35]
+  corridor_cache_max: 4
 ```
 
 ---
@@ -685,7 +673,6 @@ python sail_routing.py \
     --start-lat 47.63 --start-lon -122.40 \
     --end-lat   47.75 --end-lon   -122.42 \
     --boat-speed 6 \
-    --grid-resolution 300 \
     --depart "2026-03-10 09:00" \
     --save route.png
 ```
@@ -695,8 +682,6 @@ Key flags:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--boat-speed` | 6 kt | Fallback fixed speed (used without polar) |
-| `--grid-resolution` | 300 m | Routing grid cell size |
-| `--padding` | 5000 m | Grid margin beyond start/end |
 | `--polar` | — | Path to polar CSV (simple or sail-config format) |
 | `--minimum-twa` | 0 | No-go zone: zero boat speed below this TWA (degrees) |
 | `--wind-speed` | — | Constant TWS in knots (requires `--wind-direction`) |

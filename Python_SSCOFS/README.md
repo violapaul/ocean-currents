@@ -186,9 +186,22 @@ wind:
   padding_deg: 0.25
   duration_hours: 12
   buffer_hours: 2
+  use_cached_netcdf: true      # reuse cached .nc if it already exists
   # optional cache/output paths (relative to Python_SSCOFS/)
   # nodes_csv: ".wind_cache/my_route_nodes.csv"
   # output_netcdf: ".wind_cache/my_route_wind.nc"
+```
+
+`run_route.py` uses `SectorRouter` only. Optional routing performance knobs:
+
+```yaml
+routing:
+  router_type: "sector"
+  tack_penalty_s: 60
+  duration_hours: 10
+  polar_sweep_coarse_step: 5         # 1 = exact full sweep, >1 = faster approximate
+  corridor_pad_factors: [0.85, 1.0, 1.35]
+  corridor_cache_max: 4
 ```
 
 ---

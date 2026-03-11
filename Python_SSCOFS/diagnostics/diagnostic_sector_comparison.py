@@ -79,8 +79,18 @@ def run_diagnostic():
     route, _, _, _, debug = router.find_route(
         start_ll, end_ll, start_time_s=start_time_s, return_debug=True)
 
-    raw_path    = debug['raw_path']
-    smooth_path = debug['smoothed_path']
+    # Support both legacy and current debug payload keys.
+    raw_path = debug.get('raw_path')
+    if raw_path is None:
+        raw_path = debug.get('raw_node_ids')
+    smooth_path = debug.get('smoothed_path')
+    if smooth_path is None:
+        smooth_path = debug.get('smooth_node_ids')
+    if raw_path is None or smooth_path is None:
+        raise KeyError("Debug payload missing raw/smoothed path keys")
+
+    raw_path = list(np.asarray(raw_path, dtype=np.int64))
+    smooth_path = list(np.asarray(smooth_path, dtype=np.int64))
     node_x      = router.node_x
     node_y      = router.node_y
 

@@ -9,17 +9,16 @@ Phase 1: fixed boat speed through water (current only).
 Phase 2: polar-based speed dependent on true wind angle and speed,
          with optional spatial/time-varying wind field.
 
-The router uses time-dependent A* on a regular grid.  Each node carries
-an arrival time so that edge costs reflect the currents *at that moment*
-(SSCOFS provides hourly forecasts).  With a single time snapshot the
-algorithm degenerates to standard static A*.
+The active router uses time-dependent A* on SSCOFS nodes with heading-binned
+connectivity (SectorRouter). Each node carries an arrival time so edge costs
+reflect currents and wind at that moment (SSCOFS provides hourly forecasts).
+With a single time snapshot the algorithm degenerates to standard static A*.
 
 Usage:
     python sail_routing.py \\
         --start-lat 47.63 --start-lon -122.40 \\
         --end-lat 47.75 --end-lon -122.42 \\
         --boat-speed 6 \\
-        --grid-resolution 300 \\
         --save route.png
 
     # With polar and constant wind:
@@ -28,7 +27,6 @@ Usage:
         --end-lat 47.75 --end-lon -122.42 \\
         --polar /path/to/j105_polar_data_long.csv \\
         --wind-speed 12 --wind-direction 180 \\
-        --grid-resolution 300 \\
         --save route_polar.png
 """
 
@@ -621,13 +619,15 @@ class CurrentField:
         # Build Delaunay triangulation for land detection
         self.delaunay = None
         self.valid_triangle = None
+        self.delaunay_error = None
         if use_delaunay and len(lonc) >= 4:
             try:
                 self.delaunay, self.valid_triangle = build_water_mask_utm(
                     self._x_utm, self._y_utm
                 )
-            except Exception:
-                pass  # Fall back to distance-based detection
+            except Exception as exc:
+                self.delaunay_error = str(exc)
+                # Fall back to distance-based detection.
 
         # Load nav mask for authoritative land detection (DEM-based)
         self._nav_mask = None
@@ -1192,7 +1192,8 @@ if _NUMBA_AVAILABLE:
         arrival_time     : float64[n_nodes, n_buckets]
         came_from_node   : int32[n_nodes, n_buckets]   (-1 = no predecessor)
         came_from_bucket : int32[n_nodes, n_buckets]
-        explored         : int  (-1 if max_iterations exceeded)
+        explored         : int
+            >=0 on success, -1 if max_iterations exceeded, -2 if heap full.
         """
         n_nodes = node_x.shape[0]
         n_frames = frame_times.shape[0]
@@ -1348,7 +1349,7 @@ if _NUMBA_AVAILABLE:
                 new_cost = cost + dt + penalty
                 if new_cost < best_cost[nb, bucket_out]:
                     best_cost[nb, bucket_out] = new_cost
-                    arrival_time[nb, bucket_out] = arr_t + dt
+                    arrival_time[nb, bucket_out] = arr_t + dt + penalty
                     came_from_node[nb, bucket_out] = node
                     came_from_bucket[nb, bucket_out] = bucket_in
 
@@ -1373,6 +1374,10 @@ if _NUMBA_AVAILABLE:
                                 i = parent
                             else:
                                 break
+                    else:
+                        # Frontier overflow: abort instead of silently dropping states.
+                        return (best_cost, arrival_time,
+                                came_from_node, came_from_bucket, -2)
 
         return best_cost, arrival_time, came_from_node, came_from_bucket, explored
 
@@ -1425,54 +1430,104 @@ def _build_corridor_sector_graph(
     valid_cand = ((idxs_all != corridor_ids[:, np.newaxis]) &
                   (dists_all >= min_edge_m) & (dists_all <= max_edge_m))
 
+    # Choose per-sector candidates nearest-first; if LOS fails, retry with the
+    # next-nearest candidate in that sector.
     best_nb = np.full((n_corridor, n_sectors), -1, dtype=np.int32)
     best_d = np.full((n_corridor, n_sectors), np.inf)
+    pending = np.ones((n_corridor, n_sectors), dtype=bool)
+    fracs = np.linspace(0, 1, n_los_samples)
+    # One fallback retry beyond nearest candidate.
+    max_sector_los_attempts = 2
 
-    for s in range(n_sectors):
-        s_mask = (sec_all == s) & valid_cand
-        d_m = np.where(s_mask, dists_all, np.inf)
-        bk = np.argmin(d_m, axis=1)
-        bd = np.take_along_axis(d_m, bk[:, np.newaxis], axis=1)[:, 0]
-        bi = np.take_along_axis(idxs_all, bk[:, np.newaxis], axis=1)[:, 0]
-        ok = bd < np.inf
-        best_nb[ok, s] = bi[ok]
-        best_d[ok, s] = bd[ok]
+    def _batch_los_ok(src_nodes, dst_nodes):
+        sx = node_x[src_nodes]
+        sy = node_y[src_nodes]
+        ex = node_x[dst_nodes]
+        ey = node_y[dst_nodes]
+
+        samp_x = sx[:, np.newaxis] + fracs[np.newaxis, :] * (ex - sx)[:, np.newaxis]
+        samp_y = sy[:, np.newaxis] + fracs[np.newaxis, :] * (ey - sy)[:, np.newaxis]
+        flat_pts = np.column_stack([samp_x.ravel(), samp_y.ravel()])
+
+        CHUNK = 5_000_000
+        flat_ok = np.zeros(len(flat_pts), dtype=bool)
+        for c0 in range(0, len(flat_pts), CHUNK):
+            c1 = min(c0 + CHUNK, len(flat_pts))
+            simplex = delaunay.find_simplex(flat_pts[c0:c1])
+            in_hull = simplex >= 0
+            flat_ok[c0:c1][in_hull] = valid_triangle[simplex[in_hull]]
+        return flat_ok.reshape(len(src_nodes), n_los_samples).all(axis=1)
+
+    for _ in range(max_sector_los_attempts):
+        if not np.any(pending):
+            break
+
+        cand_ci = []
+        cand_sec = []
+        cand_bk = []
+        cand_dst = []
+        cand_dis = []
+
+        for s in range(n_sectors):
+            active_rows = np.where(pending[:, s])[0]
+            if active_rows.size == 0:
+                continue
+            d_sub = dists_all[active_rows]
+            i_sub = idxs_all[active_rows]
+            v_sub = valid_cand[active_rows]
+            s_mask = (sec_all[active_rows] == s) & v_sub
+            d_m = np.where(s_mask, d_sub, np.inf)
+            bk = np.argmin(d_m, axis=1)
+            bd = np.take_along_axis(d_m, bk[:, np.newaxis], axis=1)[:, 0]
+            bi = np.take_along_axis(i_sub, bk[:, np.newaxis], axis=1)[:, 0]
+
+            has_candidate = bd < np.inf
+            if np.any(~has_candidate):
+                pending[active_rows[~has_candidate], s] = False
+            if not np.any(has_candidate):
+                continue
+
+            rows = active_rows[has_candidate].astype(np.int32)
+            cand_ci.append(rows)
+            cand_sec.append(np.full(len(rows), s, dtype=np.int32))
+            cand_bk.append(bk[has_candidate].astype(np.int32))
+            cand_dst.append(bi[has_candidate].astype(np.int32))
+            cand_dis.append(bd[has_candidate])
+
+        if not cand_ci:
+            break
+
+        ci_idx = np.concatenate(cand_ci)
+        s_idx = np.concatenate(cand_sec)
+        bk_idx = np.concatenate(cand_bk)
+        edge_dst = np.concatenate(cand_dst)
+        edge_dis = np.concatenate(cand_dis)
+        edge_src = corridor_ids[ci_idx].astype(np.int32)
+
+        los_pass = _batch_los_ok(edge_src, edge_dst)
+        if np.any(los_pass):
+            pass_ci = ci_idx[los_pass]
+            pass_sec = s_idx[los_pass]
+            best_nb[pass_ci, pass_sec] = edge_dst[los_pass]
+            best_d[pass_ci, pass_sec] = edge_dis[los_pass]
+            pending[pass_ci, pass_sec] = False
+
+        if np.any(~los_pass):
+            fail_ci = ci_idx[~los_pass]
+            fail_sec = s_idx[~los_pass]
+            fail_bk = bk_idx[~los_pass]
+            valid_cand[fail_ci, fail_bk] = False
+            # Keep failed sectors pending so they can try the next-nearest candidate.
+            pending[fail_ci, fail_sec] = True
 
     has_edge = best_nb >= 0
     ci_idx, s_idx = np.nonzero(has_edge)
     if len(ci_idx) == 0:
         return empty
-    edge_dst = best_nb[ci_idx, s_idx].astype(np.int32)
-    edge_dis = best_d[ci_idx, s_idx]
-    edge_sec = s_idx.astype(np.int32)
-    edge_src = corridor_ids[ci_idx].astype(np.int32)
-    n_cand = len(edge_dst)
-
-    # Batch LOS via Delaunay find_simplex
-    fracs = np.linspace(0, 1, n_los_samples)
-    sx = node_x[edge_src]
-    sy = node_y[edge_src]
-    ex = node_x[edge_dst]
-    ey = node_y[edge_dst]
-
-    samp_x = sx[:, np.newaxis] + fracs[np.newaxis, :] * (ex - sx)[:, np.newaxis]
-    samp_y = sy[:, np.newaxis] + fracs[np.newaxis, :] * (ey - sy)[:, np.newaxis]
-    flat_pts = np.column_stack([samp_x.ravel(), samp_y.ravel()])
-
-    CHUNK = 5_000_000
-    flat_ok = np.zeros(len(flat_pts), dtype=bool)
-    for c0 in range(0, len(flat_pts), CHUNK):
-        c1 = min(c0 + CHUNK, len(flat_pts))
-        simplex = delaunay.find_simplex(flat_pts[c0:c1])
-        in_hull = simplex >= 0
-        flat_ok[c0:c1][in_hull] = valid_triangle[simplex[in_hull]]
-
-    los_pass = flat_ok.reshape(n_cand, n_los_samples).all(axis=1)
-
-    f_src = edge_src[los_pass]
-    f_dst = edge_dst[los_pass]
-    f_dis = edge_dis[los_pass]
-    f_sec = edge_sec[los_pass]
+    f_src = corridor_ids[ci_idx].astype(np.int32)
+    f_dst = best_nb[ci_idx, s_idx].astype(np.int32)
+    f_dis = best_d[ci_idx, s_idx]
+    f_sec = s_idx.astype(np.int32)
 
     order = np.argsort(f_src, kind='stable')
     f_src = f_src[order]
@@ -1504,7 +1559,7 @@ if _NUMBA_AVAILABLE:
         boat_speed_ms, max_speed,
         # Polar table (pass empty arrays + has_polar=False to disable)
         has_polar, polar_twas, polar_twss, polar_speeds, polar_min_twa,
-        sweep_hx, sweep_hy, sweep_rads, n_sweep,
+        sweep_hx, sweep_hy, sweep_rads, n_sweep, polar_coarse_step,
         # Wind at nodes (pass empty arrays + has_wind=False to disable)
         has_wind, wind_wu_nodes, wind_wv_nodes, wind_frame_times_w,
         # Routing params
@@ -1721,8 +1776,13 @@ if _NUMBA_AVAILABLE:
                                   (polar_twss[j1] - polar_twss[j0])
                                   if polar_twss[j1] > polar_twss[j0] else 0.0)
                         omb = 1.0 - beta_p
+                        coarse_step = polar_coarse_step
+                        if coarse_step < 1:
+                            coarse_step = 1
+                        best_idx = -1
 
-                        for h in range(n_sweep):
+                        # Coarse sweep first, then local refine around best heading.
+                        for h in range(0, n_sweep, coarse_step):
                             delta_h = sweep_rads[h] - wind_from_rad
                             delta_h = (delta_h + PI) % (2.0 * PI) - PI
                             twa_deg = np.abs(delta_h) * (180.0 / PI)
@@ -1763,6 +1823,51 @@ if _NUMBA_AVAILABLE:
                             if sog_h > 0.01 and drift_h <= 0.10 * prog:
                                 if sog_h > best_sog:
                                     best_sog = sog_h
+                                    best_idx = h
+
+                        if coarse_step > 1 and best_idx >= 0:
+                            for off in range(-(coarse_step - 1), coarse_step):
+                                h = (best_idx + off) % n_sweep
+                                delta_h = sweep_rads[h] - wind_from_rad
+                                delta_h = (delta_h + PI) % (2.0 * PI) - PI
+                                twa_deg = np.abs(delta_h) * (180.0 / PI)
+
+                                if twa_deg < polar_min_twa:
+                                    V_ms = 0.0
+                                else:
+                                    twa_c = twa_deg
+                                    if twa_c < polar_twas[0]:
+                                        twa_c = polar_twas[0]
+                                    elif twa_c > polar_twas[-1]:
+                                        twa_c = polar_twas[-1]
+                                    n_twa = polar_twas.shape[0]
+                                    i0 = 0
+                                    for ii in range(n_twa - 1, 0, -1):
+                                        if polar_twas[ii] <= twa_c:
+                                            i0 = ii
+                                            break
+                                    if i0 >= n_twa - 1:
+                                        i0 = n_twa - 2
+                                    i1 = i0 + 1
+                                    alpha_p = ((twa_c - polar_twas[i0]) /
+                                               (polar_twas[i1] - polar_twas[i0])
+                                               if polar_twas[i1] > polar_twas[i0]
+                                               else 0.0)
+                                    oma = 1.0 - alpha_p
+                                    V_kt = (oma * omb * polar_speeds[i0, j0] +
+                                            alpha_p * omb * polar_speeds[i1, j0] +
+                                            oma * beta_p * polar_speeds[i0, j1] +
+                                            alpha_p * beta_p * polar_speeds[i1, j1])
+                                    V_ms = V_kt * KNOTS_TO_MS_L
+
+                                gx = V_ms * sweep_hx[h] + cu
+                                gy = V_ms * sweep_hy[h] + cv
+                                sog_h = gx * d_hat_x + gy * d_hat_y
+                                drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
+                                prog = max(sog_h, 1e-6)
+                                if sog_h > 0.01 and drift_h <= 0.10 * prog:
+                                    if sog_h > best_sog:
+                                        best_sog = sog_h
 
                 else:
                     # Fixed speed (no polar)
@@ -1790,7 +1895,7 @@ if _NUMBA_AVAILABLE:
                 new_cost = cost + dt + penalty
                 if new_cost < best_cost[nb, sector_out]:
                     best_cost[nb, sector_out] = new_cost
-                    arrival_time[nb, sector_out] = arr_t + dt
+                    arrival_time[nb, sector_out] = arr_t + dt + penalty
                     came_from_node[nb, sector_out] = node
                     came_from_bucket[nb, sector_out] = bucket_in
 
@@ -1814,6 +1919,10 @@ if _NUMBA_AVAILABLE:
                                 i = parent
                             else:
                                 break
+                    else:
+                        # Frontier overflow: abort instead of silently dropping states.
+                        return (best_cost, arrival_time,
+                                came_from_node, came_from_bucket, -2)
 
         return best_cost, arrival_time, came_from_node, came_from_bucket, explored
 
@@ -2324,9 +2433,8 @@ class Router:
                 if dt == INF:
                     continue
 
-                # Tacking penalty: course change beyond threshold adds planning cost.
-                # Applied to best_cost only -- NOT to arrival_time, which tracks
-                # the physical clock used for current/wind look-ups.
+                # Tacking penalty: course change beyond threshold adds time cost
+                # and advances the physical clock used for current/wind look-ups.
                 penalty = 0.0
                 if (d_in < 8 and self.tack_penalty_s > 0
                         and self._ANGLE_DIFF[d_in, d_out]
@@ -2336,7 +2444,7 @@ class Router:
                 new_cost = cost + dt + penalty
                 if new_cost < best_cost[nr, nc_, d_out]:
                     best_cost[nr, nc_, d_out] = new_cost
-                    arrival_time[nr, nc_, d_out] = arr_t + dt  # physical time only
+                    arrival_time[nr, nc_, d_out] = arr_t + dt + penalty
                     came_from[nr, nc_, d_out, 0] = r
                     came_from[nr, nc_, d_out, 1] = c
                     came_from[nr, nc_, d_out, 2] = d_in
@@ -2926,9 +3034,15 @@ class MeshRouter:
             _perf['astar'] = _time.monotonic() - t0
 
             if explored < 0:
-                raise RuntimeError(
-                    f"A* exceeded {max_iterations} iterations (Numba kernel) -- "
-                    "route may be unreachable.")
+                if explored == -1:
+                    raise RuntimeError(
+                        f"A* exceeded {max_iterations} iterations (Numba kernel) -- "
+                        "route may be unreachable.")
+                if explored == -2:
+                    raise RuntimeError(
+                        "A* frontier heap overflow in Numba kernel -- "
+                        "increase heap sizing or reduce search space.")
+                raise RuntimeError("A* failed in Numba kernel (internal error).")
 
             # Path reconstruction from numpy arrays
             t0 = _time.monotonic()
@@ -2995,7 +3109,7 @@ class MeshRouter:
                     new_state = (neighbor, bucket_out)
                     if new_cost < best_cost.get(new_state, INF):
                         best_cost[new_state] = new_cost
-                        arrival_time[new_state] = arr_t + dt
+                        arrival_time[new_state] = arr_t + dt + penalty
                         came_from[new_state] = state
                         h = self._heuristic(neighbor, goal_x, goal_y, max_speed)
                         heapq.heappush(open_set, (new_cost + h, new_cost, neighbor, bucket_out))
@@ -3220,23 +3334,26 @@ class SectorRouter:
 
     Instead of using raw Delaunay mesh adjacency (which is tied to the PDE
     mesh topology), this router connects each SSCOFS node to the nearest
-    reachable neighbor in each of 16 heading sectors (22.5 deg each).
+    reachable neighbor in each of 32 heading sectors (11.25 deg each).
 
-    This gives the A* 16 angular choices at every decision point, decoupling
+    This gives the A* 32 angular choices at every decision point, decoupling
     the navigation action lattice from the hydrodynamics mesh while still
     using SSCOFS element centers as routing nodes (inheriting their adaptive
     density: ~100m near shore, ~500m offshore).
 
     Key differences from MeshRouter:
-    - Connectivity: 16 heading sectors vs. Delaunay edge adjacency
+    - Connectivity: 32 heading sectors vs. Delaunay edge adjacency
     - Edge cost: CurrentField.query at midpoint vs. averaged node velocities
     - Graph build: Lazy (during A*) vs. eager (all edges upfront)
     - Path quality: Directly steerable headings vs. mesh topology wobble
     """
 
-    N_SECTORS = 16
-    SECTOR_WIDTH = 360.0 / N_SECTORS  # 22.5 deg
+    N_SECTORS = 32
+    SECTOR_WIDTH = 360.0 / N_SECTORS  # 11.25 deg
     START_SENTINEL = N_SECTORS  # sector index for start node (no incoming)
+    POLAR_SWEEP_COARSE_STEP = 5  # 2 deg base sweep -> 10 deg coarse pass
+    CORRIDOR_PAD_FACTORS = (0.85, 1.00, 1.35)  # adaptive retry from tight to wide
+    CORRIDOR_CACHE_MAX = 4
     SMOOTH_TACK_THRESHOLD_DEG = 45.0   # turns >= this are tack waypoints
     SMOOTH_DP_EPSILON_M = 120.0        # DP perpendicular tolerance within curved segments
     SMOOTH_MIN_TACK_SPACING_M = 400.0  # minimum distance between consecutive tack waypoints
@@ -3247,7 +3364,10 @@ class SectorRouter:
                  tack_threshold_deg: float = 90.0,
                  max_edge_m: float = 2000.0,
                  min_edge_m: float = 50.0,
-                 k_candidates: int = 50):
+                 k_candidates: int = 50,
+                 polar_sweep_coarse_step: int | None = None,
+                 corridor_pad_factors: tuple[float, ...] | list[float] | None = None,
+                 corridor_cache_max: int | None = None):
         """
         Parameters
         ----------
@@ -3267,6 +3387,14 @@ class SectorRouter:
             Minimum edge length in meters (skip very short edges).
         k_candidates : int
             Number of KD-tree neighbors to consider when filling sectors.
+        polar_sweep_coarse_step : int, optional
+            Coarse stride for polar heading sweep in the Numba kernel.
+            1 means exact full sweep. Higher values are faster but approximate.
+        corridor_pad_factors : sequence[float], optional
+            Adaptive corridor pad multipliers (tight to wide) applied to the
+            base pad. Defaults to class constant CORRIDOR_PAD_FACTORS.
+        corridor_cache_max : int, optional
+            Maximum number of corridor graphs to keep in memory cache.
         """
         self.cf = current_field
         self.boat = boat
@@ -3276,6 +3404,20 @@ class SectorRouter:
         self.max_edge_m = max_edge_m
         self.min_edge_m = min_edge_m
         self.k_candidates = k_candidates
+        if polar_sweep_coarse_step is None:
+            polar_sweep_coarse_step = self.POLAR_SWEEP_COARSE_STEP
+        self._polar_sweep_coarse_step = max(1, int(polar_sweep_coarse_step))
+
+        if corridor_pad_factors is None:
+            corridor_pad_factors = self.CORRIDOR_PAD_FACTORS
+        pads = [float(v) for v in corridor_pad_factors if float(v) > 0.0]
+        if not pads:
+            pads = list(self.CORRIDOR_PAD_FACTORS)
+        self._corridor_pad_factors = tuple(pads)
+
+        if corridor_cache_max is None:
+            corridor_cache_max = self.CORRIDOR_CACHE_MAX
+        self._corridor_cache_max = max(1, int(corridor_cache_max))
 
         if current_field.tree is None:
             raise ValueError("CurrentField must have KD-tree for SectorRouter")
@@ -3286,6 +3428,7 @@ class SectorRouter:
 
         # Lazy neighbor cache: node_id -> list of (neighbor_id, sector, distance)
         self._neighbor_cache = {}
+        self._corridor_graph_cache = {}
 
         # Line-of-sight samples per edge
         self._los_samples = 15
@@ -3305,6 +3448,32 @@ class SectorRouter:
     @property
     def _use_polar(self):
         return self.wind is not None and self.boat.polar is not None
+
+    def _corridor_cache_key(self, start_node, end_node, pad_m):
+        lo = start_node if start_node < end_node else end_node
+        hi = end_node if start_node < end_node else start_node
+        return (
+            int(lo), int(hi), int(round(pad_m)),
+            int(self.N_SECTORS), int(self.k_candidates),
+            int(round(self.min_edge_m)), int(round(self.max_edge_m)),
+            int(self._los_samples),
+        )
+
+    def _corridor_cache_get(self, key):
+        val = self._corridor_graph_cache.get(key)
+        if val is None:
+            return None
+        # Touch key for recency.
+        self._corridor_graph_cache.pop(key)
+        self._corridor_graph_cache[key] = val
+        return val
+
+    def _corridor_cache_put(self, key, value):
+        if key in self._corridor_graph_cache:
+            self._corridor_graph_cache.pop(key)
+        self._corridor_graph_cache[key] = value
+        while len(self._corridor_graph_cache) > self._corridor_cache_max:
+            self._corridor_graph_cache.pop(next(iter(self._corridor_graph_cache)))
 
     def _precompute_wind_at_nodes(self):
         """Map wind field onto SSCOFS node positions for Numba kernel."""
@@ -3337,9 +3506,36 @@ class SectorRouter:
                 w._wv_frames[:, nn].astype(np.float64))
             self._wind_frame_times = w._frame_times.astype(np.float64)
             self._numba_wind_ready = True
+        elif w._mode == 'grid':
+            # Spatially varying but time-constant wind.
+            pts = np.column_stack([self.node_x, self.node_y])
+            wu_nodes, wv_nodes = w.query(pts[:, 0], pts[:, 1], elapsed_s=0.0)
+            self._wind_at_nodes_wu = np.ascontiguousarray(
+                np.asarray(wu_nodes, dtype=np.float64).reshape(1, self.n_nodes))
+            self._wind_at_nodes_wv = np.ascontiguousarray(
+                np.asarray(wv_nodes, dtype=np.float64).reshape(1, self.n_nodes))
+            self._wind_frame_times = np.array([0.0], dtype=np.float64)
+            self._numba_wind_ready = True
+        elif w._mode == 'temporal_grid':
+            # Spatially and temporally varying wind on a regular grid.
+            # Pre-sample each frame onto SSCOFS nodes so Numba can use
+            # node-indexed arrays during A*.
+            n_wf = len(w._frame_times)
+            pts = np.column_stack([self.node_x, self.node_y])
+            wu = np.empty((n_wf, self.n_nodes), dtype=np.float64)
+            wv = np.empty((n_wf, self.n_nodes), dtype=np.float64)
+            for i in range(n_wf):
+                t_s = float(w._frame_times[i])
+                wu_i, wv_i = w.query(pts[:, 0], pts[:, 1], elapsed_s=t_s)
+                wu[i, :] = np.asarray(wu_i, dtype=np.float64)
+                wv[i, :] = np.asarray(wv_i, dtype=np.float64)
+            self._wind_at_nodes_wu = np.ascontiguousarray(wu)
+            self._wind_at_nodes_wv = np.ascontiguousarray(wv)
+            self._wind_frame_times = w._frame_times.astype(np.float64)
+            self._numba_wind_ready = True
 
     def _bearing_to_sector(self, dx, dy):
-        """Convert a direction vector to a sector index (0-15).
+        """Convert a direction vector to a sector index (0-(N_SECTORS-1)).
 
         Sector 0 is centered on North (0 deg), sector 4 on East (90 deg), etc.
         """
@@ -3372,7 +3568,7 @@ class SectorRouter:
         return True
 
     def _find_sector_neighbors(self, node_id):
-        """Find reachable neighbors in each of 16 heading sectors.
+        """Find reachable neighbors in each heading sector.
 
         Uses KD-tree to find candidate neighbors, assigns each to a sector,
         keeps the nearest valid candidate per sector.
@@ -3390,8 +3586,8 @@ class SectorRouter:
         dists = np.atleast_1d(dists)
         idxs = np.atleast_1d(idxs)
 
-        # Best candidate per sector: sector -> (neighbor_id, distance)
-        sector_best = {}
+        # Candidate list per sector: sector -> [(distance, neighbor_id), ...]
+        sector_candidates = {}
 
         for d, idx in zip(dists, idxs):
             idx = int(idx)
@@ -3406,16 +3602,20 @@ class SectorRouter:
             dy = y1 - y0
             sector = self._bearing_to_sector(dx, dy)
 
-            if sector not in sector_best or d < sector_best[sector][1]:
-                sector_best[sector] = (idx, d)
+            if sector not in sector_candidates:
+                sector_candidates[sector] = []
+            sector_candidates[sector].append((float(d), idx))
 
-        # Validate each sector's best candidate with line-of-sight
+        # Validate nearest-first candidates with line-of-sight.
         neighbors = []
-        for sector, (idx, d) in sector_best.items():
-            x1 = self.node_x[idx]
-            y1 = self.node_y[idx]
-            if self._line_of_sight(x0, y0, x1, y1):
-                neighbors.append((idx, sector, d))
+        for sector, candidates in sector_candidates.items():
+            candidates.sort(key=lambda item: item[0])
+            for d, idx in candidates:
+                x1 = self.node_x[idx]
+                y1 = self.node_y[idx]
+                if self._line_of_sight(x0, y0, x1, y1):
+                    neighbors.append((idx, sector, d))
+                    break
 
         self._neighbor_cache[node_id] = neighbors
         return neighbors
@@ -3900,45 +4100,31 @@ class SectorRouter:
         max_speed = max_boat_speed + self.cf.max_current_speed
         _perf['setup'] = _time.monotonic() - t0
 
-        _can_numba = (_NUMBA_AVAILABLE and _sector_astar_jit is not None
-                      and self.cf.delaunay is not None
-                      and self.cf.valid_triangle is not None
-                      and (not self._use_polar
-                           or (self._numba_wind_ready and self.boat.polar is not None)))
+        _numba_reason = []
+        if not _NUMBA_AVAILABLE or _sector_astar_jit is None:
+            _numba_reason.append("numba_unavailable")
+        if self.cf.delaunay is None or self.cf.valid_triangle is None:
+            _numba_reason.append("missing_delaunay")
+            if getattr(self.cf, "delaunay_error", None):
+                _numba_reason.append(f"delaunay_error={self.cf.delaunay_error}")
+        if self._use_polar and (not self.boat.polar or not self._numba_wind_ready):
+            if not self.boat.polar:
+                _numba_reason.append("polar_missing")
+            if not self._numba_wind_ready:
+                w_mode = getattr(self.wind, "_mode", "unknown") if self.wind is not None else "none"
+                _numba_reason.append(f"wind_not_numba_ready(mode={w_mode})")
+
+        _can_numba = len(_numba_reason) == 0
         _mode = 'Numba JIT' if _can_numba else 'Python'
         print(f"SectorRouter: {self.n_nodes:,} nodes, {self.N_SECTORS} sectors/node  [{_mode}]")
+        if not _can_numba:
+            print("  Numba disabled:", "; ".join(_numba_reason))
         print(f"Start node: {start_node}, End node: {end_node}")
 
         # ------------------------------------------------------------------
         # A* search
         # ------------------------------------------------------------------
         if _can_numba:
-            # Build corridor: generous bounding box around start/end
-            t0 = _time.monotonic()
-            route_dist = np.hypot(ex - sx, ey - sy)
-            pad = max(route_dist * 1.0, self.max_edge_m * 5, 5000.0)
-            x_lo = min(sx, ex) - pad
-            x_hi = max(sx, ex) + pad
-            y_lo = min(sy, ey) - pad
-            y_hi = max(sy, ey) + pad
-            corridor = ((self.node_x >= x_lo) & (self.node_x <= x_hi) &
-                        (self.node_y >= y_lo) & (self.node_y <= y_hi))
-            n_corr = int(corridor.sum())
-            _perf['corridor'] = _time.monotonic() - t0
-
-            t0 = _time.monotonic()
-            g_off, g_tgt, g_dis, g_sec = _build_corridor_sector_graph(
-                self.node_x, self.node_y, self.cf.tree,
-                self.cf.delaunay, self.cf.valid_triangle,
-                corridor, self.N_SECTORS, self.SECTOR_WIDTH,
-                self.k_candidates, self.min_edge_m, self.max_edge_m,
-                self._los_samples,
-            )
-            n_edges = len(g_tgt)
-            _perf['graph_build'] = _time.monotonic() - t0
-            print(f"Corridor: {n_corr:,} nodes, {n_edges:,} edges "
-                  f"(built in {_perf['graph_build']:.2f}s)")
-
             # Prepare polar arrays (dummy if no polar)
             has_polar = self._use_polar
             if has_polar:
@@ -3963,29 +4149,111 @@ class SectorRouter:
                 wind_wv = np.empty((0, 0), dtype=np.float64)
                 wind_ft = np.empty(0, dtype=np.float64)
 
-            t0 = _time.monotonic()
-            best_cost_arr, arrival_arr, cf_node_arr, cf_bucket_arr, explored = \
-                _sector_astar_jit(
-                    g_off, g_tgt, g_dis, g_sec,
-                    self.node_x, self.node_y,
-                    self._u_frames_2d, self._v_frames_2d,
-                    self.cf.frame_times,
-                    start_node, end_node, start_time_s,
-                    boat_speed, max_speed,
-                    has_polar, polar_twas, polar_twss, polar_speeds,
-                    polar_min_twa,
-                    _SWEEP_HX, _SWEEP_HY, _SWEEP_RADS, len(_SWEEP_HX),
-                    has_wind, wind_wu, wind_wv, wind_ft,
-                    self.tack_penalty_s, self.tack_threshold_deg,
-                    self.N_SECTORS, self.START_SENTINEL, max_iterations,
-                )
-            explored = int(explored)
-            _perf['astar'] = _time.monotonic() - t0
+            # Build corridor adaptively and reuse graph from cache when possible.
+            _perf['corridor'] = 0.0
+            _perf['graph_build'] = 0.0
+            _perf['graph_cache_hits'] = 0
+            _perf['corridor_attempts'] = 0
+            _perf['astar'] = 0.0
 
-            if explored < 0:
-                raise RuntimeError(
-                    f"A* exceeded {max_iterations} iterations (Numba) -- "
-                    "route may be unreachable.")
+            sx_n = self.node_x[start_node]
+            sy_n = self.node_y[start_node]
+            ex_n = self.node_x[end_node]
+            ey_n = self.node_y[end_node]
+            route_dist = np.hypot(ex_n - sx_n, ey_n - sy_n)
+            base_pad = max(route_dist, self.max_edge_m * 5, 5000.0)
+
+            pad_values = []
+            _seen = set()
+            for fac in self._corridor_pad_factors:
+                pad_i = max(base_pad * float(fac), self.max_edge_m * 3, 2500.0)
+                key_i = int(round(pad_i))
+                if key_i in _seen:
+                    continue
+                _seen.add(key_i)
+                pad_values.append(float(key_i))
+            pad_values.sort()
+
+            best_cost_arr = None
+            arrival_arr = None
+            cf_node_arr = None
+            cf_bucket_arr = None
+            explored = -1
+
+            for i_try, pad in enumerate(pad_values, start=1):
+                _perf['corridor_attempts'] += 1
+                cache_key = self._corridor_cache_key(start_node, end_node, pad)
+                cached = self._corridor_cache_get(cache_key)
+                if cached is not None:
+                    g_off, g_tgt, g_dis, g_sec, n_corr, n_edges = cached
+                    _perf['graph_cache_hits'] += 1
+                    print(f"Corridor attempt {i_try}/{len(pad_values)}: "
+                          f"pad {pad:.0f}m, {n_corr:,} nodes, {n_edges:,} edges (cache hit)")
+                else:
+                    t0 = _time.monotonic()
+                    x_lo = min(sx_n, ex_n) - pad
+                    x_hi = max(sx_n, ex_n) + pad
+                    y_lo = min(sy_n, ey_n) - pad
+                    y_hi = max(sy_n, ey_n) + pad
+                    corridor = ((self.node_x >= x_lo) & (self.node_x <= x_hi) &
+                                (self.node_y >= y_lo) & (self.node_y <= y_hi))
+                    n_corr = int(corridor.sum())
+                    _perf['corridor'] += _time.monotonic() - t0
+
+                    t0 = _time.monotonic()
+                    g_off, g_tgt, g_dis, g_sec = _build_corridor_sector_graph(
+                        self.node_x, self.node_y, self.cf.tree,
+                        self.cf.delaunay, self.cf.valid_triangle,
+                        corridor, self.N_SECTORS, self.SECTOR_WIDTH,
+                        self.k_candidates, self.min_edge_m, self.max_edge_m,
+                        self._los_samples,
+                    )
+                    n_edges = len(g_tgt)
+                    dt_build = _time.monotonic() - t0
+                    _perf['graph_build'] += dt_build
+                    self._corridor_cache_put(
+                        cache_key, (g_off, g_tgt, g_dis, g_sec, n_corr, n_edges))
+                    print(f"Corridor attempt {i_try}/{len(pad_values)}: "
+                          f"pad {pad:.0f}m, {n_corr:,} nodes, {n_edges:,} edges "
+                          f"(built in {dt_build:.2f}s)")
+
+                t0 = _time.monotonic()
+                best_cost_arr, arrival_arr, cf_node_arr, cf_bucket_arr, explored = \
+                    _sector_astar_jit(
+                        g_off, g_tgt, g_dis, g_sec,
+                        self.node_x, self.node_y,
+                        self._u_frames_2d, self._v_frames_2d,
+                        self.cf.frame_times,
+                        start_node, end_node, start_time_s,
+                        boat_speed, max_speed,
+                        has_polar, polar_twas, polar_twss, polar_speeds,
+                        polar_min_twa,
+                        _SWEEP_HX, _SWEEP_HY, _SWEEP_RADS, len(_SWEEP_HX),
+                        self._polar_sweep_coarse_step,
+                        has_wind, wind_wu, wind_wv, wind_ft,
+                        self.tack_penalty_s, self.tack_threshold_deg,
+                        self.N_SECTORS, self.START_SENTINEL, max_iterations,
+                    )
+                explored = int(explored)
+                _perf['astar'] += _time.monotonic() - t0
+
+                if explored < 0:
+                    if explored == -1:
+                        raise RuntimeError(
+                            f"A* exceeded {max_iterations} iterations (Numba) -- "
+                            "route may be unreachable.")
+                    if explored == -2:
+                        raise RuntimeError(
+                            "A* frontier heap overflow in Numba kernel -- "
+                            "increase heap sizing or reduce search space.")
+                    raise RuntimeError("A* failed in Numba kernel (internal error).")
+
+                gc_try = best_cost_arr[end_node, :]
+                fs_try = int(np.argmin(gc_try))
+                if np.isfinite(gc_try[fs_try]):
+                    break
+                if i_try < len(pad_values):
+                    print("  No path in this corridor; expanding search window...")
 
             # Reconstruct path
             t0 = _time.monotonic()
@@ -4059,7 +4327,7 @@ class SectorRouter:
                     new_state = (neighbor, sector_out)
                     if new_cost < best_cost.get(new_state, INF):
                         best_cost[new_state] = new_cost
-                        arrival_time_d[new_state] = arr_t + dt
+                        arrival_time_d[new_state] = arr_t + dt + penalty
                         came_from[new_state] = state
                         h = self._heuristic(neighbor, goal_x, goal_y, max_speed)
                         heapq.heappush(open_set,
@@ -4290,6 +4558,8 @@ class SectorRouter:
         if _can_numba:
             print(f"  Corridor select:     {_perf['corridor']:.3f}s")
             print(f"  Graph build:         {_perf['graph_build']:.3f}s")
+            print(f"  Corridor attempts:   {int(_perf.get('corridor_attempts', 1))} "
+                  f"(cache hits {int(_perf.get('graph_cache_hits', 0))})")
         print(f"  A* search:           {_perf['astar']:.3f}s")
         print(f"  Path reconstruction: {_perf['reconstruct']:.3f}s")
         print(f"  Path smoothing:      {_perf['smooth']:.3f}s")
@@ -4870,11 +5140,6 @@ def main():
                         help="End longitude")
     parser.add_argument("--boat-speed", type=float, default=6.0,
                         help="Boat speed through water in knots (default: 6)")
-    parser.add_argument("--grid-resolution", type=float, default=300.0,
-                        help="Routing grid cell size in metres (default: 300)")
-    parser.add_argument("--padding", type=float, default=5000.0,
-                        help="Grid padding around start/end in metres "
-                             "(default: 5000)")
     parser.add_argument("--depart", type=str, default=None,
                         help="Departure time in local time, e.g. "
                              "'2026-03-07 10:30'.  The system auto-selects "
@@ -4901,12 +5166,6 @@ def main():
                              "(default: 60).  Set 0 to disable.")
     parser.add_argument("--no-cache", action="store_true",
                         help="Skip SSCOFS cache, always download fresh")
-    parser.add_argument("--sector", action="store_true",
-                        help="Use SectorRouter (16-sector heading-binned, default)")
-    parser.add_argument("--mesh", action="store_true",
-                        help="Use MeshRouter (A* on SSCOFS Delaunay mesh)")
-    parser.add_argument("--grid", action="store_true",
-                        help="Use legacy 8-connected grid Router")
     parser.add_argument("--save", type=str, default=None,
                         help="Save plot to file (e.g. route.png)")
     parser.add_argument("--no-plot", action="store_true",
@@ -4947,19 +5206,9 @@ def main():
 
     boat = BoatModel(base_speed_knots=args.boat_speed, polar=polar)
 
-    if args.grid:
-        print("Using Router (8-connected grid, legacy)")
-        router = Router(cf, boat, resolution_m=args.grid_resolution,
-                        padding_m=args.padding, wind=wind,
-                        tack_penalty_s=args.tack_penalty)
-    elif args.mesh:
-        print("Using MeshRouter (A* on SSCOFS Delaunay mesh)")
-        router = MeshRouter(cf, boat, wind=wind,
-                            tack_penalty_s=args.tack_penalty)
-    else:
-        print("Using SectorRouter (16-sector heading-binned connectivity)")
-        router = SectorRouter(cf, boat, wind=wind,
-                              tack_penalty_s=args.tack_penalty)
+    print(f"Using SectorRouter ({SectorRouter.N_SECTORS}-sector heading-binned connectivity)")
+    router = SectorRouter(cf, boat, wind=wind,
+                          tack_penalty_s=args.tack_penalty)
 
     start = (args.start_lat, args.start_lon)
     end = (args.end_lat, args.end_lon)
