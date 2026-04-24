@@ -42,6 +42,16 @@ YAML schema:
       # buffer_hours: 2
       # use_cached_netcdf: true        # reuse existing output_netcdf when present
 
+      # Option C: manual time-varying schedule (spatially uniform, linearly
+      # interpolated between anchors; queries outside the schedule clamp to
+      # the nearest endpoint).
+      # source: "schedule"
+      # timezone: "America/Los_Angeles"  # tz for time strings (default: same as departure)
+      # schedule:
+      #   - { time: "09:15", speed_kt: 9.0,  from_deg: 340 }
+      #   - { time: "11:00", speed_kt: 12.0, from_deg: 330 }
+      #   - { time: "13:00", speed_kt: 16.0, from_deg: 320 }
+
     routing:
       router_type: "sector"           # required; only supported router
       tack_penalty_s: 60
@@ -81,17 +91,102 @@ HERE = Path(__file__).parent
 # YAML loading and validation
 # ---------------------------------------------------------------------------
 
+_ROUTABLE_MARK_TYPES = {"close_round", "finish_seed", "waypoint"}
+_CONSTRAINT_MARK_TYPES = {"constraint"}
+_ALL_MARK_TYPES = _ROUTABLE_MARK_TYPES | _CONSTRAINT_MARK_TYPES
+
+
+def _is_routable_wp(wp) -> bool:
+    """True if *wp* is a waypoint the A* router should navigate TO."""
+    if isinstance(wp, (list, tuple)):
+        return True
+    if isinstance(wp, dict):
+        mt = wp.get("mark_type")
+        if mt is None:
+            return False          # old-format dict → land mark constraint
+        return mt in _ROUTABLE_MARK_TYPES
+    return False
+
+
 def load_task(yaml_path: Path) -> dict:
-    """Load and lightly validate a routing task YAML."""
+    """Load and lightly validate a routing task YAML.
+
+    Waypoints may be any of:
+      - ``[lat, lon]``                   — real routing waypoint (old format)
+      - dict with ``mark_type`` in {``close_round``, ``finish_seed``,
+        ``waypoint``}                    — real routing waypoint (new format)
+      - dict with ``mark_type: constraint`` and ``barrier_bearing_deg``
+                                         — barrier constraint (new format)
+      - dict with ``barrier_bearing_deg`` but no ``mark_type``
+                                         — barrier constraint (old format)
+    """
     with open(yaml_path) as f:
         doc = yaml.safe_load(f)
 
-    wps = doc.get("waypoints", [])
-    if len(wps) < 2:
+    raw_wps = doc.get("waypoints", [])
+    if len(raw_wps) < 2:
         raise ValueError("YAML must contain at least 2 waypoints.")
-    for i, wp in enumerate(wps):
-        if len(wp) != 2:
-            raise ValueError(f"Waypoint {i} must be [lat, lon], got {wp!r}.")
+
+    real_count = 0
+    for i, wp in enumerate(raw_wps):
+        if isinstance(wp, (list, tuple)):
+            if len(wp) != 2:
+                raise ValueError(f"Waypoint {i} must be [lat, lon], got {wp!r}.")
+            real_count += 1
+
+        elif isinstance(wp, dict):
+            mt = wp.get("mark_type")
+
+            if mt is not None and mt not in _ALL_MARK_TYPES:
+                raise ValueError(
+                    f"Waypoint {i}: unknown mark_type={mt!r}. "
+                    f"Valid types: {sorted(_ALL_MARK_TYPES)}."
+                )
+
+            for key in ("lat", "lon"):
+                if key not in wp:
+                    raise ValueError(
+                        f"Waypoint {i} (dict) is missing required key '{key}'."
+                    )
+
+            if mt in _ROUTABLE_MARK_TYPES:
+                real_count += 1
+            else:
+                # constraint (new format) or old-format land mark (no mark_type)
+                if "barrier_bearing_deg" not in wp:
+                    raise ValueError(
+                        f"Constraint mark at index {i} is missing 'barrier_bearing_deg'. "
+                        "Constraint marks must have: lat, lon, rounding, barrier_bearing_deg."
+                    )
+                if "rounding" not in wp:
+                    raise ValueError(
+                        f"Constraint mark at index {i} is missing 'rounding'."
+                    )
+                if wp["rounding"] not in ("port", "starboard"):
+                    raise ValueError(
+                        f"Constraint mark at index {i}: rounding must be "
+                        f"'port' or 'starboard', got {wp['rounding']!r}."
+                    )
+        else:
+            raise ValueError(
+                f"Waypoint {i} must be a [lat, lon] list or a dict, got {wp!r}."
+            )
+
+    if real_count < 2:
+        raise ValueError(
+            "YAML must contain at least 2 routable waypoints "
+            "(constraint marks do not count)."
+        )
+    if not _is_routable_wp(raw_wps[0]):
+        raise ValueError(
+            "The first waypoint must be routable ([lat, lon] or "
+            "mark_type close_round/finish_seed/waypoint), not a constraint."
+        )
+    if not _is_routable_wp(raw_wps[-1]):
+        raise ValueError(
+            "The last waypoint must be routable ([lat, lon] or "
+            "mark_type close_round/finish_seed/waypoint), not a constraint."
+        )
 
     dep = doc.get("departure", {})
     if "datetime" not in dep:
@@ -100,9 +195,163 @@ def load_task(yaml_path: Path) -> dict:
     return doc
 
 
+def partition_waypoints(raw_wps: list) -> tuple:
+    """Split the raw waypoints list into real waypoints and per-leg constraints.
+
+    Supports both the old format (``[lat, lon]`` lists + bare dicts) and the
+    new ``mark_type``-based format.
+
+    Parameters
+    ----------
+    raw_wps : list
+        Each entry is either:
+        - ``[lat, lon]``                       — routable waypoint (old format)
+        - dict with ``mark_type`` in
+          {``close_round``, ``finish_seed``, ``waypoint``}
+                                               — routable waypoint (new format)
+        - dict with ``mark_type: constraint``  — barrier constraint (new format)
+        - dict with ``barrier_bearing_deg``
+          but no ``mark_type``                 — barrier constraint (old format)
+
+    Returns
+    -------
+    real_wps : list of (lat, lon)
+        Routable waypoints the A* router navigates between.
+    leg_marks : dict
+        Maps leg index (0-based) to a list of constraint dicts for that leg.
+        Leg *i* runs from ``real_wps[i]`` to ``real_wps[i+1]``.
+    """
+    real_wps = []
+    leg_marks: dict = {}
+    pending_marks: list = []
+
+    for wp in raw_wps:
+        if _is_routable_wp(wp):
+            if pending_marks and real_wps:
+                leg_idx = len(real_wps) - 1
+                leg_marks.setdefault(leg_idx, []).extend(pending_marks)
+                pending_marks = []
+            if isinstance(wp, (list, tuple)):
+                real_wps.append((float(wp[0]), float(wp[1])))
+            else:
+                real_wps.append((float(wp["lat"]), float(wp["lon"])))
+        else:
+            pending_marks.append(dict(wp))
+
+    if pending_marks and len(real_wps) >= 2:
+        leg_marks.setdefault(len(real_wps) - 2, []).extend(pending_marks)
+
+    return real_wps, leg_marks
+
+
+def compute_barriers(marks: list, transformer, ray_length: float = 25_000.0) -> np.ndarray:
+    """Convert land mark constraints to barrier line segments in UTM coordinates.
+
+    Each mark produces one ray segment starting at the mark and extending
+    ``ray_length`` metres in the direction given by ``barrier_bearing_deg``
+    (compass bearing: 0 = north, 90 = east, 180 = south, 270 = west).
+
+    Parameters
+    ----------
+    marks : list of dict
+        Each dict must contain ``lat``, ``lon``, ``barrier_bearing_deg``.
+    transformer : pyproj.Transformer
+        Lon→lat to UTM transformer (as returned by ``load_current_field``).
+    ray_length : float
+        Barrier ray length in metres (default 25 km — long enough to block
+        any realistic wrong-side shortcut in Puget Sound).
+
+    Returns
+    -------
+    barriers : np.ndarray, shape (N, 4), dtype float64
+        Each row is ``[x1, y1, x2, y2]`` (UTM metres).
+        Returns an empty ``(0, 4)`` array if *marks* is empty.
+    """
+    if not marks:
+        return np.empty((0, 4), dtype=np.float64)
+
+    rows = []
+    for m in marks:
+        lat = float(m["lat"])
+        lon = float(m["lon"])
+        bearing_deg = float(m["barrier_bearing_deg"])
+        bearing_rad = np.radians(bearing_deg)
+        # Compass bearing → UTM displacement: east = sin(b), north = cos(b)
+        dx = np.sin(bearing_rad) * ray_length
+        dy = np.cos(bearing_rad) * ray_length
+        mx, my = transformer.transform(lon, lat)
+        rows.append([mx, my, mx + dx, my + dy])
+
+    return np.array(rows, dtype=np.float64)
+
+
 # ---------------------------------------------------------------------------
 # Build routing objects from YAML
 # ---------------------------------------------------------------------------
+
+def _build_schedule_wind(wind_cfg: dict, ctx: dict) -> WindField:
+    """Build a spatially-uniform, time-varying wind from a YAML schedule.
+
+    Each schedule entry is an anchor point ``(time, speed_kt, from_deg)``.
+    The engine linearly interpolates between anchors and clamps queries
+    outside the schedule to the nearest endpoint
+    (``WindField.from_frames`` ``temporal_const`` mode).
+
+    ``time`` may be either ``"HH:MM"`` (assumed to be on the same local date
+    as departure, in the configured timezone) or ``"YYYY-MM-DD HH:MM"`` for
+    multi-day schedules.
+    """
+    from zoneinfo import ZoneInfo
+    from ecmwf_wind import DEFAULT_TIMEZONE
+
+    sched = wind_cfg.get("schedule") or []
+    if len(sched) < 1:
+        raise ValueError("wind.schedule must have at least one entry")
+
+    tz = ZoneInfo(str(wind_cfg.get("timezone", ctx.get("tz_str", DEFAULT_TIMEZONE))))
+    depart_dt = ctx["depart_dt"]                        # local tz-aware
+    depart_utc = ctx["depart_utc"]                      # UTC tz-aware
+    start_time_s = float(ctx["start_time_s"])           # router time-base offset
+    depart_local_date = depart_dt.astimezone(tz).date()
+
+    anchors = []                                         # list of (elapsed_s, wu, wv)
+    for entry in sched:
+        t_raw = str(entry["time"]).strip()
+        if len(t_raw) <= 5:                              # "HH:MM"
+            hhmm = _dt.datetime.strptime(t_raw, "%H:%M").time()
+            local_dt = _dt.datetime.combine(depart_local_date, hhmm, tzinfo=tz)
+        else:                                            # "YYYY-MM-DD HH:MM"
+            naive = _dt.datetime.strptime(t_raw, "%Y-%m-%d %H:%M")
+            local_dt = naive.replace(tzinfo=tz)
+
+        elapsed_s = start_time_s + (
+            local_dt.astimezone(_dt.timezone.utc) - depart_utc
+        ).total_seconds()
+
+        speed_ms = float(entry["speed_kt"]) * KNOTS_TO_MS
+        from_rad = np.radians(float(entry["from_deg"]))
+        wu = -speed_ms * float(np.sin(from_rad))
+        wv = -speed_ms * float(np.cos(from_rad))
+        anchors.append((elapsed_s, wu, wv))
+
+    anchors.sort(key=lambda a: a[0])
+    if len(anchors) == 1:                                # degenerate single anchor → constant
+        anchors.append((anchors[0][0] + 3600.0, anchors[0][1], anchors[0][2]))
+    times_s = [a[0] for a in anchors]
+    wus     = [a[1] for a in anchors]
+    wvs     = [a[2] for a in anchors]
+
+    print(f"Wind: schedule with {len(sched)} anchor(s):")
+    for entry in sched:
+        print(f"  {entry['time']}  {float(entry['speed_kt']):.1f} kt @ "
+              f"{float(entry['from_deg']):.0f}°")
+
+    return WindField.from_frames(
+        xs=None, ys=None,
+        wu_frames=wus, wv_frames=wvs,
+        frame_times_s=times_s,
+    )
+
 
 def _build_openmeteo_route_wind(wind_cfg: dict, ctx: dict) -> WindField:
     """Build a dynamic wind field by fetching Open-Meteo ECMWF nodes."""
@@ -239,6 +488,10 @@ def build_boat_and_wind(doc: dict, context: dict | None = None):
             wd = float(wind_cfg.get("direction_deg", 0.0))
             wind = WindField.from_met(ws, wd)
             print(f"Wind: {ws:.1f} kt from {wd:.0f}°")
+        elif source in ("schedule", "manual_schedule", "piecewise"):
+            if context is None:
+                raise ValueError("schedule wind source requires route context")
+            wind = _build_schedule_wind(wind_cfg, context)
         elif source in ("open_meteo_ecmwf", "ecmwf_openmeteo", "ecmwf_route"):
             if context is None:
                 raise ValueError("Open-Meteo wind source requires route context")
@@ -268,15 +521,19 @@ def build_boat_and_wind(doc: dict, context: dict | None = None):
 # ---------------------------------------------------------------------------
 
 def run_leg(router: SectorRouter, start_ll, end_ll, start_time_s: float,
-            leg_num: int, leg_label: str) -> tuple:
+            leg_num: int, leg_label: str,
+            barriers: np.ndarray | None = None) -> tuple:
     """Run A* for one leg. Returns (route, xs, ys, water_mask)."""
     print(f"\n{'─'*60}")
     print(f"Leg {leg_num}: {leg_label}")
     print(f"  From: {start_ll[0]:.6f}, {start_ll[1]:.6f}")
     print(f"  To:   {end_ll[0]:.6f}, {end_ll[1]:.6f}")
     print(f"  Start time offset: {start_time_s:.0f}s ({start_time_s/3600:.2f}h)")
+    if barriers is not None and len(barriers) > 0:
+        print(f"  Land mark barriers: {len(barriers)}")
     route, xs, ys, wm = router.find_route(start_ll, end_ll,
-                                           start_time_s=start_time_s)
+                                           start_time_s=start_time_s,
+                                           barriers=barriers)
     return route, xs, ys, wm
 
 
@@ -369,7 +626,8 @@ def position_at_time(xs, ys, ts, query_t):
 
 
 def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
-                           tz, task_name, plot_dir, slug, wind_field=None):
+                           tz, task_name, plot_dir, slug, wind_field=None,
+                           all_land_marks=None):
     """Generate one annotated PNG per hour of the trip.
 
     Each frame shows side-by-side panels for current and wind (if wind_field provided):
@@ -472,6 +730,21 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
         ax.plot(bx, by, "o", color="#ffdd00", markersize=8, zorder=10,
                 markeredgecolor="white", markeredgewidth=2,
                 label=f"Boat @ {frame_local:%I:%M %p}" if show_legend else None)
+
+        # Constraint mark overlays
+        if all_land_marks:
+            for _mi, _m in enumerate(all_land_marks):
+                _mx, _my = transformer.transform(float(_m["lon"]), float(_m["lat"]))
+                _rnd = _m.get("rounding", "")
+                _name = _m.get("name", "")
+                _lbl = "Constraint mark" if show_legend and _mi == 0 else None
+                ax.plot(_mx, _my, "D", color="#cc00cc", markersize=10,
+                        zorder=11, markeredgecolor="white", markeredgewidth=1.5,
+                        label=_lbl)
+                _tag = _name if _name else ("P" if _rnd == "port" else "S")
+                ax.text(_mx, _my + 250, _tag,
+                        fontsize=6, ha="center", va="bottom", color="#cc00cc",
+                        fontweight="bold", zorder=12)
 
     def _setup_ax(ax, title):
         """Common axis setup."""
@@ -943,15 +1216,27 @@ def main():
     depart_utc = depart_dt.astimezone(_dt.timezone.utc)
 
     # ---- Waypoints ----
-    wps = [(float(lat), float(lon)) for lat, lon in doc["waypoints"]]
+    wps, leg_marks = partition_waypoints(doc["waypoints"])
     leg_labels = [
         f"{wps[i][0]:.4f},{wps[i][1]:.4f} → {wps[i+1][0]:.4f},{wps[i+1][1]:.4f}"
         for i in range(len(wps) - 1)
     ]
+    # Report any constraint marks found
+    total_marks = sum(len(v) for v in leg_marks.values())
+    if total_marks:
+        print(f"Constraint marks: {total_marks} across {len(leg_marks)} leg(s)")
+        for li, marks in sorted(leg_marks.items()):
+            for m in marks:
+                name = m.get("name", "")
+                label = f" — {name}" if name else ""
+                print(f"  Leg {li+1}: {m['rounding']} rounding of "
+                      f"({m['lat']:.5f}, {m['lon']:.5f}), "
+                      f"barrier bearing {m['barrier_bearing_deg']:.0f}°{label}")
 
     # ---- Routing config ----
     r_cfg = doc.get("routing", {})
-    tack_penalty = float(r_cfg.get("tack_penalty_s", 60))
+    tack_penalty = float(r_cfg.get("tack_penalty_s", 90))
+    tack_threshold_deg = float(r_cfg.get("tack_threshold_deg", 50))
     duration_h   = int(r_cfg.get("duration_hours", 10))
     router_type  = str(r_cfg.get("router_type", "sector")).strip().lower()
     if router_type != "sector":
@@ -987,7 +1272,13 @@ def main():
     # ---- Output config ----
     out_cfg = doc.get("output", {})
     save_plots = out_cfg.get("save_plots", True) and not args.no_plots
-    plot_dir = HERE / out_cfg.get("plot_dir", "routes/output")
+    # Default to a per-route subdirectory so outputs from many YAMLs don't
+    # collide.  An explicit "plot_dir" in the YAML is taken as-is (no
+    # auto-subdir) so users can override.
+    if "plot_dir" in out_cfg:
+        plot_dir = HERE / out_cfg["plot_dir"]
+    else:
+        plot_dir = HERE / "routes/output" / yaml_path.stem
     if save_plots:
         plot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1020,6 +1311,7 @@ def main():
     print(f"Using SectorRouter ({SectorRouter.N_SECTORS}-sector heading-binned connectivity)")
     router = SectorRouter(cf, boat, wind=wind,
                           tack_penalty_s=tack_penalty,
+                          tack_threshold_deg=tack_threshold_deg,
                           polar_sweep_coarse_step=polar_sweep_coarse_step,
                           corridor_pad_factors=corridor_pad_factors,
                           corridor_cache_max=corridor_cache_max,
@@ -1032,11 +1324,15 @@ def main():
     current_depart_utc = depart_utc
 
     for i, (start_ll, end_ll) in enumerate(zip(wps[:-1], wps[1:]), 1):
+        marks_this_leg = leg_marks.get(i - 1, [])
+        barriers = compute_barriers(marks_this_leg, transformer)
+
         route, xs, ys, wm = run_leg(
             router, start_ll, end_ll,
             start_time_s=current_time_s,
             leg_num=i,
             leg_label=leg_labels[i - 1],
+            barriers=barriers if len(barriers) > 0 else None,
         )
         routes.append(route)
 
@@ -1054,7 +1350,9 @@ def main():
                        start_ll, end_ll,
                        straight_time_s=sl_time, straight_dist_m=sl_dist,
                        save_path=plot_path, show=False,
-                       wind_field=wind, elapsed_s=current_time_s)
+                       wind_field=wind, elapsed_s=current_time_s,
+                       land_marks=marks_this_leg,
+                       barriers=barriers if len(barriers) > 0 else None)
 
         # Save rich NPZ diagnostics for this leg
         npz_path = plot_dir / f"{yaml_path.stem}_leg{i:02d}.npz"
@@ -1095,6 +1393,7 @@ def main():
 
     # ---- Hourly position frames ----
     if save_plots and not args.no_plots:
+        all_land_marks = [m for marks in leg_marks.values() for m in marks]
         generate_hourly_frames(
             routes=routes,
             wps=wps,
@@ -1106,6 +1405,7 @@ def main():
             plot_dir=plot_dir,
             slug=yaml_path.stem,
             wind_field=wind,
+            all_land_marks=all_land_marks if all_land_marks else None,
         )
 
     if save_plots:

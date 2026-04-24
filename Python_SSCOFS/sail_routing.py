@@ -1606,6 +1606,49 @@ def _build_corridor_sector_graph(
 
 
 # ===================================================================
+#  Geometry helper: 2-D segment intersection test (Numba-compatible)
+# ===================================================================
+
+def _seg_cross_py(ax, ay, bx, by, cx, cy, dx, dy):
+    """Pure-Python 2-D proper segment intersection test (A-B vs C-D).
+
+    Returns True iff the two segments properly cross (endpoints on the
+    interior of the other segment are required for a "proper" crossing).
+    Collinear / T-intersection cases return False, which is the
+    conservative choice: we only block an edge when it clearly crosses
+    the barrier.
+    """
+    abx = bx - ax;  aby = by - ay
+    d1 = abx * (cy - ay) - aby * (cx - ax)
+    d2 = abx * (dy - ay) - aby * (dx - ax)
+    cdx = dx - cx;  cdy = dy - cy
+    d3 = cdx * (ay - cy) - cdy * (ax - cx)
+    d4 = cdx * (by - cy) - cdy * (bx - cx)
+    return (
+        ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and
+        ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0))
+    )
+
+
+if _NUMBA_AVAILABLE:
+    @_numba_mod.njit(cache=True)
+    def _seg_cross_jit(ax, ay, bx, by, cx, cy, dx, dy):
+        """Numba-compiled 2-D proper segment intersection test (A-B vs C-D)."""
+        abx = bx - ax;  aby = by - ay
+        d1 = abx * (cy - ay) - aby * (cx - ax)
+        d2 = abx * (dy - ay) - aby * (dx - ax)
+        cdx = dx - cx;  cdy = dy - cy
+        d3 = cdx * (ay - cy) - cdy * (ax - cx)
+        d4 = cdx * (by - cy) - cdy * (bx - cx)
+        return (
+            ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and
+            ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0))
+        )
+else:
+    _seg_cross_jit = None
+
+
+# ===================================================================
 #  Numba A* kernel for SectorRouter (fixed-speed AND polar+wind)
 # ===================================================================
 
@@ -1632,6 +1675,8 @@ if _NUMBA_AVAILABLE:
         # Routing params
         tack_penalty_s, tack_threshold_deg,
         n_sectors, start_sentinel, max_iterations,
+        # Rounding mark barriers (pass n_barriers=0 and empty arrays to disable)
+        n_barriers, bar_x1, bar_y1, bar_x2, bar_y2,
     ):
         """Numba-compiled time-dependent A* over a sector graph.
 
@@ -1800,6 +1845,12 @@ if _NUMBA_AVAILABLE:
             Bucket index used for the start node (= n_sectors).
         max_iterations : int
             Hard cap on node expansions; returns ``explored = -1`` if hit.
+        n_barriers : int
+            Number of rounding-mark barrier segments (0 to disable).
+        bar_x1, bar_y1, bar_x2, bar_y2 : shape (n_barriers,)
+            UTM coordinates of each barrier ray.  Any A* edge that properly
+            crosses a barrier is discarded (infinite cost), enforcing the
+            taut-string rounding-mark rule.
 
         Returns
         -------
@@ -1972,6 +2023,21 @@ if _NUMBA_AVAILABLE:
                 d_hat_x = (node_x[nb] - node_x[node]) / dist
                 d_hat_y = (node_y[nb] - node_y[node]) / dist
 
+                # Barrier check: skip this edge if it crosses any rounding mark barrier.
+                # Each barrier is a line segment [x1,y1 → x2,y2] in UTM metres.
+                barrier_hit = False
+                for _bi in range(n_barriers):
+                    if _seg_cross_jit(
+                        node_x[node], node_y[node],
+                        node_x[nb],   node_y[nb],
+                        bar_x1[_bi],  bar_y1[_bi],
+                        bar_x2[_bi],  bar_y2[_bi],
+                    ):
+                        barrier_hit = True
+                        break
+                if barrier_hit:
+                    continue
+
                 # Reuse the same frame bracket (fi, alpha_c) computed for the current node;
                 # the neighbour is evaluated at the same arrival time.
                 if n_frames == 1:
@@ -2066,7 +2132,7 @@ if _NUMBA_AVAILABLE:
                                 sog_h = gx * d_hat_x + gy * d_hat_y
                                 drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
                                 prog = max(sog_h, 1e-6)
-                                if sog_h > 0.01 and drift_h <= 0.50 * prog:
+                                if sog_h > 0.01 and drift_h <= 0.10 * prog:
                                     if sog_h > best_sog:
                                         best_sog = sog_h
                                         best_idx = h
@@ -2103,7 +2169,7 @@ if _NUMBA_AVAILABLE:
                                     sog_h = gx * d_hat_x + gy * d_hat_y
                                     drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
                                     prog = max(sog_h, 1e-6)
-                                    if sog_h > 0.01 and drift_h <= 0.50 * prog:
+                                    if sog_h > 0.01 and drift_h <= 0.10 * prog:
                                         if sog_h > best_sog:
                                             best_sog = sog_h
 
@@ -2184,7 +2250,7 @@ if _NUMBA_AVAILABLE:
                                 # Cross-track component — reject if it swamps forward progress.
                                 drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
                                 prog = max(sog_h, 1e-6)
-                                if sog_h > 0.01 and drift_h <= 0.50 * prog:
+                                if sog_h > 0.01 and drift_h <= 0.10 * prog:
                                     if sog_h > best_sog:
                                         best_sog = sog_h
                                         best_idx = h
@@ -2232,7 +2298,7 @@ if _NUMBA_AVAILABLE:
                                     sog_h = gx * d_hat_x + gy * d_hat_y
                                     drift_h = np.abs(gx * (-d_hat_y) + gy * d_hat_x)
                                     prog = max(sog_h, 1e-6)
-                                    if sog_h > 0.01 and drift_h <= 0.50 * prog:
+                                    if sog_h > 0.01 and drift_h <= 0.10 * prog:
                                         if sog_h > best_sog:
                                             best_sog = sog_h
 
@@ -3735,13 +3801,14 @@ class SectorRouter:
     CORRIDOR_PAD_FACTORS = (0.85, 1.00, 1.35)  # adaptive retry from tight to wide
     CORRIDOR_CACHE_MAX = 4
     SMOOTH_TACK_THRESHOLD_DEG = 45.0   # turns >= this are tack waypoints
-    SMOOTH_DP_EPSILON_M = 120.0        # DP perpendicular tolerance within curved segments
+    SMOOTH_DP_EPSILON_M = 120.0        # DP perpendicular tolerance floor (short legs)
+    SMOOTH_DP_EPSILON_REL = 0.04       # DP tolerance as fraction of chord (long legs)
     SMOOTH_MIN_TACK_SPACING_M = 400.0  # minimum distance between consecutive tack waypoints
 
     def __init__(self, current_field: CurrentField, boat: BoatModel,
                  wind: 'WindField | None' = None,
-                 tack_penalty_s: float = 60.0,
-                 tack_threshold_deg: float = 90.0,
+                 tack_penalty_s: float = 90.0,
+                 tack_threshold_deg: float = 50.0,
                  max_edge_m: float = 2000.0,
                  min_edge_m: float = 50.0,
                  k_candidates: int = 50,
@@ -4195,18 +4262,29 @@ class SectorRouter:
             x1, y1 = self.node_x[first], self.node_y[first]
             x2, y2 = self.node_x[last],  self.node_y[last]
 
-            sailable = False
-            t_direct, _ = _seg_time(x1, y1, x2, y2, t_start)
-            if np.isfinite(t_direct):
-                seg_len = np.hypot(x2 - x1, y2 - y1)
-                if seg_len < 1e-6:
-                    return [first, last]
-                spx = np.array([self.node_x[nd] for nd in seg_nodes])
-                spy = np.array([self.node_y[nd] for nd in seg_nodes])
-                devs = np.abs((x2 - x1) * (y1 - spy) -
-                              (x1 - spx) * (y2 - y1)) / seg_len
-                if devs.max() <= shape_tol:
-                    sailable = True
+            seg_len = np.hypot(x2 - x1, y2 - y1)
+            if seg_len < 1e-6:
+                return [first, last]
+            spx = np.array([self.node_x[nd] for nd in seg_nodes])
+            spy = np.array([self.node_y[nd] for nd in seg_nodes])
+            devs = np.abs((x2 - x1) * (y1 - spy) -
+                          (x1 - spx) * (y2 - y1)) / seg_len
+            # Adaptive tolerance: long tack legs accumulate sector-
+            # quantization noise that exceeds the floor.
+            tol = max(shape_tol, self.SMOOTH_DP_EPSILON_REL * seg_len)
+            # Dense water-presence check.  We sample more finely than
+            # _segment_travel_time (which uses 10 samples and aborts on the
+            # first NaN — too brittle for chords that hug the shore).
+            dense_n = max(20, int(seg_len / 250.0))
+            fracs = np.linspace(0.0, 1.0, dense_n + 2)[1:-1]
+            sx = x1 + fracs * (x2 - x1)
+            sy = y1 + fracs * (y2 - y1)
+            cu_dense, _ = self.cf.query(np.asarray(sx, dtype=np.float64),
+                                        np.asarray(sy, dtype=np.float64),
+                                        elapsed_s=t_start)
+            cu_dense = np.atleast_1d(cu_dense)
+            land_frac = float(np.isnan(cu_dense).sum()) / max(1, len(cu_dense))
+            sailable = (devs.max() <= tol) and (land_frac <= 0.10)
 
             if sailable:
                 return [first, last]
@@ -4250,7 +4328,70 @@ class SectorRouter:
             else:
                 result.extend(simplified)
 
-        return result
+        # ── 5. Stub removal ─────────────────────────────────────────────
+        # Drop Y-junction stubs: a waypoint with a sharp turn (>45°) and
+        # very unbalanced legs (ratio > 3) where the shortcut from prev to
+        # next still passes the dense water-tolerant check.  This catches
+        # short overshoots at tack points that survive the per-segment DP.
+        def _chord_in_water(x1, y1, x2, y2):
+            L = np.hypot(x2 - x1, y2 - y1)
+            if L < 1.0:
+                return True
+            n_dense = max(20, int(L / 250.0))
+            fracs = np.linspace(0.0, 1.0, n_dense + 2)[1:-1]
+            sx = np.asarray(x1 + fracs * (x2 - x1), dtype=np.float64)
+            sy = np.asarray(y1 + fracs * (y2 - y1), dtype=np.float64)
+            cu, _ = self.cf.query(sx, sy, elapsed_s=0.0)
+            cu = np.atleast_1d(cu)
+            return float(np.isnan(cu).sum()) / max(1, len(cu)) <= 0.10
+
+        def _strip_redundant(path):
+            """Iteratively drop two kinds of redundant waypoints:
+
+            1. **Stubs** — sharp turn (>45°) on very unbalanced legs (ratio>3)
+               where the prev→next shortcut is in water.
+            2. **Near-collinear bends** — small turn (<12°) where the
+               prev→next shortcut is in water; these arise because raw tack
+               boundaries occasionally collapse to nearly straight chords
+               after per-segment DP, leaving cosmetic but meaningless kinks.
+            """
+            if len(path) <= 2:
+                return path
+            COLLINEAR_TURN_DEG = 12.0
+            STUB_TURN_DEG = 45.0
+            STUB_RATIO = 3.0
+            changed = True
+            while changed and len(path) > 2:
+                changed = False
+                pruned = [path[0]]
+                i = 1
+                while i < len(path) - 1:
+                    p, c, n = path[i - 1], path[i], path[i + 1]
+                    x0, y0 = self.node_x[p], self.node_y[p]
+                    x1, y1 = self.node_x[c], self.node_y[c]
+                    x2, y2 = self.node_x[n], self.node_y[n]
+                    L_in  = np.hypot(x1 - x0, y1 - y0)
+                    L_out = np.hypot(x2 - x1, y2 - y1)
+                    if L_in < 1.0 or L_out < 1.0:
+                        pruned.append(c); i += 1; continue
+                    h_in  = np.degrees(np.arctan2(x1 - x0, y1 - y0)) % 360.0
+                    h_out = np.degrees(np.arctan2(x2 - x1, y2 - y1)) % 360.0
+                    turn = abs(h_out - h_in)
+                    turn = turn if turn <= 180.0 else 360.0 - turn
+                    ratio = max(L_in, L_out) / max(min(L_in, L_out), 1.0)
+                    is_stub      = turn > STUB_TURN_DEG and ratio > STUB_RATIO
+                    is_collinear = turn < COLLINEAR_TURN_DEG
+                    if (is_stub or is_collinear) and _chord_in_water(x0, y0, x2, y2):
+                        changed = True
+                        i += 1
+                        continue
+                    pruned.append(c)
+                    i += 1
+                pruned.append(path[-1])
+                path = pruned
+            return path
+
+        return _strip_redundant(result)
 
     def _smooth_path(self, path_nodes, arrival_times,
                       tack_threshold_deg=None, dp_epsilon_m=None,
@@ -4474,14 +4615,40 @@ class SectorRouter:
         return kept
 
     def find_route(self, start_latlon, end_latlon, start_time_s=0.0,
-                   max_iterations=2_000_000, return_debug=False):
+                   max_iterations=2_000_000, return_debug=False,
+                   barriers=None):
         """Find the time-optimal route between two lat/lon points.
 
         Uses a vectorized sector graph + Numba A* kernel when available,
         falling back to the original Python A* loop otherwise.
+
+        Parameters
+        ----------
+        barriers : np.ndarray of shape (N, 4), optional
+            Rounding-mark barrier segments in UTM metres.  Each row is
+            ``[x1, y1, x2, y2]``.  A* edges that cross any barrier are
+            blocked (infinite cost).  Pass ``None`` or an empty array to
+            disable (default).
         """
         _perf = {}
         t_total = _time.monotonic()
+
+        # Normalise barriers to flat arrays for the Numba kernel
+        if barriers is not None and len(barriers) > 0:
+            _barriers = np.asarray(barriers, dtype=np.float64)
+            if _barriers.ndim != 2 or _barriers.shape[1] != 4:
+                raise ValueError("barriers must be shape (N, 4)")
+            _n_barriers = len(_barriers)
+            _bar_x1 = np.ascontiguousarray(_barriers[:, 0])
+            _bar_y1 = np.ascontiguousarray(_barriers[:, 1])
+            _bar_x2 = np.ascontiguousarray(_barriers[:, 2])
+            _bar_y2 = np.ascontiguousarray(_barriers[:, 3])
+        else:
+            _n_barriers = 0
+            _bar_x1 = np.empty(0, dtype=np.float64)
+            _bar_y1 = np.empty(0, dtype=np.float64)
+            _bar_x2 = np.empty(0, dtype=np.float64)
+            _bar_y2 = np.empty(0, dtype=np.float64)
 
         # ------------------------------------------------------------------
         # Setup
@@ -4648,6 +4815,7 @@ class SectorRouter:
                         has_wind, wind_wu, wind_wv, wind_ft,
                         self.tack_penalty_s, self.tack_threshold_deg,
                         self.N_SECTORS, self.START_SENTINEL, max_iterations,
+                        _n_barriers, _bar_x1, _bar_y1, _bar_x2, _bar_y2,
                     )
                 explored = int(explored)
                 _perf['astar'] += _time.monotonic() - t0
@@ -4731,6 +4899,19 @@ class SectorRouter:
                 arr_t = arrival_time_d[state]
                 neighbors = self._find_sector_neighbors(node)
                 for neighbor, sector_out, dist in neighbors:
+                    # Barrier check: skip edges crossing any rounding mark barrier
+                    if _n_barriers > 0:
+                        nx0 = self.node_x[node];  ny0 = self.node_y[node]
+                        nx1 = self.node_x[neighbor]; ny1 = self.node_y[neighbor]
+                        blocked = False
+                        for _bi in range(_n_barriers):
+                            if _seg_cross_py(nx0, ny0, nx1, ny1,
+                                             _bar_x1[_bi], _bar_y1[_bi],
+                                             _bar_x2[_bi], _bar_y2[_bi]):
+                                blocked = True
+                                break
+                        if blocked:
+                            continue
                     dt = self._edge_cost(node, neighbor, dist, arr_t)
                     if dt == INF:
                         continue
@@ -4787,8 +4968,18 @@ class SectorRouter:
             transformer.target_crs, transformer.source_crs, always_xy=True)
 
         def _compute_leg_times(nodes):
-            """Compute per-leg timing.  Every segment should be sailable;
-            fall back to raw sub-path summation only as a safety net."""
+            """Compute per-leg timing.
+
+            Each smoothed waypoint is a node from the raw A* path, so the
+            authoritative time/distance for the leg is the A* sub-path
+            between consecutive smoothed nodes.  Sailing the smoothed
+            chord directly would over-estimate time whenever the chord
+            is upwind (the boat would tack within the leg in reality).
+
+            Falls back to sailing the chord only when a smoothed
+            waypoint isn't on the raw path (shouldn't happen with
+            _build_sailable_route).
+            """
             raw_node_idx = {nd: i for i, nd in enumerate(raw_path)}
             wps, times, dists = [], [], []
             fallback_speed = max(self.boat.base_speed_knots * 0.514, 0.1)
@@ -4797,34 +4988,30 @@ class SectorRouter:
                 na, nb = nodes[k], nodes[k + 1]
                 x1, y1 = self.node_x[na], self.node_y[na]
                 x2, y2 = self.node_x[nb], self.node_y[nb]
-                t_seg, d_seg = self._segment_travel_time(x1, y1, x2, y2, t)
-                if np.isfinite(t_seg):
-                    wps.append((x1, y1))
-                    times.append(t_seg)
-                    dists.append(d_seg)
-                    t += t_seg
-                else:
-                    ia = raw_node_idx.get(na, -1)
-                    ib = raw_node_idx.get(nb, -1)
-                    sub = raw_path[ia:ib + 1] if (ia >= 0 and ib > ia) else [na, nb]
-                    leg_t = 0.0
+                ia = raw_node_idx.get(na, -1)
+                ib = raw_node_idx.get(nb, -1)
+                if ia >= 0 and ib > ia:
+                    leg_t = float(raw_times[ib] - raw_times[ia])
                     leg_d = 0.0
-                    for j in range(len(sub) - 1):
-                        sx1 = self.node_x[sub[j]]
-                        sy1 = self.node_y[sub[j]]
-                        sx2 = self.node_x[sub[j + 1]]
-                        sy2 = self.node_y[sub[j + 1]]
-                        t_s, _ = self._segment_travel_time(
-                            sx1, sy1, sx2, sy2, t + leg_t)
-                        d_s = np.hypot(sx2 - sx1, sy2 - sy1)
-                        if not np.isfinite(t_s):
-                            t_s = d_s / fallback_speed
-                        leg_t += t_s
-                        leg_d += d_s
+                    for j in range(ia, ib):
+                        sx1 = self.node_x[raw_path[j]]
+                        sy1 = self.node_y[raw_path[j]]
+                        sx2 = self.node_x[raw_path[j + 1]]
+                        sy2 = self.node_y[raw_path[j + 1]]
+                        leg_d += float(np.hypot(sx2 - sx1, sy2 - sy1))
                     wps.append((x1, y1))
                     times.append(leg_t)
                     dists.append(leg_d)
                     t += leg_t
+                else:
+                    t_seg, d_seg = self._segment_travel_time(x1, y1, x2, y2, t)
+                    if not np.isfinite(t_seg):
+                        d_seg = float(np.hypot(x2 - x1, y2 - y1))
+                        t_seg = d_seg / fallback_speed
+                    wps.append((x1, y1))
+                    times.append(t_seg)
+                    dists.append(d_seg)
+                    t += t_seg
             wps.append((self.node_x[nodes[-1]],
                         self.node_y[nodes[-1]]))
             return list(nodes), wps, times, dists
@@ -5073,7 +5260,8 @@ def plot_route(route, xs, ys, water_mask, current_field,
                start_latlon, end_latlon,
                straight_time_s=None, straight_dist_m=None,
                save_path=None, subsample_arrows=3, show=True,
-               wind_field=None, elapsed_s=0.0):
+               wind_field=None, elapsed_s=0.0,
+               land_marks=None, barriers=None):
     """Plot the optimised route over the current field.
 
     Parameters
@@ -5083,6 +5271,13 @@ def plot_route(route, xs, ys, water_mask, current_field,
         and wind (right) vector fields.
     elapsed_s : float
         Time offset for querying current/wind fields (default 0).
+    land_marks : list of dict, optional
+        Constraint marks for this leg.  Each dict must have
+        ``lat``, ``lon``, ``rounding``, ``barrier_bearing_deg``.
+        Drawn as diamonds with barrier fence lines.
+    barriers : np.ndarray of shape (N, 4), optional
+        Pre-computed barrier segments in UTM (same as passed to find_route).
+        If provided alongside land_marks, drawn as dashed fence lines.
     """
     import matplotlib.pyplot as plt
     import matplotlib.patheffects as pe
@@ -5134,6 +5329,30 @@ def plot_route(route, xs, ys, water_mask, current_field,
         ax.plot(ex, ey, 's', color='#e76f51', markersize=12, zorder=6,
                 markeredgecolor='white', markeredgewidth=2,
                 label='End' if show_legend else None)
+
+        # Constraint mark overlays
+        if land_marks:
+            for _mi, _m in enumerate(land_marks):
+                _mx, _my = transformer.transform(float(_m['lon']), float(_m['lat']))
+                _rnd = _m.get('rounding', '')
+                _name = _m.get('name', '')
+                _lbl = ("Constraint mark"
+                        if show_legend and _mi == 0 else None)
+                ax.plot(_mx, _my, 'D', color='#cc00cc', markersize=11, zorder=11,
+                        markeredgecolor='white', markeredgewidth=1.5,
+                        label=_lbl)
+                _tag = _name if _name else f"Mark ({_rnd[0].upper()})"
+                ax.text(_mx, _my + 200, _tag,
+                        fontsize=6, ha='center', va='bottom', color='#cc00cc',
+                        fontweight='bold', zorder=12)
+
+        # Barrier ray overlays (dashed magenta fence lines)
+        if barriers is not None and len(barriers) > 0:
+            for _bi, _bar in enumerate(barriers):
+                ax.plot([_bar[0], _bar[2]], [_bar[1], _bar[3]],
+                        '--', color='#cc00cc', linewidth=1.2,
+                        alpha=0.55, zorder=7,
+                        label='Barrier' if show_legend and _bi == 0 else None)
 
     def _setup_ax(ax, title):
         ax.set_facecolor('#f0e6d3')

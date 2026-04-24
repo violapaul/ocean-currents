@@ -1,0 +1,38 @@
+# Short upwind test: Shilshole → 47.87 (mid-Possession). One-way only,
+# fast iteration for debugging the tack penalty.
+
+task:
+  name: "Short upwind test"
+  description: "Bug-finding fixture: ~12 nm upwind only."
+
+departure:
+  datetime: "2026-04-25 09:15"
+  tz: "America/Los_Angeles"
+
+waypoints:
+  - [47.68619881085159, -122.41359007579005]    # Shilshole
+  - [47.8682501523804, -122.442314875071]       # mid-Possession turnaround
+
+boat:
+  speed_kt: 6.0
+  polar: "../../j105_new_polars.csv"
+  minimum_twa: 38
+
+wind:
+  source: schedule
+  timezone: "America/Los_Angeles"
+  schedule:
+    - { time: "09:15", speed_kt: 10.0, from_deg: 340 }
+    - { time: "13:00", speed_kt: 13.0, from_deg: 330 }
+
+routing:
+  router_type: "sector"
+  tack_penalty_s: 60
+  tack_threshold_deg: 50
+  duration_hours: 5
+  polar_sweep_coarse_step: 3
+  use_dense_polar: true
+  use_dot_filter: true
+
+output:
+  save_plots: true

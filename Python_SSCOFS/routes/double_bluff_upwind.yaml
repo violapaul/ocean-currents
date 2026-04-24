@@ -1,0 +1,39 @@
+# One-way upwind only: Shilshole → Double Bluff. Same conditions as the
+# round-trip race, but isolated to the upwind leg for fast iteration.
+
+task:
+  name: "Double Bluff upwind only"
+  description: "Bug-finding fixture: one-way upwind matching the race leg 1."
+
+departure:
+  datetime: "2026-04-25 09:15"
+  tz: "America/Los_Angeles"
+
+waypoints:
+  - [47.68619881085159, -122.41359007579005]    # Shilshole
+  - [47.964840250731996, -122.55132622218066]   # Double Bluff
+
+boat:
+  speed_kt: 6.0
+  polar: "../../j105_new_polars.csv"
+  minimum_twa: 38
+
+wind:
+  source: schedule
+  timezone: "America/Los_Angeles"
+  schedule:
+    - { time: "09:15", speed_kt: 10.0, from_deg: 340 }
+    - { time: "11:00", speed_kt: 13.0, from_deg: 330 }
+    - { time: "13:00", speed_kt: 17.0, from_deg: 320 }
+    - { time: "16:00", speed_kt: 17.0, from_deg: 320 }
+
+routing:
+  router_type: "sector"
+  tack_penalty_s: 60
+  duration_hours: 6
+  polar_sweep_coarse_step: 3
+  use_dense_polar: true
+  use_dot_filter: true
+
+output:
+  save_plots: true

@@ -1,0 +1,50 @@
+# Shilshole → Double Bluff → Shilshole (round-trip race, 2026-04-25)
+#
+# NW thermal pattern building through the day.  Leg 1 is downwind / broad
+# reach; Leg 2 is an upwind beat into building breeze.
+#
+# Run with:
+#   conda run -n anaconda python run_route.py routes/shilshole_double_bluff_return.yaml
+
+task:
+  name: "Shilshole → Double Bluff → Shilshole"
+  description: >
+    Round-trip race up to Double Bluff (Whidbey Island) and back to Shilshole.
+    NW thermal building through the day.
+
+departure:
+  datetime: "2026-04-25 09:15"
+  tz: "America/Los_Angeles"
+
+waypoints:
+  - [47.68619881085159, -122.41359007579005]    # Shilshole Marina (start)
+  - [47.964840250731996, -122.55132622218066]   # Double Bluff (turn)
+  - [47.68619881085159, -122.41359007579005]    # Shilshole Marina (finish)
+
+boat:
+  speed_kt: 6.0
+  polar: "../../j105_new_polars.csv"
+  minimum_twa: 38
+
+wind:
+  # Anchors set to upper-half of each forecast band per PNW ECMWF heuristic
+  # (actual wind tends to land between predicted base and predicted gust).
+  source: schedule
+  timezone: "America/Los_Angeles"
+  schedule:
+    - { time: "09:15", speed_kt: 10.0, from_deg: 340 }   # 8–10 kt @ 340
+    - { time: "11:00", speed_kt: 13.0, from_deg: 330 }   # 10–14 kt @ 330
+    - { time: "13:00", speed_kt: 17.0, from_deg: 320 }   # 12–20 kt @ 320
+    - { time: "16:00", speed_kt: 17.0, from_deg: 320 }   # tail anchor (clamps end)
+
+routing:
+  router_type: "sector"
+  tack_penalty_s: 60
+  duration_hours: 8                # ~6.5 hr expected, +1.5 hr slack
+  polar_sweep_coarse_step: 3
+  use_dense_polar: true
+  use_dot_filter: true
+
+output:
+  save_plots: true
+  # plot_dir defaults to routes/output/<yaml-stem>/

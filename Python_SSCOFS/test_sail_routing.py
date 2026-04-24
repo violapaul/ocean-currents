@@ -1513,6 +1513,107 @@ class TestWindFieldTemporal:
         assert route.avg_sog_knots > 3.0
 
 
+class TestScheduleWindBuilder:
+    """Tests for run_route._build_schedule_wind: YAML schedule → WindField."""
+
+    def _ctx(self):
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/Los_Angeles")
+        depart_dt = _dt.datetime(2026, 4, 25, 9, 15, tzinfo=tz)
+        return {
+            "depart_dt": depart_dt,
+            "depart_utc": depart_dt.astimezone(_dt.timezone.utc),
+            "start_time_s": 0.0,
+            "tz_str": "America/Los_Angeles",
+        }
+
+    @staticmethod
+    def _decode(wu, wv):
+        """(wu, wv) → (speed_kt, from_deg) in meteorological convention."""
+        speed_kt = float(np.hypot(wu, wv)) * MS_TO_KNOTS
+        from_deg = (float(np.degrees(np.arctan2(-wu, -wv))) + 360.0) % 360.0
+        return speed_kt, from_deg
+
+    def test_anchor_values_round_trip(self):
+        """Querying at anchor times should return the configured speed/dir."""
+        from run_route import _build_schedule_wind
+        cfg = {"source": "schedule", "schedule": [
+            {"time": "09:15", "speed_kt": 9.0,  "from_deg": 340.0},
+            {"time": "11:00", "speed_kt": 12.0, "from_deg": 330.0},
+            {"time": "13:00", "speed_kt": 16.0, "from_deg": 320.0},
+        ]}
+        wf = _build_schedule_wind(cfg, self._ctx())
+
+        for t_h, exp_kt, exp_dir in [(0.0, 9.0, 340.0), (1.75, 12.0, 330.0), (3.75, 16.0, 320.0)]:
+            wu, wv = wf.query(0.0, 0.0, elapsed_s=t_h * 3600.0)
+            spd, frm = self._decode(wu, wv)
+            assert spd == pytest.approx(exp_kt, abs=0.05), f"t={t_h}h speed"
+            assert frm == pytest.approx(exp_dir, abs=0.5), f"t={t_h}h dir"
+
+    def test_midpoint_interpolation(self):
+        """Midpoint between two anchors interpolates wu/wv linearly."""
+        from run_route import _build_schedule_wind
+        cfg = {"source": "schedule", "schedule": [
+            {"time": "09:15", "speed_kt": 9.0,  "from_deg": 340.0},
+            {"time": "11:00", "speed_kt": 12.0, "from_deg": 330.0},
+        ]}
+        wf = _build_schedule_wind(cfg, self._ctx())
+
+        # Anchors are at t=0 and t=1.75h (6300s); midpoint = 3150s.
+        wu0, wv0 = wf.query(0.0, 0.0, elapsed_s=0.0)
+        wu1, wv1 = wf.query(0.0, 0.0, elapsed_s=6300.0)
+        wum, wvm = wf.query(0.0, 0.0, elapsed_s=3150.0)
+        assert wum == pytest.approx(0.5 * (wu0 + wu1), rel=0.01)
+        assert wvm == pytest.approx(0.5 * (wv0 + wv1), rel=0.01)
+
+    def test_clamps_outside_schedule(self):
+        """Queries before first / after last anchor clamp to the endpoint."""
+        from run_route import _build_schedule_wind
+        cfg = {"source": "schedule", "schedule": [
+            {"time": "09:15", "speed_kt": 9.0,  "from_deg": 340.0},
+            {"time": "13:00", "speed_kt": 16.0, "from_deg": 320.0},
+        ]}
+        wf = _build_schedule_wind(cfg, self._ctx())
+
+        # Before start (t = -1h)
+        spd_before, frm_before = self._decode(*wf.query(0.0, 0.0, elapsed_s=-3600.0))
+        assert spd_before == pytest.approx(9.0, abs=0.05)
+        assert frm_before == pytest.approx(340.0, abs=0.5)
+
+        # After end (t = 8h, well past 13:00 anchor at t=3.75h)
+        spd_after, frm_after = self._decode(*wf.query(0.0, 0.0, elapsed_s=8 * 3600.0))
+        assert spd_after == pytest.approx(16.0, abs=0.05)
+        assert frm_after == pytest.approx(320.0, abs=0.5)
+
+    def test_single_anchor_acts_as_constant(self):
+        """A single anchor degenerates to a constant wind field."""
+        from run_route import _build_schedule_wind
+        cfg = {"source": "schedule", "schedule": [
+            {"time": "10:00", "speed_kt": 10.0, "from_deg": 270.0},
+        ]}
+        wf = _build_schedule_wind(cfg, self._ctx())
+        for t_h in (0.0, 2.5, 5.0):
+            spd, frm = self._decode(*wf.query(0.0, 0.0, elapsed_s=t_h * 3600.0))
+            assert spd == pytest.approx(10.0, abs=0.05)
+            assert frm == pytest.approx(270.0, abs=0.5)
+
+    def test_start_time_offset_applied(self):
+        """Schedule should be aligned to ctx['start_time_s'] (router time-base)."""
+        from run_route import _build_schedule_wind
+        ctx = self._ctx()
+        ctx["start_time_s"] = 5000.0
+        cfg = {"source": "schedule", "schedule": [
+            {"time": "09:15", "speed_kt": 9.0,  "from_deg": 340.0},
+            {"time": "11:00", "speed_kt": 12.0, "from_deg": 330.0},
+        ]}
+        wf = _build_schedule_wind(cfg, ctx)
+        # The 09:15 anchor should now be at elapsed_s=5000 (not 0).
+        spd, frm = self._decode(*wf.query(0.0, 0.0, elapsed_s=5000.0))
+        assert spd == pytest.approx(9.0, abs=0.05)
+        assert frm == pytest.approx(340.0, abs=0.5)
+
+
 # =====================================================================
 #  10.  Run as script
 # =====================================================================
