@@ -1,7 +1,7 @@
 // Ocean Currents PWA Service Worker
 // Enables offline functionality by caching tiles and assets
 
-const CACHE_VERSION = 'ocean-currents-v2';
+const CACHE_VERSION = 'ocean-currents-v3';
 const TILE_CACHE = `${CACHE_VERSION}-tiles`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 
@@ -116,6 +116,34 @@ self.addEventListener('fetch', (event) => {
     return;
   }
   
+  // Dynamic data (forecast cycles + race routes). These rotate frequently —
+  // cache-first would serve stale forecasts for hours/days. Use network-first
+  // with cache fallback so offline still works but online users always see
+  // the freshest data.
+  const isDynamicData = (
+    url.pathname.includes('/current_data/') ||
+    url.pathname.includes('/race-dev/')     ||
+    url.pathname.includes('/races/')        ||
+    url.pathname.endsWith('/latest.json')
+  );
+  if (isDynamicData) {
+    event.respondWith((async () => {
+      try {
+        const response = await fetch(event.request);
+        if (response && response.ok && event.request.method === 'GET') {
+          const clone = response.clone();
+          caches.open(STATIC_CACHE).then((cache) => cache.put(event.request, clone));
+        }
+        return response;
+      } catch (err) {
+        const cached = await caches.match(event.request);
+        if (cached) return cached;
+        throw err;
+      }
+    })());
+    return;
+  }
+
   // Handle API requests (NVS, NOAA tides)
   if (url.pathname.includes('/nvs/') || url.pathname.includes('/noaa/')) {
     event.respondWith(

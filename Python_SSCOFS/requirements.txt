@@ -9,3 +9,6 @@ requests
 aiohttp
 PyYAML
 scipy
+# Added for the sail_routing stack used by the race-route workflow.
+pyproj
+numba

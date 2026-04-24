@@ -1652,7 +1652,33 @@ def main():
                         help="Force fresh SSCOFS download (ignore local cache)")
     parser.add_argument("--no-plots", action="store_true",
                         help="Skip all matplotlib output")
+    # --- race-mode / web publishing flags (see plan: races to PWA) ---
+    parser.add_argument("--race-mode", action="store_true",
+                        help="Requires a race: block in the YAML. Implies "
+                             "--no-plots, --geojson, --publish-s3. Overrides "
+                             "departure from race.event_start_utc.")
+    parser.add_argument("--geojson", action="store_true",
+                        help="Also emit <slug>.geojson alongside the JSON.")
+    parser.add_argument("--publish-s3", action="store_true",
+                        help="Upload route.json + route.geojson + manifest.json "
+                             "to s3://{race.s3_bucket}/{race.s3_prefix}/.")
+    parser.add_argument("--only-if-within", type=float, default=None,
+                        metavar="HOURS",
+                        help="Exit 0 without running if the race start is "
+                             "further than HOURS away. Used by scheduled GHA.")
+    parser.add_argument("--min-lead-min", type=float, default=None,
+                        metavar="MIN",
+                        help="Exit 0 without running if the race start is "
+                             "closer than MIN minutes away, or already "
+                             "passed. Freezes the published nominal route "
+                             "before start so live reroute takes over.")
     args = parser.parse_args()
+
+    # --race-mode implies --no-plots / --geojson / --publish-s3
+    if args.race_mode:
+        args.no_plots = True
+        args.geojson = True
+        args.publish_s3 = True
 
     yaml_path = Path(args.yaml_file)
     if not yaml_path.is_absolute():
@@ -1669,6 +1695,11 @@ def main():
         print(f"  {desc.strip()}")
     print(f"{'═'*60}\n")
 
+    # ---- Race block (optional; required for --race-mode) ----
+    race_cfg = doc.get("race") or {}
+    if args.race_mode and not race_cfg.get("slug"):
+        sys.exit("--race-mode requires a race: block with a slug in the YAML")
+
     # ---- Departure time ----
     dep_cfg = doc["departure"]
     tz_str = dep_cfg.get("tz", "America/Los_Angeles")
@@ -1676,6 +1707,33 @@ def main():
     naive = _dt.datetime.strptime(dep_cfg["datetime"], "%Y-%m-%d %H:%M")
     depart_dt = naive.replace(tzinfo=tz)
     depart_utc = depart_dt.astimezone(_dt.timezone.utc)
+
+    # Race mode anchors departure to event_start_utc, ignoring the
+    # ad-hoc `departure.datetime` (which is useful for local dry runs only).
+    if args.race_mode:
+        ev_str = race_cfg["event_start_utc"]
+        depart_utc = _dt.datetime.fromisoformat(ev_str.replace("Z", "+00:00"))
+        depart_dt = depart_utc.astimezone(tz)
+        print(f"Race mode: depart_utc = {depart_utc.isoformat()} "
+              f"(slug={race_cfg['slug']})")
+
+    # --only-if-within / --min-lead-min: bound the precompute window.
+    # Together they say: "publish the route only while the race is within
+    # WINDOW hours out AND at least LEAD minutes away from start."
+    if args.only_if_within is not None or args.min_lead_min is not None:
+        now_utc = _dt.datetime.now(_dt.timezone.utc)
+        delta_s = (depart_utc - now_utc).total_seconds()
+        hours_to_start = delta_s / 3600.0
+        mins_to_start  = delta_s / 60.0
+        if args.only_if_within is not None and hours_to_start > args.only_if_within:
+            print(f"Race is {hours_to_start:.1f}h away "
+                  f"(> --only-if-within={args.only_if_within}h). Skipping.")
+            return
+        if args.min_lead_min is not None and mins_to_start < args.min_lead_min:
+            print(f"Race is {mins_to_start:.1f}min away "
+                  f"(< --min-lead-min={args.min_lead_min}min). "
+                  f"Freezing nominal route; use live reroute from here on.")
+            return
 
     # ---- Waypoints ----
     wps, leg_marks = partition_waypoints(doc["waypoints"])
@@ -1756,7 +1814,7 @@ def main():
         plot_dir = HERE / out_cfg["plot_dir"]
     else:
         plot_dir = HERE / "routes/output" / yaml_path.stem
-    # JSON/report/NPZ exports are written even when matplotlib output is off.
+    # JSON/report/NPZ/GeoJSON exports are written even when matplotlib output is off.
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Load current data ----
@@ -1851,7 +1909,7 @@ def main():
     print_performance_summary(routes)
 
     # ---- Save route JSON ----
-    save_route_json(
+    route_json_path = save_route_json(
         routes=routes,
         wps=wps,
         depart_utc=depart_utc,
@@ -1872,6 +1930,65 @@ def main():
         slug=yaml_path.stem,
         doc=doc,
     )
+
+    # ---- GeoJSON + manifest for web publishing ----
+    route_geojson_path = None
+    manifest_path = None
+    if args.geojson or args.publish_s3:
+        import race_publish
+        inputs_hash = race_publish.compute_inputs_hash()
+        route_geojson_path = plot_dir / f"{yaml_path.stem}.geojson"
+        race_publish.write_geojson(
+            routes=routes, wps=wps,
+            depart_utc=depart_utc,
+            depart_time_s=start_time_s,
+            task_name=task_name,
+            race_cfg=race_cfg,
+            inputs_hash=inputs_hash,
+            out_path=route_geojson_path,
+        )
+        total_dist_nm = sum(r.total_distance_m for r in routes) / 1852.0
+        total_time_hr = sum(r.total_time_s for r in routes) / 3600.0
+        manifest_path = plot_dir / f"{yaml_path.stem}_manifest.json"
+        race_publish.write_manifest(
+            race_cfg=race_cfg,
+            depart_utc=depart_utc,
+            total_distance_nm=total_dist_nm,
+            total_time_hr=total_time_hr,
+            inputs_hash=inputs_hash,
+            out_path=manifest_path,
+        )
+
+    # ---- S3 publish (canonical names: route.json, route.geojson, manifest.json) ----
+    if args.publish_s3:
+        import race_publish
+        bucket = race_cfg.get("s3_bucket")
+        prefix = race_cfg.get("s3_prefix")
+        if not (bucket and prefix):
+            sys.exit("--publish-s3 requires race.s3_bucket and race.s3_prefix in YAML")
+        # Upload with canonical filenames regardless of local slug-based names.
+        # boto3.upload_file lets us pick the S3 key independently.
+        import boto3
+        s3 = boto3.client("s3")
+        prefix = prefix.strip("/")
+        uploads = [
+            (route_json_path,    "route.json",    "application/json"),
+            (route_geojson_path, "route.geojson", "application/geo+json"),
+            (manifest_path,      "manifest.json", "application/json"),
+        ]
+        print(f"\nUploading to s3://{bucket}/{prefix}/ ...")
+        for local_path, remote_name, content_type in uploads:
+            if local_path is None or not Path(local_path).exists():
+                print(f"  SKIP (missing): {remote_name}")
+                continue
+            key = f"{prefix}/{remote_name}"
+            s3.upload_file(
+                str(local_path), bucket, key,
+                ExtraArgs={"ContentType": content_type,
+                           "CacheControl": "max-age=300"},
+            )
+            print(f"  -> s3://{bucket}/{key}")
+        print("Upload complete.")
 
     # ---- Position time-series ----
     if save_plots and not args.no_plots:

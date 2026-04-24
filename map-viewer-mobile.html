@@ -599,7 +599,81 @@
       0%, 100% { opacity: 1; }
       50% { opacity: 0.5; }
     }
-    
+
+    /* Race route toggle */
+    .race-toggle {
+      position: fixed;
+      bottom: calc(160px + env(safe-area-inset-bottom, 0px));
+      left: 10px;
+      width: 44px;
+      height: 44px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.95);
+      border: 2px solid #d95f0e;
+      color: #d95f0e;
+      font-size: 11px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      z-index: 10;
+      transition: all 0.2s ease;
+      text-align: center;
+      line-height: 1.1;
+    }
+    .race-toggle:active { transform: scale(0.95); }
+    .race-toggle.active { background: #d95f0e; color: white; }
+    .race-toggle.loading { animation: pulse 1s ease-in-out infinite; }
+    /* "NEW" badge appears when a fresher precompute is available on S3. */
+    .race-toggle .race-new-badge {
+      position: absolute;
+      top: -4px; right: -4px;
+      min-width: 18px; height: 18px; padding: 0 4px;
+      background: #0a7d00;
+      color: white;
+      border-radius: 9px;
+      font-size: 9px;
+      font-weight: 700;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.35);
+    }
+    .race-toggle.has-update .race-new-badge { display: flex; }
+
+    /* Reroute button (enabled at T-30m; stub until Phase 2 Lambda ships). */
+    .reroute-btn {
+      position: fixed;
+      bottom: calc(210px + env(safe-area-inset-bottom, 0px));
+      left: 10px;
+      width: 44px;
+      height: 44px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.95);
+      border: 2px solid #999;
+      color: #999;
+      font-size: 11px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: not-allowed;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      z-index: 10;
+      transition: all 0.2s ease;
+      text-align: center;
+      line-height: 1.1;
+    }
+    .reroute-btn.enabled {
+      border-color: #0a7d00;
+      color: #0a7d00;
+      cursor: pointer;
+    }
+    .reroute-btn.enabled:active { transform: scale(0.95); }
+
     /* User location marker */
     .user-location-marker {
       position: absolute;
@@ -661,6 +735,7 @@
     
     <div id="map"></div>
     <canvas id="currents-canvas" style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2;"></canvas>
+    <canvas id="race-canvas"     style="position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:3;display:none;"></canvas>
     
     <!-- Tide chart -->
     <div class="tide-chart" id="tide-chart">
@@ -680,6 +755,10 @@
     
     <!-- View toggle button -->
     <button class="view-toggle" id="view-toggle" aria-label="Toggle raw data view" title="Toggle raw data view">RAW</button>
+
+    <button class="race-toggle" id="race-toggle" aria-label="Toggle race route overlay" title="Show race route">RACE<span class="race-new-badge" id="race-new-badge">NEW</span></button>
+
+    <button class="reroute-btn" id="reroute-btn" aria-label="Reroute from my position" title="Reroute enables at T-30m (requires GPS)" disabled>GO</button>
     
     <!-- Location button -->
     <button class="locate-btn" id="locate-btn" aria-label="Show my location" title="Show my location">
@@ -816,6 +895,13 @@
       ARROWS_PER_TILE: isLowPowerDevice ? 12 : 16,
       // Water boundary bitmap resolution (degrees per pixel, ~50m at lat 48)
       WATER_BITMAP_RES: 0.0005,
+      // Race route published by the GHA precompute workflow.
+      RACE_SLUG: 'shilshole_double_bluff_return',
+      // On localhost we look for the route under /race-dev/<slug>/ so you can
+      // symlink the run_route.py output dir there for pre-deploy verification.
+      RACE_BASE_URL: (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+        ? `${location.origin}/race-dev`
+        : 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/races',
     };
     
     // ========== APPLICATION STATE ==========
@@ -831,6 +917,10 @@
       userLocation: null,  // { lat, lng, accuracy }
       watchId: null,       // Geolocation watch ID
       locationActive: false,
+      raceRouteLoaded: false,   // GeoJSON fetched and set on source
+      raceRouteVisible: false,  // layers currently visible
+      raceInputsHash: null,     // last-seen manifest inputs_hash for cache-busting
+      raceLastManifest: null,   // last manifest seen (for event_start_utc + T-30m gate)
     };
     
     // ========== CANVAS CURRENT RENDERER ==========
@@ -2850,9 +2940,270 @@ window.addEventListener('resize', handleViewportChange);
       marker.style.top = (point.y + rect.top) + 'px';
     });
     
+    // ========== RACE ROUTE LAYER ==========
+    // Drawn on a dedicated canvas (#race-canvas, z-index 3) that sits ABOVE
+    // the semi-transparent currents canvas, so the route isn't washed out by
+    // the current-arrow overlay. Coords come from a fetched GeoJSON (cached
+    // client-side); map.project() converts lon/lat -> screen px on every
+    // pan/zoom.
+    const raceCanvas = document.getElementById('race-canvas');
+    const raceCtx    = raceCanvas.getContext('2d');
+    let   raceGeojson = null;  // last-fetched FeatureCollection
+    let   raceRenderScheduled = false;
+
+    // Dark, saturated leg colors that stay legible over light water tints.
+    const RACE_LEG_COLORS = {
+      1: '#001a4d',  // deep navy
+      2: '#4a1a00',  // dark rust
+      3: '#1a4a00',  // dark green
+      4: '#2a004a',  // dark plum
+    };
+    const RACE_LEG_DEFAULT = '#111';
+
+    function resizeRaceCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      raceCanvas.width  = raceCanvas.clientWidth  * dpr;
+      raceCanvas.height = raceCanvas.clientHeight * dpr;
+      raceCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    function scheduleRaceRender() {
+      // Zero-cost path when the race layer is hidden: no RAF scheduling, no
+      // clearRect, no projection. The canvas is already display:none so
+      // anything stale is hidden.
+      if (!state.raceRouteVisible) return;
+      if (raceRenderScheduled) return;
+      raceRenderScheduled = true;
+      requestAnimationFrame(() => {
+        raceRenderScheduled = false;
+        renderRaceCanvas();
+      });
+    }
+
+    function renderRaceCanvas() {
+      const ctx = raceCtx;
+      const w = raceCanvas.clientWidth;
+      const h = raceCanvas.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+      if (!state.raceRouteVisible || !raceGeojson) return;
+
+      // Pass 1: legs (white casing under dark inner line for contrast on any basemap).
+      for (const feat of raceGeojson.features) {
+        if (feat.geometry.type !== 'LineString') continue;
+        const coords = feat.geometry.coordinates;
+        if (coords.length < 2) continue;
+
+        ctx.beginPath();
+        for (let i = 0; i < coords.length; i++) {
+          const [lon, lat] = coords[i];
+          const p = map.project([lon, lat]);
+          if (i === 0) ctx.moveTo(p.x, p.y);
+          else         ctx.lineTo(p.x, p.y);
+        }
+        // White casing
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+        ctx.lineWidth = 9;
+        ctx.stroke();
+        // Dark inner line
+        ctx.strokeStyle = RACE_LEG_COLORS[feat.properties.leg] || RACE_LEG_DEFAULT;
+        ctx.lineWidth = 5;
+        ctx.stroke();
+      }
+
+      // Pass 2: marks (points) with labels.
+      ctx.font = '600 12px system-ui, -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      for (const feat of raceGeojson.features) {
+        if (feat.geometry.type !== 'Point') continue;
+        const [lon, lat] = feat.geometry.coordinates;
+        const p = map.project([lon, lat]);
+        const kind = feat.properties.mark_kind;
+        const fill = kind === 'start'  ? '#1d6a1d'
+                   : kind === 'finish' ? '#a31d1d'
+                                       : '#ffffff';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        ctx.fillStyle = fill;
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = '#111';
+        ctx.stroke();
+
+        const name = feat.properties.name;
+        if (name) {
+          const ty = p.y + 12;
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+          ctx.strokeText(name, p.x, ty);
+          ctx.fillStyle = '#111';
+          ctx.fillText(name, p.x, ty);
+        }
+      }
+    }
+
+    // Three-valued fetch:
+    //   'load-route'   — fetch manifest+geojson unconditionally (first use)
+    //   'check-update' — fetch only manifest; set has-update badge if newer
+    //   'apply-update' — fetch manifest+geojson; refresh in place
+    async function fetchRaceRoute(mode = 'load-route') {
+      const base = `${CONFIG.RACE_BASE_URL}/${CONFIG.RACE_SLUG}`;
+      const bust = Date.now();
+      const manifest = await fetch(`${base}/manifest.json?t=${bust}`).then((r) => {
+        if (!r.ok) throw new Error(`manifest fetch failed: ${r.status}`);
+        return r.json();
+      });
+      state.raceLastManifest = manifest;
+      const hash = manifest.inputs_hash || '';
+      const fresh = (hash !== state.raceInputsHash);
+
+      if (mode === 'check-update') {
+        // Set or clear the "NEW" badge. Never mutate the rendered route.
+        if (state.raceRouteLoaded && fresh) {
+          document.getElementById('race-toggle').classList.add('has-update');
+          logger.info('Race route has a newer precompute available:', hash);
+        }
+        return manifest;
+      }
+      if (!fresh && state.raceRouteLoaded && mode !== 'apply-update') {
+        return manifest;  // nothing to do
+      }
+
+      const geojsonUrl = `${base}/${manifest.route_geojson || 'route.geojson'}?v=${encodeURIComponent(hash)}`;
+      const geojson = await fetch(geojsonUrl).then((r) => {
+        if (!r.ok) throw new Error(`geojson fetch failed: ${r.status}`);
+        return r.json();
+      });
+      raceGeojson = geojson;
+      state.raceRouteLoaded = true;
+      state.raceInputsHash = hash;
+      document.getElementById('race-toggle').classList.remove('has-update');
+      logger.info('Race route loaded:', manifest.slug, 'hash=', hash,
+                  'total_nm=', manifest.total_distance_nm);
+      return manifest;
+    }
+
+    // True when we're within 30 min of start (or past it). The server stops
+    // precomputing at this point, so manifest polling also stops and the
+    // reroute button takes over as the only update path.
+    function isInRaceWindow() {
+      const m = state.raceLastManifest;
+      if (!m || !m.event_start_utc) return false;
+      const start = Date.parse(m.event_start_utc);
+      if (isNaN(start)) return false;
+      return (Date.now() >= start - 30 * 60 * 1000);
+    }
+
+    function updateRerouteBtn() {
+      const btn = document.getElementById('reroute-btn');
+      const enabled = isInRaceWindow() && !!state.userLocation;
+      btn.classList.toggle('enabled', enabled);
+      btn.disabled = !enabled;
+      btn.title = enabled
+        ? 'Reroute from my current position'
+        : (!state.userLocation
+            ? 'Enable location to reroute'
+            : 'Reroute enables at T-30m');
+    }
+
+    // Called on load + every time the app comes to foreground. Silent
+    // manifest check; if newer, badge the RACE button but do NOT refetch the
+    // geojson until the user taps to accept.
+    async function checkForRouteUpdate() {
+      if (isInRaceWindow()) {
+        updateRerouteBtn();
+        return;  // server has frozen nominal route; don't poll further
+      }
+      try {
+        await fetchRaceRoute('check-update');
+      } catch (err) {
+        logger.warn('Race manifest check failed:', err.message);
+      }
+      updateRerouteBtn();
+    }
+
+    async function toggleRaceRoute() {
+      const btn = document.getElementById('race-toggle');
+      // If the badge is showing, a short tap accepts the update instead of
+      // toggling visibility off. Avoids the user losing the route to hide a
+      // notification.
+      const hasUpdate = btn.classList.contains('has-update');
+      if (state.raceRouteVisible && hasUpdate) {
+        btn.classList.add('loading');
+        try {
+          await fetchRaceRoute('apply-update');
+          scheduleRaceRender();
+        } catch (err) {
+          logger.error('Race route refresh failed:', err);
+          alert('Could not refresh race route:\n' + err.message);
+        } finally {
+          btn.classList.remove('loading');
+        }
+        return;
+      }
+      if (!state.raceRouteVisible) {
+        btn.classList.add('loading');
+        try {
+          await fetchRaceRoute('load-route');
+          raceCanvas.style.display = 'block';
+          resizeRaceCanvas();
+          state.raceRouteVisible = true;
+          btn.classList.add('active');
+          scheduleRaceRender();
+          updateRerouteBtn();
+        } catch (err) {
+          logger.error('Race route load failed:', err);
+          alert('Could not load race route:\n' + err.message);
+        } finally {
+          btn.classList.remove('loading');
+        }
+      } else {
+        state.raceRouteVisible = false;
+        raceCanvas.style.display = 'none';
+        btn.classList.remove('active');
+      }
+    }
+
+    document.getElementById('race-toggle').addEventListener('click', toggleRaceRoute);
+
+    // REROUTE button — Phase 2 Lambda stub. Wires will land when the
+    // Function URL is deployed; for now we surface intent + constraints.
+    document.getElementById('reroute-btn').addEventListener('click', () => {
+      if (!isInRaceWindow()) return;
+      if (!state.userLocation) {
+        alert('Enable your location first (tap the locate button).');
+        return;
+      }
+      alert('Reroute endpoint not yet deployed (Phase 2). '
+          + 'Current GPS: '
+          + state.userLocation.lat.toFixed(5) + ', '
+          + state.userLocation.lng.toFixed(5));
+    });
+
+    // Surface fresher precomputes on app foreground / initial load, but
+    // never swap the rendered route without the user tapping the badge.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        checkForRouteUpdate();
+      }
+    });
+
+    // Keep the race overlay in sync with map pan/zoom/resize.
+    map.on('move',    scheduleRaceRender);
+    map.on('zoom',    scheduleRaceRender);
+    map.on('rotate',  scheduleRaceRender);
+    window.addEventListener('resize', () => { resizeRaceCanvas(); scheduleRaceRender(); });
+
     // Initialize when map loads
     map.on('load', async () => {
+      resizeRaceCanvas();
       await initialize();
+      // One manifest check on load so the badge appears if a fresher
+      // precompute has landed since last session. Never mutates the
+      // rendered route; tap RACE to accept.
+      checkForRouteUpdate();
     });
     
     // Handle errors gracefully

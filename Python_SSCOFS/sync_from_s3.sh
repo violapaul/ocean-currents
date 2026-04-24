@@ -34,8 +34,9 @@ echo "Syncing: ${LOCAL_RUN:-none} → $REMOTE_RUN"
 RUN_DIR="$OUT_DIR/$REMOTE_RUN"
 mkdir -p "$RUN_DIR"
 
-curl -sf "$S3_BASE/$REMOTE_RUN/manifest.json" -o "$RUN_DIR/manifest.json"
-curl -sf "$S3_BASE/$REMOTE_RUN/geometry.bin"   -o "$RUN_DIR/geometry.bin"
+curl -sf "$S3_BASE/$REMOTE_RUN/manifest.json"          -o "$RUN_DIR/manifest.json"
+curl -sf "$S3_BASE/$REMOTE_RUN/geometry.bin"           -o "$RUN_DIR/geometry.bin"
+curl -sf "$S3_BASE/$REMOTE_RUN/water_boundary.geojson" -o "$RUN_DIR/water_boundary.geojson"
 
 HOURS=$(python3 -c "
 import json
