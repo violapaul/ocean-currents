@@ -1655,8 +1655,10 @@ def main():
     # --- race-mode / web publishing flags (see plan: races to PWA) ---
     parser.add_argument("--race-mode", action="store_true",
                         help="Requires a race: block in the YAML. Implies "
-                             "--no-plots, --geojson, --publish-s3. Overrides "
-                             "departure from race.event_start_utc.")
+                             "--no-plots and --geojson. Overrides departure "
+                             "from race.event_start_utc. Pass --publish-s3 "
+                             "additionally to upload to S3 (the workflow "
+                             "does this; local test runs typically don't).")
     parser.add_argument("--geojson", action="store_true",
                         help="Also emit <slug>.geojson alongside the JSON.")
     parser.add_argument("--publish-s3", action="store_true",
