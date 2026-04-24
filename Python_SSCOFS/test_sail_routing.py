@@ -25,7 +25,7 @@ from sail_routing import (CurrentField, BoatModel, Router, MeshRouter, SectorRou
                           Route, PolarTable, WindField, compute_twa, _solve_heading,
                           KNOTS_TO_MS, MS_TO_KNOTS, build_mesh_adjacency)
 
-POLAR_CSV = Path(__file__).parent.parent.parent / "j105_polar_data_long.csv"
+POLAR_CSV = Path(__file__).parent.parent.parent / "j105_new_polars.csv"
 
 # =====================================================================
 #  Helpers -- synthetic current field factory
@@ -969,9 +969,9 @@ class TestPolarTable:
 
     def test_exact_table_lookup(self, polar):
         """Values that fall exactly on table grid points should match CSV."""
-        assert polar.speed(90, 10) == pytest.approx(7.1, abs=0.05)
-        assert polar.speed(52, 20) == pytest.approx(7.3, abs=0.05)
-        assert polar.speed(180, 12) == pytest.approx(5.9, abs=0.05)
+        assert polar.speed(90, 10) == pytest.approx(7.8, abs=0.05)
+        assert polar.speed(52, 20) == pytest.approx(7.4, abs=0.05)
+        assert polar.speed(180, 12) == pytest.approx(5.85, abs=0.05)
 
     def test_twa_interpolation(self, polar):
         """Midpoint between TWA=70 and TWA=80 should interpolate."""
@@ -997,9 +997,9 @@ class TestPolarTable:
         s_over = polar.speed(90, 200.0)
         assert s_over == pytest.approx(s_max, abs=0.01)
 
-    def test_tws_clamps_at_zero(self, polar):
-        """TWS=0 should give zero speed."""
-        assert polar.speed(90, 0) == pytest.approx(0.0, abs=0.01)
+    def test_tws_clamps_at_min_table_wind(self, polar):
+        """TWS below the table range clamps to the lowest table wind speed."""
+        assert polar.speed(90, 0) == pytest.approx(polar.speed(90, polar._twss[0]), abs=0.01)
 
     def test_max_speed_kt(self, polar):
         """max_speed_kt should match the maximum value in the CSV."""
