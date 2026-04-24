@@ -1,54 +1,211 @@
 # Round the County — Sunday Leg
 #
-# Mosquito Pass (start) → south through San Juan Channel → round Iceberg Point
-# → east across south Lopez / Strait of Juan de Fuca entry → north up
-# Rosario Strait → Lydia Shoal (finish).
+# Source course reference: 2025 Sailing Instructions v1.2.
+# RC-set start/finish marks are day-of positions and are represented here by
+# approximate seed/guide points only.
 #
-# Race direction: counter-clockwise around San Juan County (continuing from Saturday).
+# Sunday start: south end of Mosquito Pass, between RC boat and orange
+# pyramid buoy.
+#
+# Leave to port:
+#   San Juan Island,
+#   Long Island,
+#   Lopez Island,
+#   Davidson Rock,
+#   Kellett Ledge,
+#   James Island,
+#   Blakely Island.
+#
+# Finish: between RC boat and Lydia Shoal buoy, leave RC boat to port.
+# If the RC boat is missing, cross latitude 48° 35.973' N west of and within
+# 100 yards of Lydia Shoal buoy.
+#
+# Official 2025 SI distances:
+#   full course: 31.4 nm
+#   short course: 16.37 nm
+#
+# Sunday short-course finish:
+#   north-south GPS line through Iceberg Point longitude
+#   cross when GPS longitude becomes less than 122° 53.656' W
+#   signed decimal test: lon > -122.894267 (east of the meridian)
 #
 # Mark types:
-#   Lydia Shoal buoy (finish) → regular waypoint.
-#   Headland (Iceberg Point, SW tip of Lopez Island) → land mark with barrier.
+#   1) waypoint / close_round / finish_seed:
+#        a point the A* router navigates to.
+#   2) constraint mark:
+#        a representative point plus a one-way fence that blocks an illegal
+#        shortcut. These are routing approximations, not official point marks.
 #
-# Iceberg Point barrier (bearing 0° = north):
-#   Correct route keeps Iceberg Point to port heading east = passes SOUTH of
-#   the Lopez Island tip into the Strait of Juan de Fuca.
-#   The fence extends north from Iceberg Point, closing the Cattle Pass
-#   inside-line shortcut (which would leave the point to starboard).
+# Official fixed-point marks from 2025 SIs:
+#   Lydia Shoal buoy      48.599550  -122.779083
+#   Iceberg Point Light   48.422050  -122.894283
 #
-# Iceberg Point coordinates are from official lighthouse reference.
+# NOTE:
+#   The island/rock/ledge constraints below are approximate until replaced by
+#   chart polygons or shoreline/reef edges. Treat this as a routing draft, not
+#   a certified RTC course geometry.
 #
 # Run with:
 #   conda run -n anaconda python run_route.py routes/round_the_county_sunday.yaml
 
 task:
   name: "Round the County — Sunday (Mosquito Pass → Lydia Shoal)"
+  source: "Round the County 2025 Sailing Instructions v1.2"
   description: >
-    Counter-clockwise leg 2. Start off south end of Mosquito Pass, south through
-    San Juan Channel with San Juan Island to port (west), round Iceberg Point
-    (SW tip of Lopez Island) to port — passing SOUTH of the headland into the
-    Strait of Juan de Fuca — then northeast up Rosario Strait to finish at
-    Lydia Shoal buoy.
+    Counter-clockwise leg 2. Start at the south end of Mosquito Pass, leave
+    the listed islands/rocks/ledges to port, and finish at the Lydia Shoal
+    line. Route points and constraints are approximations for planning.
+
+course:
+  race: "Round the County"
+  year: 2025
+  leg: sunday
+  direction: counter_clockwise
+  distance_nm:
+    full: 31.4
+    short: 16.37
+  fixed_marks:
+    lydia_shoal:
+      name: "Lydia Shoal"
+      description: "Green lighted gong buoy 13 (Q G)"
+      lat: 48.599550
+      lon: -122.779083
+    iceberg_point:
+      name: "Iceberg Point"
+      description: "Iceberg Point Light 2 (Fl R 4s)"
+      lat: 48.422050
+      lon: -122.894283
+  start:
+    type: rc_line_day_of
+    location_text: "South end of Mosquito Pass"
+    endpoints:
+      - rc_boat: true
+      - orange_pyramid_buoy: true
+  leave_to_port:
+    - San Juan Island
+    - Long Island
+    - Lopez Island
+    - Davidson Rock
+    - Kellett Ledge
+    - James Island
+    - Blakely Island
+  short_finish:
+    type: meridian_crossing
+    reference: iceberg_point
+    longitude_dms: "122° 53.656' W"
+    longitude_decimal: -122.894267
+    signed_test: "boat.lon > -122.894267"
+  full_finish:
+    type: line_day_of
+    endpoints:
+      - rc_boat: true
+      - fixed_mark: lydia_shoal
+    rounding_instruction: "Leave RC boat to port."
+  fallback_finish_if_rc_missing:
+    type: latitude_crossing_near_mark
+    latitude_dms: "48° 35.973' N"
+    latitude_decimal: 48.599550
+    side: "west of Lydia Shoal buoy"
+    max_distance_yards_from_lydia_shoal: 100
+  routing_limitations:
+    - "The current waypoints are guide seeds; official RC start/finish lines are day-of positions."
+    - "Island, rock, and ledge leave-to-port requirements need chart polygons for production-grade enforcement."
 
 departure:
   datetime: "2026-03-12 09:00"   # test date — update to actual race date before use
   tz: "America/Los_Angeles"
 
 waypoints:
-  - [48.590, -123.005]        # Start — south end of Mosquito Pass (approx RC position)
-  - [48.530, -122.970]        # San Juan Channel — southbound, SJI to port (west)
+  # --- start / southbound guide gates ---
+  - lat: 48.590000
+    lon: -123.005000
+    name: "Sunday start seed — south end of Mosquito Pass"
+    mark_type: waypoint
+    notes: "Approximate RC start area seed."
 
-  # Land mark: Iceberg Point Light 2 (SW tip of Lopez Island).
-  # Correct route keeps Iceberg Point to port heading east = SOUTH of the tip.
-  # Barrier extends north, closing the inside-line shortcut through Cattle Pass.
+  # Guide south through San Juan Channel with San Juan Island to port.
+  - lat: 48.530000
+    lon: -122.970000
+    name: "San Juan Channel southbound guide"
+    mark_type: waypoint
+
+  # San Juan Island / Long Island side constraints are approximate; the
+  # official SIs name landmasses, not point coordinates.
+  - lat: 48.515000
+    lon: -123.020000
+    name: "San Juan Island south-end constraint"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 180
+    notes: "Approximate guard against cutting west/inside of the intended southbound line."
+
+  - lat: 48.457000
+    lon: -122.955000
+    name: "Long Island constraint"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 180
+    notes: "Approximate keep-Long-Island-to-port constraint."
+
+  # Official lighthouse coordinate.  Correct route keeps Iceberg Point to port
+  # heading east, passing south of Lopez Island into the Strait of Juan de Fuca.
+  # Barrier extends north, closing the Cattle Pass inside-line shortcut.
   - lat: 48.422050
     lon: -122.894283
+    name: "Iceberg Point Light 2"
+    mark_type: constraint
     rounding: port
     barrier_bearing_deg: 0    # fence north into Cattle Pass, blocks inside-line shortcut
 
-  - [48.400, -122.870]        # South of Iceberg Point — Strait of Juan de Fuca entry
-  - [48.445, -122.780]        # Rosario Strait south — east of Lopez / Davidson Rock
-  - [48.5996, -122.7791]      # Lydia Shoal buoy — finish line reference / leave to port
+  - lat: 48.400000
+    lon: -122.870000
+    name: "South of Iceberg Point guide"
+    mark_type: waypoint
+
+  # Approximate outside/east-side constraints for the named rocks/islands.
+  - lat: 48.421000
+    lon: -122.796000
+    name: "Davidson Rock constraint"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 0
+    notes: "Approximate keep-Davidson-Rock-to-port constraint."
+
+  - lat: 48.487000
+    lon: -122.780000
+    name: "Kellett Ledge constraint"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 0
+    notes: "Approximate keep-Kellett-Ledge-to-port constraint."
+
+  - lat: 48.512000
+    lon: -122.771000
+    name: "James Island constraint"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 0
+    notes: "Approximate keep-James-Island-to-port constraint."
+
+  - lat: 48.565000
+    lon: -122.795000
+    name: "Blakely Island constraint"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 0
+    notes: "Approximate keep-Blakely-Island-to-port constraint."
+
+  - lat: 48.445000
+    lon: -122.780000
+    name: "Rosario Strait south guide"
+    mark_type: waypoint
+
+  - lat: 48.599550
+    lon: -122.779083
+    name: "Lydia Shoal buoy G '13'"
+    mark_type: finish_seed
+    rounding: port
+    notes: "Finish line reference; actual RC line is day-of."
 
 boat:
   speed_kt: 6.0

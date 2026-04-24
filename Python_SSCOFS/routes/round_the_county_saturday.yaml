@@ -1,5 +1,9 @@
 # Round the County — Saturday leg (counter-clockwise / leave listed marks to port)
 #
+# Source course reference: 2025 Sailing Instructions v1.2.
+# Official fixed coordinates are included below; RC-set start/finish marks are
+# day-of positions and are represented here only by approximate seed points.
+#
 # Start off Lydia Shoal, then leave to port:
 #   Lydia Shoal buoy,
 #   Orcas Island,
@@ -15,6 +19,15 @@
 #   Danger Shoal buoy,
 # then finish near Roche Harbor on an RC-set finish line.
 #
+# Official 2025 SI distances:
+#   full course: 34.3 nm
+#   short course: 17.16 nm
+#
+# Saturday short-course finish:
+#   north-south GPS line through Patos Lighthouse longitude
+#   cross when GPS longitude becomes greater than 122° 58.280' W
+#   signed decimal test: lon < -122.971333 (west of the meridian)
+#
 # Mark classes used here:
 #   1) close-round mark:
 #        a discrete buoy/light you are assumed to round closely
@@ -28,21 +41,87 @@
 #   For a production-grade solver, replace them with chart polygons or
 #   shoreline/reef edges and enforce side-of-obstacle topologically.
 #
-# Official fixed-point marks used below:
+# Official fixed-point marks from 2025 SIs:
 #   Lydia Shoal buoy      48.599550  -122.779083
 #   Clements Reef buoy    48.777667  -122.891733
 #   Danger Shoal buoy     48.639167  -123.181000
+#   Patos Lighthouse      48.789000  -122.971367
 #
 # Run with:
-#   conda run -n anaconda python run_route.py routes/rtc_saturday_leg.yaml
+#   conda run -n anaconda python run_route.py routes/round_the_county_saturday.yaml
 
 task:
   name: "RTC Saturday leg — Lydia Shoal → Roche Harbor area"
+  source: "Round the County 2025 Sailing Instructions v1.2"
   description: >
     Counter-clockwise Saturday leg of Round the County.
     Fixed buoy marks are rounded closely to port.
     Island/reef marks are encoded as routing constraints: representative
     point + fence that blocks the wrong-side shortcut.
+
+course:
+  race: "Round the County"
+  year: 2025
+  leg: saturday
+  direction: counter_clockwise
+  distance_nm:
+    full: 34.3
+    short: 17.16
+  fixed_marks:
+    lydia_shoal:
+      name: "Lydia Shoal"
+      description: "Green lighted gong buoy 13 (Q G)"
+      lat: 48.599550
+      lon: -122.779083
+    clements_reef_buoy:
+      name: "Clements Reef Buoy"
+      description: "Red nun buoy 2"
+      lat: 48.777667
+      lon: -122.891733
+    danger_shoal:
+      name: "Danger Shoal"
+      description: "Lighted bell buoy SW of shoal"
+      lat: 48.639167
+      lon: -123.181000
+    patos_lighthouse:
+      name: "Patos Lighthouse"
+      description: "Patos Island Light (Fl W 6s)"
+      lat: 48.789000
+      lon: -122.971367
+  start:
+    type: line_day_of
+    location_text: "Off Lydia Shoal, between Lydia Shoal buoy and the RC boat"
+    endpoints:
+      - fixed_mark: lydia_shoal
+      - rc_boat: true
+  leave_to_port:
+    - lydia_shoal
+    - Orcas Island
+    - Sisters Islands
+    - Clark Island
+    - Matia Island
+    - Clements Reef
+    - clements_reef_buoy
+    - Patos Island
+    - Waldron Island
+    - Skipjack Island
+    - Stuart Island
+    - danger_shoal
+  short_finish:
+    type: meridian_crossing
+    reference: patos_lighthouse
+    longitude_dms: "122° 58.280' W"
+    longitude_decimal: -122.971333
+    signed_test: "boat.lon < -122.971333"
+  full_finish:
+    type: rc_line_day_of
+    notes:
+      - "Either off NW Pearl Island or north of McCracken Point/east of Battleship Island."
+      - "Between RC boat and temporary orange pyramid buoy."
+      - "Leave RC boat to port."
+  routing_limitations:
+    - "Island and reef leave-to-port requirements are approximate barrier constraints, not chart polygons."
+    - "Full-course finish is an approximate seed until day-of RC position is known."
 
 departure:
   datetime: "2026-03-11 08:35"   # test date — update to actual race date before use
@@ -112,6 +191,7 @@ waypoints:
 
   # --- northern outside arc ---
   # Representative NW side of Patos; fence extends north to block inside cut.
+  # Official Patos Lighthouse reference is 48.789000, -122.971367.
   - lat: 48.790000
     lon: -122.973500
     name: "Patos Island (constraint point)"

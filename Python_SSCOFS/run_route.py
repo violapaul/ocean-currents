@@ -42,7 +42,7 @@ YAML schema:
       # padding_deg: 0.25
       # duration_hours: 12
       # buffer_hours: 2
-      # use_cached_netcdf: true        # reuse existing output_netcdf when present
+      # use_cache_even_if_stale: false # default; true reuses route wind NetCDF
 
       # Option C: manual time-varying schedule (spatially uniform, linearly
       # interpolated between anchors; queries outside the schedule clamp to
@@ -63,12 +63,18 @@ YAML schema:
       duration_hours: 10              # forecast window to load per leg
       # Optional performance knobs (all have safe defaults):
       # polar_sweep_coarse_step: 5    # 1=exact, >1 faster approximate
+      # k_candidates: 50              # KD candidates for sector graph fill
+      # max_edge_m: 2000              # max sector edge length
+      # min_edge_m: 50                # min sector edge length
+      # los_samples: 15               # land-crossing samples per candidate edge
       # corridor_pad_factors: [0.85, 1.0, 1.35]
       # corridor_cache_max: 4
+      # use_dense_polar: true
       # use_dot_filter: false         # experimental; disabled in production YAMLs
 
     output:
       save_plots: true
+      save_hourly_frames: false       # optional PNG sequence; expensive
       plot_dir: "routes/output"       # relative to this script's dir
 """
 
@@ -403,13 +409,22 @@ def _build_openmeteo_route_wind(wind_cfg: dict, ctx: dict) -> WindField:
         if not out_csv_path.is_absolute():
             out_csv_path = HERE / out_csv_path
 
-    use_cached_netcdf = bool(wind_cfg.get("use_cached_netcdf", True))
-    if use_cached_netcdf and (not ctx["no_cache"]) and out_nc_path.exists():
+    use_cache_even_if_stale = bool(
+        wind_cfg.get("use_cache_even_if_stale",
+                     wind_cfg.get("use_cached_netcdf", False))
+    )
+    if use_cache_even_if_stale and (not ctx["no_cache"]) and out_nc_path.exists():
         print(f"Using cached wind dataset: {out_nc_path}")
         ds = xr.load_dataset(out_nc_path)
         nodes_count = int(ds.sizes.get("point", len(ds["latitude"].values)))
     else:
-        print("Fetching route-local ECMWF wind nodes…")
+        if out_nc_path.exists() and not ctx["no_cache"]:
+            print(
+                "Fetching fresh route-local ECMWF wind "
+                f"(ignoring existing cache: {out_nc_path.name})…"
+            )
+        else:
+            print("Fetching route-local ECMWF wind nodes…")
         _, ds, nodes = fetch_route_wind_dataset(
             waypoints_latlon=ctx["waypoints"],
             nodes_csv=nodes_csv,
@@ -599,6 +614,53 @@ def print_trip_summary(routes, labels, total_start_utc, tz):
     for i, (r, lbl) in enumerate(zip(routes, labels), 1):
         print(f"  {i}. {lbl:<35} {r.total_distance_m/1852:.2f} nm  "
               f"{r.total_time_s/60:.0f} min  SOG {r.avg_sog_knots:.2f} kt")
+    print(f"{'═'*60}")
+
+
+def _perf_value(route, key, default=0.0):
+    """Return one route performance counter as a float."""
+    perf = (route.debug or {}).get("perf", {})
+    try:
+        return float(perf.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def print_performance_summary(routes):
+    """Print a compact aggregate benchmark table for route runs."""
+    if not routes:
+        return
+
+    keys = ("setup", "graph_build", "astar", "diagnostics", "plot_grid", "total")
+    totals = {k: sum(_perf_value(r, k) for r in routes) for k in keys}
+    attempts = sum(int(_perf_value(r, "corridor_attempts", 0)) for r in routes)
+    hits = sum(int(_perf_value(r, "graph_cache_hits", 0)) for r in routes)
+
+    print(f"\n{'═'*60}")
+    print("ROUTER PERFORMANCE")
+    print("  Leg     setup   graph   astar   diag  grid   total   explored")
+    for i, route in enumerate(routes, 1):
+        print(
+            f"  {i:>3}  "
+            f"{_perf_value(route, 'setup'):7.3f} "
+            f"{_perf_value(route, 'graph_build'):7.3f} "
+            f"{_perf_value(route, 'astar'):7.3f} "
+            f"{_perf_value(route, 'diagnostics'):6.3f} "
+            f"{_perf_value(route, 'plot_grid'):5.3f} "
+            f"{_perf_value(route, 'total'):7.3f} "
+            f"{int(route.nodes_explored):>10,}"
+        )
+    print(
+        "  ALL  "
+        f"{totals['setup']:7.3f} "
+        f"{totals['graph_build']:7.3f} "
+        f"{totals['astar']:7.3f} "
+        f"{totals['diagnostics']:6.3f} "
+        f"{totals['plot_grid']:5.3f} "
+        f"{totals['total']:7.3f}"
+    )
+    if attempts or hits:
+        print(f"  Corridor attempts: {attempts} (cache hits {hits})")
     print(f"{'═'*60}")
 
 
@@ -1166,6 +1228,17 @@ def save_route_report(routes, wps, depart_utc, depart_time_s, tz,
         f"- Source: `{wind_source}`",
         f"- Details: {wind_desc}",
         "",
+        "## Routing Settings",
+        "",
+        f"- `polar_sweep_coarse_step`: {doc.get('routing', {}).get('polar_sweep_coarse_step', SectorRouter.POLAR_SWEEP_COARSE_STEP)}",
+        f"- `use_dense_polar`: {doc.get('routing', {}).get('use_dense_polar', False)}",
+        f"- `use_dot_filter`: {doc.get('routing', {}).get('use_dot_filter', False)}",
+        f"- `k_candidates`: {doc.get('routing', {}).get('k_candidates', 50)}",
+        f"- `min_edge_m`: {doc.get('routing', {}).get('min_edge_m', 50.0)}",
+        f"- `max_edge_m`: {doc.get('routing', {}).get('max_edge_m', 2000.0)}",
+        f"- `los_samples`: {doc.get('routing', {}).get('los_samples', 15)}",
+        f"- `corridor_pad_factors`: {doc.get('routing', {}).get('corridor_pad_factors', list(SectorRouter.CORRIDOR_PAD_FACTORS))}",
+        "",
         "## Leg Breakdown",
         "",
         "| Leg | From -> To | Depart | Arrive | Distance | Time | Avg SOG | Tacks | Gybes |",
@@ -1189,6 +1262,39 @@ def save_route_report(routes, wps, depart_utc, depart_time_s, tz,
             f"{route.avg_sog_knots:.2f} kt | {tacks} | {gybes} |"
         )
         leg_depart = leg_arrive
+
+    if any((r.debug or {}).get("perf") for r in routes):
+        lines.extend([
+            "",
+            "## Router Performance",
+            "",
+            "| Leg | Setup | Graph | A* | Diagnostics | Plot Grid | Total | Explored |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+        total_perf = {
+            key: sum(_perf_value(r, key) for r in routes)
+            for key in ("setup", "graph_build", "astar", "diagnostics", "plot_grid", "total")
+        }
+        for i, route in enumerate(routes, 1):
+            lines.append(
+                f"| {i} | "
+                f"{_perf_value(route, 'setup'):.3f}s | "
+                f"{_perf_value(route, 'graph_build'):.3f}s | "
+                f"{_perf_value(route, 'astar'):.3f}s | "
+                f"{_perf_value(route, 'diagnostics'):.3f}s | "
+                f"{_perf_value(route, 'plot_grid'):.3f}s | "
+                f"{_perf_value(route, 'total'):.3f}s | "
+                f"{int(route.nodes_explored):,} |"
+            )
+        lines.append(
+            f"| **All** | "
+            f"{total_perf['setup']:.3f}s | "
+            f"{total_perf['graph_build']:.3f}s | "
+            f"{total_perf['astar']:.3f}s | "
+            f"{total_perf['diagnostics']:.3f}s | "
+            f"{total_perf['plot_grid']:.3f}s | "
+            f"{total_perf['total']:.3f}s |  |"
+        )
 
     lines.extend(["", "## Maneuvers", ""])
     any_maneuvers = False
@@ -1359,6 +1465,178 @@ def plot_position_timeseries(routes, wps, depart_utc, depart_time_s, tz,
     print(f"Time-series plot saved → {out_path.name}")
 
 
+def plot_clean_route_map(routes, wps, transformer, plot_dir, slug,
+                         leg_marks=None, course_feature_centers=None):
+    """Clean route-only overview: no wind/current layers."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.lines as mlines
+    import matplotlib.patheffects as pe
+
+    if not routes:
+        return None
+
+    leg_marks = leg_marks or {}
+    fig, ax = plt.subplots(figsize=(14, 13))
+    fig.patch.set_facecolor("white")
+
+    all_x, all_y = [], []
+    leg_tracks = []
+    for route in routes:
+        if route.simulated_track and len(route.simulated_track) > 1:
+            track = np.asarray(route.simulated_track, dtype=np.float64)
+        else:
+            track = np.asarray(route.waypoints_utm, dtype=np.float64)
+        leg_tracks.append(track)
+        all_x.extend(track[:, 0].tolist())
+        all_y.extend(track[:, 1].tolist())
+
+    route_waypoints = []
+    route_waypoints.append(routes[0].waypoints_utm[0])
+    route_waypoints.extend(route.waypoints_utm[-1] for route in routes)
+    for wx, wy in route_waypoints:
+        all_x.append(wx)
+        all_y.append(wy)
+
+    mark_entries = []
+    for leg_idx in sorted(leg_marks):
+        for m in leg_marks[leg_idx]:
+            mx, my = transformer.transform(float(m["lon"]), float(m["lat"]))
+            mark_entries.append((leg_idx, mx, my, m))
+            all_x.append(mx)
+            all_y.append(my)
+
+    feature_entries = []
+    for key, feature in (course_feature_centers or {}).items():
+        if not isinstance(feature, dict):
+            continue
+        if "lat" not in feature or "lon" not in feature:
+            continue
+        fx, fy = transformer.transform(float(feature["lon"]), float(feature["lat"]))
+        feature_entries.append((key, fx, fy, feature))
+        all_x.append(fx)
+        all_y.append(fy)
+
+    for leg_idx, _, _, _ in mark_entries:
+        barriers = compute_barriers(leg_marks.get(leg_idx, []), transformer)
+        for bar in barriers:
+            all_x.extend([bar[0], bar[2]])
+            all_y.extend([bar[1], bar[3]])
+
+    x_span = max(all_x) - min(all_x) if all_x else 1.0
+    y_span = max(all_y) - min(all_y) if all_y else 1.0
+    pad = max(1500.0, 0.08 * max(x_span, y_span))
+    ax.set_xlim(min(all_x) - pad, max(all_x) + pad)
+    ax.set_ylim(min(all_y) - pad, max(all_y) + pad)
+
+    ax.set_facecolor("#f7fbff")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, color="#d0d7de", alpha=0.45, linewidth=0.8)
+    ax.tick_params(labelsize=9)
+    ax.set_xlabel("Easting (m, UTM)", fontsize=9)
+    ax.set_ylabel("Northing (m, UTM)", fontsize=9)
+    draw_shoreline(ax, transformer, zorder=1)
+
+    barrier_label_used = False
+    for leg_idx in sorted(leg_marks):
+        barriers = compute_barriers(leg_marks.get(leg_idx, []), transformer)
+        for bar in barriers:
+            ax.plot(
+                [bar[0], bar[2]], [bar[1], bar[3]],
+                "--", color="#c026d3", linewidth=1.2, alpha=0.45,
+                zorder=2, label="Barrier" if not barrier_label_used else None,
+            )
+            barrier_label_used = True
+
+    leg_colors = ["#dc2626", "#2563eb", "#f97316", "#16a34a"]
+    for i, track in enumerate(leg_tracks):
+        ax.plot(
+            track[:, 0], track[:, 1],
+            color=leg_colors[i % len(leg_colors)], linewidth=3.0, zorder=5,
+            label=f"Leg {i + 1}",
+            path_effects=[pe.Stroke(linewidth=5.0, foreground="white", alpha=0.9),
+                          pe.Normal()],
+        )
+
+    key_lines = []
+    for i, (wx, wy) in enumerate(route_waypoints):
+        if i == 0:
+            tag, color, marker, name = "S", "#16a34a", "o", "Start"
+        elif i == len(route_waypoints) - 1:
+            tag, color, marker, name = "F", "#f97316", "s", "Finish seed"
+        else:
+            tag, color, marker, name = f"R{i}", "#111827", "o", f"Race mark {i}"
+        ax.plot(wx, wy, marker, color=color, markersize=10, zorder=8,
+                markeredgecolor="white", markeredgewidth=1.4)
+        ax.text(wx, wy, tag, ha="center", va="center", fontsize=7,
+                color="white", fontweight="bold", zorder=9)
+        key_lines.append(f"{tag}: {name}")
+
+    for mi, (leg_idx, mx, my, m) in enumerate(mark_entries, 1):
+        tag = f"C{mi}"
+        ax.plot(mx, my, "D", color="#c026d3", markersize=9, zorder=8,
+                markeredgecolor="white", markeredgewidth=1.2)
+        ax.text(mx, my, tag, ha="center", va="center", fontsize=7,
+                color="white", fontweight="bold", zorder=9)
+        name = str(m.get("name", f"constraint {mi}"))
+        name = name.replace(" (constraint point)", "")
+        key_lines.append(f"{tag}: {name}")
+
+    for fi, (key, fx, fy, feature) in enumerate(feature_entries, 1):
+        tag = f"F{fi}"
+        ax.plot(fx, fy, "o", color="#0ea5e9", markersize=8, zorder=8,
+                markeredgecolor="white", markeredgewidth=1.3)
+        ax.text(fx, fy, tag, ha="center", va="center", fontsize=6,
+                color="white", fontweight="bold", zorder=9)
+        label = str(feature.get("name", key.replace("_", " ").title()))
+        key_lines.append(f"{tag}: {label}")
+
+    if key_lines:
+        split_at = (len(key_lines) + 1) // 2
+        key_text = "\n".join(key_lines[:split_at])
+        if split_at < len(key_lines):
+            key_text += "\n\n" + "\n".join(key_lines[split_at:])
+        ax.text(
+            0.015, 0.985, key_text,
+            transform=ax.transAxes, ha="left", va="top", fontsize=8,
+            color="#111827",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
+                      edgecolor="#d1d5db", alpha=0.9),
+            zorder=20,
+        )
+
+    total_nm = sum(r.total_distance_m for r in routes) / 1852.0
+    total_min = sum(r.total_time_s for r in routes) / 60.0
+    ax.set_title(
+        f"{slug} race marks and constraints  |  {total_nm:.1f} nm, {total_min:.0f} min",
+        fontsize=13,
+    )
+
+    handles = [
+        mlines.Line2D([], [], color="#dc2626", linewidth=3, label="Route legs"),
+        mlines.Line2D([], [], marker="o", color="none", markerfacecolor="#16a34a",
+                      markeredgecolor="white", markersize=9, label="Start"),
+        mlines.Line2D([], [], marker="s", color="none", markerfacecolor="#f97316",
+                      markeredgecolor="white", markersize=9, label="End"),
+        mlines.Line2D([], [], marker="D", color="none", markerfacecolor="#c026d3",
+                      markeredgecolor="white", markersize=8, label="Constraint mark"),
+        mlines.Line2D([], [], marker="o", color="none", markerfacecolor="#0ea5e9",
+                      markeredgecolor="white", markersize=8, label="Feature center"),
+        mlines.Line2D([], [], color="#c026d3", linestyle="--", linewidth=1.2,
+                      label="Barrier"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles),
+               frameon=False, fontsize=9, bbox_to_anchor=(0.5, 0.015))
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+
+    out_path = plot_dir / f"{slug}_clean_map.png"
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Clean route map saved → {out_path.name}")
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1424,6 +1702,10 @@ def main():
     gybe_penalty = float(r_cfg.get("gybe_penalty_s", tack_penalty))
     gybe_threshold_deg = float(r_cfg.get("gybe_threshold_deg", 120))
     duration_h   = int(r_cfg.get("duration_hours", 10))
+    k_candidates = int(r_cfg.get("k_candidates", 50))
+    max_edge_m = float(r_cfg.get("max_edge_m", 2000.0))
+    min_edge_m = float(r_cfg.get("min_edge_m", 50.0))
+    los_samples = int(r_cfg.get("los_samples", 15))
     router_type  = str(r_cfg.get("router_type", "sector")).strip().lower()
     if router_type != "sector":
         raise ValueError(
@@ -1455,9 +1737,18 @@ def main():
     if corridor_cache_max is not None:
         corridor_cache_max = int(corridor_cache_max)
 
+    print("Routing performance settings:")
+    print(f"  polar_sweep_coarse_step={polar_sweep_coarse_step}, "
+          f"use_dense_polar={use_dense_polar}, use_dot_filter={use_dot_filter}")
+    print(f"  graph: k_candidates={k_candidates}, edge=[{min_edge_m:.0f}, "
+          f"{max_edge_m:.0f}]m, los_samples={los_samples}")
+    if corridor_pad_factors is not None:
+        print(f"  corridor_pad_factors={corridor_pad_factors}")
+
     # ---- Output config ----
     out_cfg = doc.get("output", {})
     save_plots = out_cfg.get("save_plots", True) and not args.no_plots
+    save_hourly_frames = bool(out_cfg.get("save_hourly_frames", False)) and save_plots
     # Default to a per-route subdirectory so outputs from many YAMLs don't
     # collide.  An explicit "plot_dir" in the YAML is taken as-is (no
     # auto-subdir) so users can override.
@@ -1465,8 +1756,8 @@ def main():
         plot_dir = HERE / out_cfg["plot_dir"]
     else:
         plot_dir = HERE / "routes/output" / yaml_path.stem
-    if save_plots:
-        plot_dir.mkdir(parents=True, exist_ok=True)
+    # JSON/report/NPZ exports are written even when matplotlib output is off.
+    plot_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Load current data ----
     # load_current_field automatically picks historical vs. live cycle.
@@ -1500,6 +1791,10 @@ def main():
                           tack_threshold_deg=tack_threshold_deg,
                           gybe_penalty_s=gybe_penalty,
                           gybe_threshold_deg=gybe_threshold_deg,
+                          max_edge_m=max_edge_m,
+                          min_edge_m=min_edge_m,
+                          k_candidates=k_candidates,
+                          los_samples=los_samples,
                           polar_sweep_coarse_step=polar_sweep_coarse_step,
                           corridor_pad_factors=corridor_pad_factors,
                           corridor_cache_max=corridor_cache_max,
@@ -1553,6 +1848,7 @@ def main():
 
     # ---- Trip summary ----
     print_trip_summary(routes, leg_labels, depart_utc, tz)
+    print_performance_summary(routes)
 
     # ---- Save route JSON ----
     save_route_json(
@@ -1579,6 +1875,15 @@ def main():
 
     # ---- Position time-series ----
     if save_plots and not args.no_plots:
+        plot_clean_route_map(
+            routes=routes,
+            wps=wps,
+            transformer=transformer,
+            plot_dir=plot_dir,
+            slug=yaml_path.stem,
+            leg_marks=leg_marks,
+            course_feature_centers=doc.get("rtc_course_feature_centers"),
+        )
         plot_position_timeseries(
             routes=routes,
             wps=wps,
@@ -1591,7 +1896,7 @@ def main():
         )
 
     # ---- Hourly position frames ----
-    if save_plots and not args.no_plots:
+    if save_hourly_frames:
         all_land_marks = [m for marks in leg_marks.values() for m in marks]
         generate_hourly_frames(
             routes=routes,
@@ -1607,7 +1912,7 @@ def main():
             all_land_marks=all_land_marks if all_land_marks else None,
         )
 
-    if save_plots:
+    if save_plots or routes:
         print(f"\nAll output saved to {plot_dir}/")
 
 

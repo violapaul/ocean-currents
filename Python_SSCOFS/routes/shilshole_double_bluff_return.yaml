@@ -30,6 +30,7 @@ boat:
 wind:
   source: "open_meteo_ecmwf"
   timezone: "America/Los_Angeles"
+  use_cache_even_if_stale: false
 
 routing:
   router_type: "sector"
@@ -44,4 +45,5 @@ routing:
 
 output:
   save_plots: true
+  save_hourly_frames: true
   # plot_dir defaults to routes/output/<yaml-stem>/

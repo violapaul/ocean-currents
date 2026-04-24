@@ -1591,7 +1591,19 @@ def _build_corridor_sector_graph(
         return empty
 
     pts = np.column_stack([node_x[corridor_ids], node_y[corridor_ids]])
-    dists_all, idxs_all = tree.query(pts, k=k_candidates)
+    if n_corridor <= 1:
+        return empty
+
+    # Query only corridor nodes.  The previous global-tree query often pulled
+    # nearest candidates outside the search corridor, which made graph build
+    # and A* pay for edges the corridor was supposed to exclude.
+    local_tree = cKDTree(pts)
+    k_eff = min(max(int(k_candidates), 1), n_corridor)
+    dists_all, idxs_local_all = local_tree.query(pts, k=k_eff)
+    if k_eff == 1:
+        dists_all = dists_all[:, np.newaxis]
+        idxs_local_all = idxs_local_all[:, np.newaxis]
+    idxs_all = corridor_ids[np.asarray(idxs_local_all, dtype=np.int64)]
 
     dx = node_x[idxs_all] - node_x[corridor_ids, np.newaxis]
     dy = node_y[idxs_all] - node_y[corridor_ids, np.newaxis]
@@ -2014,6 +2026,7 @@ if _NUMBA_AVAILABLE:
         heap[0, 3] = float(start_sentinel)
         heap_size = 1
         explored = 0
+        best_goal_cost = INF
 
         # TWS bracket (j0, beta_p) is recomputed per edge because wind varies
         # spatially; there is no single value we can hoist out of the main loop.
@@ -2021,6 +2034,8 @@ if _NUMBA_AVAILABLE:
         while heap_size > 0:
             if explored >= max_iterations:
                 explored = -1
+                break
+            if heap[0, 0] >= best_goal_cost:
                 break
 
             # --- Pop minimum f-score state from heap ---
@@ -2057,6 +2072,8 @@ if _NUMBA_AVAILABLE:
 
             explored += 1
             if node == end_node:
+                if cost < best_goal_cost:
+                    best_goal_cost = cost
                 break
 
             arr_t = arrival_time[node, bucket_in]  # wall-clock time we arrive here
@@ -2473,18 +2490,22 @@ if _NUMBA_AVAILABLE:
 
                 new_cost = cost + dt + penalty
                 if new_cost < best_cost[nb, sector_out]:
+                    hdx2 = goal_x - node_x[nb]
+                    hdy2 = goal_y - node_y[nb]
+                    # f = g + h (admissible heuristic: straight-line / max_speed).
+                    new_f = new_cost + np.sqrt(hdx2 * hdx2 + hdy2 * hdy2) / max_speed
+                    if new_f >= best_goal_cost:
+                        continue
                     # Better path found — update tables and push to heap.
                     best_cost[nb, sector_out] = new_cost
                     arrival_time[nb, sector_out] = arr_t + dt + penalty
                     came_from_node[nb, sector_out] = node
                     came_from_bucket[nb, sector_out] = bucket_in
                     arrival_heading[nb, sector_out] = best_heading_rad
+                    if nb == end_node and new_cost < best_goal_cost:
+                        best_goal_cost = new_cost
 
                     if heap_size < max_heap:
-                        hdx2 = goal_x - node_x[nb]
-                        hdy2 = goal_y - node_y[nb]
-                        # f = g + h (admissible heuristic: straight-line / max_speed).
-                        new_f = new_cost + np.sqrt(hdx2 * hdx2 + hdy2 * hdy2) / max_speed
                         heap[heap_size, 0] = new_f
                         heap[heap_size, 1] = new_cost
                         heap[heap_size, 2] = float(nb)
@@ -3954,6 +3975,7 @@ class SectorRouter:
                  max_edge_m: float = 2000.0,
                  min_edge_m: float = 50.0,
                  k_candidates: int = 50,
+                 los_samples: int | None = None,
                  polar_sweep_coarse_step: int | None = None,
                  corridor_pad_factors: tuple[float, ...] | list[float] | None = None,
                  corridor_cache_max: int | None = None,
@@ -3982,6 +4004,9 @@ class SectorRouter:
             Minimum edge length in meters (skip very short edges).
         k_candidates : int
             Number of KD-tree neighbors to consider when filling sectors.
+        los_samples : int, optional
+            Number of line-of-sight samples used to reject land-crossing
+            sector edges. Defaults to 15.
         polar_sweep_coarse_step : int, optional
             Coarse stride for polar heading sweep in the Numba kernel.
             1 means exact full sweep. Higher values are faster but approximate.
@@ -4011,7 +4036,7 @@ class SectorRouter:
         self.gybe_threshold_deg = gybe_threshold_deg
         self.max_edge_m = max_edge_m
         self.min_edge_m = min_edge_m
-        self.k_candidates = k_candidates
+        self.k_candidates = max(1, int(k_candidates))
         if polar_sweep_coarse_step is None:
             polar_sweep_coarse_step = self.POLAR_SWEEP_COARSE_STEP
         self._polar_sweep_coarse_step = max(1, int(polar_sweep_coarse_step))
@@ -4039,7 +4064,9 @@ class SectorRouter:
         self._corridor_graph_cache = {}
 
         # Line-of-sight samples per edge
-        self._los_samples = 15
+        if los_samples is None:
+            los_samples = 15
+        self._los_samples = max(2, int(los_samples))
 
         # Pre-stacked current frames for Numba kernel: (n_frames, n_nodes)
         self._u_frames_2d = np.stack(current_field.u_frames).astype(np.float64)
@@ -4992,7 +5019,10 @@ class SectorRouter:
             ex_n = self.node_x[end_node]
             ey_n = self.node_y[end_node]
             route_dist = np.hypot(ex_n - sx_n, ey_n - sy_n)
-            base_pad = max(route_dist, self.max_edge_m * 5, 5000.0)
+            base_pad = max(route_dist * 0.30, self.max_edge_m * 4, 5000.0)
+            seg_dx = ex_n - sx_n
+            seg_dy = ey_n - sy_n
+            seg_len2 = max(seg_dx * seg_dx + seg_dy * seg_dy, 1.0)
 
             pad_values = []
             _seen = set()
@@ -5019,15 +5049,18 @@ class SectorRouter:
                     g_off, g_tgt, g_dis, g_sec, n_corr, n_edges = cached
                     _perf['graph_cache_hits'] += 1
                     print(f"Corridor attempt {i_try}/{len(pad_values)}: "
-                          f"pad {pad:.0f}m, {n_corr:,} nodes, {n_edges:,} edges (cache hit)")
+                          f"half-width {pad:.0f}m, {n_corr:,} nodes, {n_edges:,} edges (cache hit)")
                 else:
                     t0 = _time.monotonic()
-                    x_lo = min(sx_n, ex_n) - pad
-                    x_hi = max(sx_n, ex_n) + pad
-                    y_lo = min(sy_n, ey_n) - pad
-                    y_hi = max(sy_n, ey_n) + pad
-                    corridor = ((self.node_x >= x_lo) & (self.node_x <= x_hi) &
-                                (self.node_y >= y_lo) & (self.node_y <= y_hi))
+                    rel_x = self.node_x - sx_n
+                    rel_y = self.node_y - sy_n
+                    along = (rel_x * seg_dx + rel_y * seg_dy) / seg_len2
+                    along = np.clip(along, 0.0, 1.0)
+                    near_x = sx_n + along * seg_dx
+                    near_y = sy_n + along * seg_dy
+                    cross2 = ((self.node_x - near_x) ** 2 +
+                              (self.node_y - near_y) ** 2)
+                    corridor = cross2 <= pad * pad
                     n_corr = int(corridor.sum())
                     _perf['corridor'] += _time.monotonic() - t0
 
@@ -5045,7 +5078,7 @@ class SectorRouter:
                     self._corridor_cache_put(
                         cache_key, (g_off, g_tgt, g_dis, g_sec, n_corr, n_edges))
                     print(f"Corridor attempt {i_try}/{len(pad_values)}: "
-                          f"pad {pad:.0f}m, {n_corr:,} nodes, {n_edges:,} edges "
+                          f"half-width {pad:.0f}m, {n_corr:,} nodes, {n_edges:,} edges "
                           f"(built in {dt_build:.2f}s)")
 
                 t0 = _time.monotonic()
