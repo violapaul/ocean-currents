@@ -781,7 +781,10 @@ class CurrentField:
 
         land_mask = self._land_mask_for_points(x, y, dists=dists)
 
-        weights = np.where(dists < 1e-12, 1e12, 1.0 / dists)
+        weights = np.empty_like(dists, dtype=np.float64)
+        near = dists < 1e-12
+        weights[near] = 1e12
+        weights[~near] = 1.0 / dists[~near]
         w_sum = weights.sum(axis=1, keepdims=True)
         weights /= w_sum
         return idxs, weights, land_mask
