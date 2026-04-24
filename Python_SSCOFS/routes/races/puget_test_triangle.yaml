@@ -1,0 +1,57 @@
+# Synthetic "race" used end-to-end to validate the race-route pipeline
+# (precompute -> S3 -> PWA -> reroute) without touching the real race's
+# S3 prefix. Short round-trip from Shilshole up Puget Sound and back.
+#
+#   Run (nominal, race ~15 min in the past so the in-progress UI lights up):
+#     python run_route.py routes/races/puget_test_triangle.yaml \
+#       --race-mode --no-plots --ignore-window \
+#       --departure-utc "$(date -u -v-15M +'%Y-%m-%dT%H:%M:%SZ')"
+#
+#   Run (reroute from ~mid-course):
+#     python run_route.py routes/races/puget_test_triangle.yaml \
+#       --race-mode --no-plots --ignore-window \
+#       --departure-utc "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+#       --start-latlon 47.745,-122.424
+
+task:
+  name: "Puget Sound test triangle"
+  description: >
+    Synthetic race for end-to-end pipeline testing. Shilshole -> turn mark
+    off Point Wells (~7 nm north) -> Shilshole. Not a real race.
+
+departure:
+  datetime: "2026-04-24 13:00"   # placeholder; overridden via --departure-utc
+  tz: "America/Los_Angeles"
+
+waypoints:
+  - [47.686199, -122.413590]     # Shilshole Marina (start)
+  - [47.804000, -122.434000]     # Turn mark (off Point Wells / Richmond Beach)
+  - [47.686199, -122.413590]     # Shilshole Marina (finish)
+
+boat:
+  speed_kt: 6.0
+  polar: "../../j105_new_polars.csv"
+  minimum_twa: 38
+
+wind:
+  source: "open_meteo_ecmwf"
+  timezone: "America/Los_Angeles"
+
+routing:
+  router_type: "sector"
+  tack_penalty_s: 60
+  duration_hours: 4
+  polar_sweep_coarse_step: 3
+  use_dense_polar: true
+  use_dot_filter: true
+
+output:
+  save_plots: false
+
+race:
+  slug: puget_test_triangle
+  event_start_utc: "2026-04-24T20:00:00Z"   # placeholder; use --departure-utc in tests
+  precompute_window_hr: 48
+  web_publish: true
+  s3_bucket: viola-ocean-currents
+  s3_prefix: races/puget_test_triangle

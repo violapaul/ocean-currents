@@ -4,7 +4,7 @@
 # Leg 2 is the downwind return to Shilshole.
 #
 # Run with:
-#   conda run -n anaconda python run_route.py routes/shilshole_double_bluff_return.yaml
+#   conda run -n anaconda python run_route.py routes/races/shilshole_double_bluff_return.yaml
 
 task:
   name: "Shilshole → Double Bluff → Shilshole"
@@ -23,7 +23,7 @@ waypoints:
 
 boat:
   speed_kt: 6.0
-  polar: "../../j105_new_polars.csv"
+  polar: "../../j105_new_polars.csv"   # relative to Python_SSCOFS/ (run_route.py __file__.parent), i.e. repo root
   minimum_twa: 38
   maximum_twa: 165
 
@@ -47,3 +47,11 @@ output:
   save_plots: true
   save_hourly_frames: true
   # plot_dir defaults to routes/output/<yaml-stem>/
+
+race:
+  slug: shilshole_double_bluff_return
+  event_start_utc: "2026-04-25T16:15:00Z"   # 09:15 PDT
+  precompute_window_hr: 48                  # --only-if-within skips runs outside this window
+  web_publish: true
+  s3_bucket: viola-ocean-currents
+  s3_prefix: races/shilshole_double_bluff_return

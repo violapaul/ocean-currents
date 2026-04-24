@@ -865,7 +865,17 @@
     }
     
     // Simple production logging - errors only by default
-    const IS_DEBUG = new URLSearchParams(location.search).has('debug');
+    const URL_PARAMS = new URLSearchParams(location.search);
+    const IS_DEBUG = URL_PARAMS.has('debug');
+    // Test harness overrides (see plan: test fixture). Production URLs omit
+    // these; when present they tweak the race layer's behavior in-situ:
+    //   ?race=<slug>      — override CONFIG.RACE_SLUG
+    //   ?test_gps=LAT,LON — seed state.userLocation (bypass geolocation)
+    //   ?test_reroute=1   — GO button fetches /reroute.geojson instead of
+    //                       POSTing to Lambda (which isn't deployed yet)
+    const RACE_OVERRIDE = URL_PARAMS.get('race');
+    const TEST_GPS_RAW  = URL_PARAMS.get('test_gps');
+    const TEST_REROUTE  = URL_PARAMS.get('test_reroute') === '1';
     
     const logger = {
       error: console.error,
@@ -896,7 +906,8 @@
       // Water boundary bitmap resolution (degrees per pixel, ~50m at lat 48)
       WATER_BITMAP_RES: 0.0005,
       // Race route published by the GHA precompute workflow.
-      RACE_SLUG: 'shilshole_double_bluff_return',
+      // ?race=<slug> URL param lets tests point at a different published race.
+      RACE_SLUG: RACE_OVERRIDE || 'shilshole_double_bluff_return',
       // On localhost we look for the route under /race-dev/<slug>/ so you can
       // symlink the run_route.py output dir there for pre-deploy verification.
       RACE_BASE_URL: (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
@@ -921,7 +932,22 @@
       raceRouteVisible: false,  // layers currently visible
       raceInputsHash: null,     // last-seen manifest inputs_hash for cache-busting
       raceLastManifest: null,   // last manifest seen (for event_start_utc + T-30m gate)
+      raceRerouteGeojson: null, // pre-staged or Lambda-returned reroute FC
+      raceRerouteVisible: false,
     };
+
+    // ?test_gps=LAT,LON bypasses navigator.geolocation entirely. The render
+    // hook still draws state.userLocation, so this is enough to exercise
+    // the GO gate + any location-dependent rendering.
+    if (TEST_GPS_RAW) {
+      const [lat, lng] = TEST_GPS_RAW.split(',').map(Number);
+      if (Number.isFinite(lat) && Number.isFinite(lng)) {
+        state.userLocation = { lat, lng, accuracy: 10, faked: true };
+        logger.info('Test GPS seeded:', state.userLocation);
+      } else {
+        logger.warn('?test_gps malformed, ignoring:', TEST_GPS_RAW);
+      }
+    }
     
     // ========== CANVAS CURRENT RENDERER ==========
     
@@ -2987,7 +3013,7 @@ window.addEventListener('resize', handleViewportChange);
       ctx.clearRect(0, 0, w, h);
       if (!state.raceRouteVisible || !raceGeojson) return;
 
-      // Pass 1: legs (white casing under dark inner line for contrast on any basemap).
+      // Pass 1: nominal legs (white casing + dark inner line).
       for (const feat of raceGeojson.features) {
         if (feat.geometry.type !== 'LineString') continue;
         const coords = feat.geometry.coordinates;
@@ -3000,19 +3026,60 @@ window.addEventListener('resize', handleViewportChange);
           if (i === 0) ctx.moveTo(p.x, p.y);
           else         ctx.lineTo(p.x, p.y);
         }
-        // White casing
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
+        ctx.setLineDash([]);
         ctx.strokeStyle = 'rgba(255,255,255,0.85)';
         ctx.lineWidth = 9;
         ctx.stroke();
-        // Dark inner line
         ctx.strokeStyle = RACE_LEG_COLORS[feat.properties.leg] || RACE_LEG_DEFAULT;
         ctx.lineWidth = 5;
         ctx.stroke();
       }
 
-      // Pass 2: marks (points) with labels.
+      // Pass 2: reroute overlay (dashed contrast color, on top of nominal).
+      if (state.raceRerouteVisible && state.raceRerouteGeojson) {
+        for (const feat of state.raceRerouteGeojson.features) {
+          if (feat.geometry.type !== 'LineString') continue;
+          const coords = feat.geometry.coordinates;
+          if (coords.length < 2) continue;
+          ctx.beginPath();
+          for (let i = 0; i < coords.length; i++) {
+            const [lon, lat] = coords[i];
+            const p = map.project([lon, lat]);
+            if (i === 0) ctx.moveTo(p.x, p.y);
+            else         ctx.lineTo(p.x, p.y);
+          }
+          ctx.setLineDash([10, 6]);
+          ctx.lineCap = 'butt';
+          ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+          ctx.lineWidth = 10;
+          ctx.stroke();
+          ctx.strokeStyle = '#c2410c';  // dark orange
+          ctx.lineWidth = 6;
+          ctx.stroke();
+        }
+        ctx.setLineDash([]);
+
+        // "You are here" diamond at the reroute origin (first point of leg 1).
+        const rerouteStart = state.raceRerouteGeojson.features.find(
+          (f) => f.geometry.type === 'LineString' && f.properties.leg === 1);
+        if (rerouteStart) {
+          const [lon, lat] = rerouteStart.geometry.coordinates[0];
+          const p = map.project([lon, lat]);
+          ctx.save();
+          ctx.translate(p.x, p.y);
+          ctx.rotate(Math.PI / 4);
+          ctx.fillStyle = '#c2410c';
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 3;
+          ctx.fillRect(-7, -7, 14, 14);
+          ctx.strokeRect(-7, -7, 14, 14);
+          ctx.restore();
+        }
+      }
+
+      // Pass 3: marks (points) with labels.
       ctx.font = '600 12px system-ui, -apple-system, sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
@@ -3168,18 +3235,54 @@ window.addEventListener('resize', handleViewportChange);
 
     document.getElementById('race-toggle').addEventListener('click', toggleRaceRoute);
 
-    // REROUTE button — Phase 2 Lambda stub. Wires will land when the
-    // Function URL is deployed; for now we surface intent + constraints.
-    document.getElementById('reroute-btn').addEventListener('click', () => {
+    // REROUTE button. Two paths:
+    //   - ?test_reroute=1: GET ${base}/reroute.geojson (pre-staged). Lets
+    //     us fully exercise the render pipeline while the Phase-2 Lambda
+    //     is still undeployed.
+    //   - otherwise: POST to the Lambda Function URL with the live GPS
+    //     fix + race slug. Not yet wired (shows "not deployed" alert).
+    document.getElementById('reroute-btn').addEventListener('click', async () => {
       if (!isInRaceWindow()) return;
       if (!state.userLocation) {
         alert('Enable your location first (tap the locate button).');
         return;
       }
-      alert('Reroute endpoint not yet deployed (Phase 2). '
-          + 'Current GPS: '
-          + state.userLocation.lat.toFixed(5) + ', '
-          + state.userLocation.lng.toFixed(5));
+      if (!state.raceRouteVisible) {
+        // Nothing to compare the reroute against; load the nominal first.
+        alert('Turn the RACE layer on first.');
+        return;
+      }
+      const btn = document.getElementById('reroute-btn');
+      btn.classList.add('loading');
+      try {
+        let geojson;
+        if (TEST_REROUTE) {
+          const base = `${CONFIG.RACE_BASE_URL}/${CONFIG.RACE_SLUG}`;
+          const bust = Date.now();
+          const url = `${base}/reroute.geojson?t=${bust}`;
+          logger.info('Fetching test reroute:', url);
+          const resp = await fetch(url);
+          if (!resp.ok) throw new Error(`reroute fetch failed: ${resp.status}`);
+          geojson = await resp.json();
+        } else {
+          // TODO(phase-2): POST to Lambda Function URL with
+          //   {race_slug, start:{lat,lon}, depart_utc, next_waypoint_index}
+          alert('Reroute endpoint not yet deployed. Current GPS: '
+              + state.userLocation.lat.toFixed(5) + ', '
+              + state.userLocation.lng.toFixed(5));
+          return;
+        }
+        state.raceRerouteGeojson = geojson;
+        state.raceRerouteVisible = true;
+        scheduleRaceRender();
+        logger.info('Reroute applied:', geojson?.properties?.slug,
+                    'total_nm=', geojson?.properties?.total_distance_nm);
+      } catch (err) {
+        logger.error('Reroute failed:', err);
+        alert('Reroute failed:\n' + err.message);
+      } finally {
+        btn.classList.remove('loading');
+      }
     });
 
     // Surface fresher precomputes on app foreground / initial load, but
@@ -3204,6 +3307,16 @@ window.addEventListener('resize', handleViewportChange);
       // precompute has landed since last session. Never mutates the
       // rendered route; tap RACE to accept.
       checkForRouteUpdate();
+      // If test GPS was seeded pre-map, render it now.
+      if (state.userLocation && state.userLocation.faked) {
+        updateUserLocationMarker();
+      }
+    });
+    // Keep the faked GPS marker glued to the map during pan/zoom.
+    map.on('move', () => {
+      if (state.userLocation && state.userLocation.faked) {
+        updateUserLocationMarker();
+      }
     });
     
     // Handle errors gracefully

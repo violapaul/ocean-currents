@@ -1672,13 +1672,30 @@ def main():
                              "closer than MIN minutes away, or already "
                              "passed. Freezes the published nominal route "
                              "before start so live reroute takes over.")
+    # --- test overrides (see routes/races/puget_test_triangle.yaml) ---
+    parser.add_argument("--departure-utc", type=str, default=None,
+                        metavar="ISO8601",
+                        help="Override departure from the YAML. Accepts "
+                             "e.g. 2026-04-24T20:00:00Z. In --race-mode, "
+                             "overrides race.event_start_utc.")
+    parser.add_argument("--start-latlon", type=str, default=None,
+                        metavar="LAT,LON",
+                        help="Replace waypoints[0] with this point. Used to "
+                             "simulate a reroute from mid-course without "
+                             "editing the YAML.")
+    parser.add_argument("--ignore-window", action="store_true",
+                        help="Bypass --only-if-within and --min-lead-min. "
+                             "For local/test compute only; never in "
+                             "production precomputes.")
     args = parser.parse_args()
 
-    # --race-mode implies --no-plots / --geojson / --publish-s3
+    # --race-mode implies --no-plots and --geojson. Publishing to S3 is an
+    # *additional* explicit decision: the GHA workflow passes --publish-s3;
+    # local test runs (e.g. --race-mode alone) produce on-disk artifacts
+    # without mutating the published race.
     if args.race_mode:
         args.no_plots = True
         args.geojson = True
-        args.publish_s3 = True
 
     yaml_path = Path(args.yaml_file)
     if not yaml_path.is_absolute():
@@ -1717,10 +1734,23 @@ def main():
         print(f"Race mode: depart_utc = {depart_utc.isoformat()} "
               f"(slug={race_cfg['slug']})")
 
+    # --departure-utc: final override, wins over both race.event_start_utc
+    # and departure.datetime. Used in tests to simulate an in-progress race.
+    if args.departure_utc:
+        depart_utc = _dt.datetime.fromisoformat(
+            args.departure_utc.replace("Z", "+00:00"))
+        if depart_utc.tzinfo is None:
+            depart_utc = depart_utc.replace(tzinfo=_dt.timezone.utc)
+        depart_dt = depart_utc.astimezone(tz)
+        print(f"Departure override: {depart_utc.isoformat()}")
+
     # --only-if-within / --min-lead-min: bound the precompute window.
     # Together they say: "publish the route only while the race is within
     # WINDOW hours out AND at least LEAD minutes away from start."
-    if args.only_if_within is not None or args.min_lead_min is not None:
+    if args.ignore_window:
+        print("Window gates bypassed (--ignore-window). "
+              "Running regardless of --only-if-within / --min-lead-min.")
+    elif args.only_if_within is not None or args.min_lead_min is not None:
         now_utc = _dt.datetime.now(_dt.timezone.utc)
         delta_s = (depart_utc - now_utc).total_seconds()
         hours_to_start = delta_s / 3600.0
@@ -1737,6 +1767,20 @@ def main():
 
     # ---- Waypoints ----
     wps, leg_marks = partition_waypoints(doc["waypoints"])
+
+    # --start-latlon: replace the first waypoint with an arbitrary lat/lon.
+    # Used to simulate a mid-course reroute without editing the YAML. The
+    # rest of the course (turn marks, finish) is unchanged.
+    if args.start_latlon:
+        try:
+            lat_str, lon_str = args.start_latlon.split(",")
+            new_start = (float(lat_str), float(lon_str))
+        except (ValueError, AttributeError) as e:
+            sys.exit(f"Invalid --start-latlon {args.start_latlon!r}: {e}")
+        print(f"Start override: waypoints[0] = {new_start[0]:.5f},"
+              f"{new_start[1]:.5f} (was {wps[0][0]:.5f},{wps[0][1]:.5f})")
+        wps = [new_start] + wps[1:]
+
     leg_labels = [
         f"{wps[i][0]:.4f},{wps[i][1]:.4f} → {wps[i+1][0]:.4f},{wps[i+1][1]:.4f}"
         for i in range(len(wps) - 1)
