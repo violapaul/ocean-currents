@@ -12,3 +12,6 @@ scipy
 # Added for the sail_routing stack used by the race-route workflow.
 pyproj
 numba
+# Imported at module-load by plot_local_currents.py (transitively via
+# sail_routing); needed even when run_route.py runs with --no-plots.
+matplotlib
