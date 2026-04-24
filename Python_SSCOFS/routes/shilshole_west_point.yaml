@@ -1,0 +1,66 @@
+# Shilshole → round West Point (port) → return
+#
+# West Point is the western tip of Discovery Park, jutting into Puget Sound.
+# Navigable water lies to both the north (Shilshole Bay side) and
+# south (main Sound channel); Discovery Park is to the east.
+#
+# Both legs route to the WEST of West Point (the open-Sound side).
+#
+# Outbound (southbound) — port rounding:
+#   mark on port (left when heading south = east), pass to the west.
+#   Barrier extends east (90°) from the tip, closing the inside/shore shortcut.
+#
+# Return (northbound) — starboard rounding:
+#   mark on starboard (right when heading north = east), also pass to the west.
+#   Same barrier direction: extends east, blocking the shore-side shortcut.
+#
+# Run with:
+#   conda run -n anaconda python run_route.py routes/shilshole_west_point.yaml
+
+task:
+  name: "Shilshole → West Point (mark) → Shilshole"
+  description: >
+    Outbound: round West Point to port — mark on port, pass WEST (open Sound).
+    Return:   round West Point to starboard — mark on starboard, pass WEST.
+    West Point is a land-based headland; the route passes it, not to it.
+
+departure:
+  datetime: "2026-03-07 10:30"
+  tz: "America/Los_Angeles"
+
+waypoints:
+  - [47.682919, -122.412349]          # Shilshole Bay Marina (start)
+  - lat: 47.575671494473305           # debug mark
+    lon: -122.43465355183903          #   land mark
+    rounding: port                    #   round to port (CCW): pass WEST, open Sound
+    barrier_bearing_deg: 90           #   fence extends east (closes inside/shore shortcut)
+  - [47.510000, -122.440000]          # open water south of mark
+  - lat: 47.575671494473305           # same mark on return
+    lon: -122.43465355183903
+    rounding: starboard               #   round to starboard (CW): also pass WEST (northbound)
+    barrier_bearing_deg: 90           #   fence extends east (closes inside/shore shortcut)
+  - [47.682919, -122.412349]          # Return to Shilshole
+
+boat:
+  speed_kt: 6.0
+  polar: "../../j105_new_polars.csv"
+  minimum_twa: 38
+  maximum_twa: 165
+
+wind:
+  source: "open_meteo_ecmwf"
+
+routing:
+  router_type: "sector"
+  tack_penalty_s: 90
+  tack_threshold_deg: 50
+  gybe_penalty_s: 90
+  gybe_threshold_deg: 120
+  duration_hours: 10
+  polar_sweep_coarse_step: 3
+  use_dense_polar: true
+  use_dot_filter: false
+
+output:
+  save_plots: true
+  plot_dir: "routes/output"

@@ -51,7 +51,8 @@ def _make_inv_transformer(fwd):
 def make_synthetic_field(u_func=None, v_func=None,
                          half_size_deg=0.06, spacing_deg=0.002,
                          land_func=None, k_neighbors=4,
-                         land_threshold_m=300.0):
+                         land_threshold_m=300.0,
+                         use_delaunay=True):
     """Build a CurrentField from position-based u/v functions.
 
     Parameters
@@ -96,7 +97,8 @@ def make_synthetic_field(u_func=None, v_func=None,
 
     cf = CurrentField(lonc, latc, [u_vals], [v_vals], [0.0],
                       transformer, k_neighbors=k_neighbors,
-                      land_threshold_m=land_threshold_m)
+                      land_threshold_m=land_threshold_m,
+                      use_delaunay=use_delaunay)
     return cf, transformer
 
 
@@ -702,7 +704,8 @@ class TestPathSmoothing:
             return abs(x - cx) < 300
 
         cf, _ = make_synthetic_field(land_func=land_func,
-                                     land_threshold_m=200.0)
+                                     land_threshold_m=200.0,
+                                     use_delaunay=False)
         boat = BoatModel(base_speed_knots=6.0)
         router = Router(cf, boat, resolution_m=100.0, padding_m=1500.0)
 
@@ -1010,6 +1013,23 @@ class TestPolarTable:
         twa, tws = 90, 10
         assert polar.speed_ms(twa, tws) == pytest.approx(
             polar.speed(twa, tws) * KNOTS_TO_MS, rel=1e-6)
+
+    def test_downwind_no_go_zeroes_deep_angles(self, tmp_path):
+        """maximum_twa should reject dead-downwind/deep-running angles."""
+        import csv
+
+        csv_path = tmp_path / "polar.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["TWA_deg", "TWS_kt", "BoatSpeed_kt"])
+            writer.writeheader()
+            for twa, spd in [(0, 0), (90, 7), (165, 5), (170, 4), (180, 3)]:
+                writer.writerow({"TWA_deg": twa, "TWS_kt": 12, "BoatSpeed_kt": spd})
+                writer.writerow({"TWA_deg": twa, "TWS_kt": 16, "BoatSpeed_kt": spd + 1})
+        polar = PolarTable(csv_path, maximum_twa=165.0)
+        assert polar.speed(165.0, 12.0) > 0.0
+        assert polar.speed(170.0, 12.0) == pytest.approx(0.0, abs=0.01)
+        assert polar.speed(180.0, 12.0) == pytest.approx(0.0, abs=0.01)
 
     def test_max_speed_in_fast_angles(self, polar):
         """Best speeds should be at broad reach angles (100-140 deg)."""
@@ -2335,6 +2355,53 @@ class TestSectorRouterTackingPenalty:
         assert route_with_pen.total_time_s >= route_no_pen.total_time_s * 0.90
 
 
+class TestSectorRouterManeuverPenalty:
+    """Wind-relative maneuver penalties for tack/gybe detection."""
+
+    def test_downwind_side_flip_gets_gybe_penalty(self):
+        """A port/starboard flip deep downwind should use gybe_penalty_s."""
+        if not POLAR_CSV.exists():
+            pytest.skip(f"Polar CSV not found at {POLAR_CSV}")
+        cf, _ = make_synthetic_field(half_size_deg=0.02, spacing_deg=0.004)
+        boat = BoatModel(base_speed_knots=6.0,
+                         polar=PolarTable(POLAR_CSV, minimum_twa=38))
+        wind = WindField.from_met(10.0, 90.0)  # wind from east: math angle 0
+        router = SectorRouter(cf, boat, wind=wind,
+                              tack_penalty_s=30.0,
+                              gybe_penalty_s=120.0,
+                              gybe_threshold_deg=120.0)
+
+        penalty = router._maneuver_penalty(
+            np.radians(170.0), np.radians(-170.0),
+            cf._x_utm[0], cf._y_utm[0], 0.0, angle_diff_deg=20.0)
+        assert penalty == pytest.approx(120.0)
+
+    def test_dot_filter_matches_exact_on_mild_case(self):
+        """Dot filter remains covered as experimental, not a production default."""
+        if not POLAR_CSV.exists():
+            pytest.skip(f"Polar CSV not found at {POLAR_CSV}")
+        polar = PolarTable(POLAR_CSV, minimum_twa=38)
+        cf, tr = make_synthetic_field(half_size_deg=0.04, spacing_deg=0.004)
+        boat = BoatModel(base_speed_knots=6.0, polar=polar)
+        wind = WindField.from_met(12.0, 180.0)
+        start = _latlon_for_offset(-1200, -1200, tr)
+        end = _latlon_for_offset(1200, 1200, tr)
+
+        exact = SectorRouter(cf, boat, wind=wind, tack_penalty_s=0.0,
+                             polar_sweep_coarse_step=1,
+                             use_dense_polar=True,
+                             use_dot_filter=False)
+        filtered = SectorRouter(cf, boat, wind=wind, tack_penalty_s=0.0,
+                                polar_sweep_coarse_step=1,
+                                use_dense_polar=True,
+                                use_dot_filter=True)
+
+        route_exact, _, _, _ = exact.find_route(start, end)
+        route_filtered, _, _, _ = filtered.find_route(start, end)
+        assert route_filtered.total_time_s == pytest.approx(
+            route_exact.total_time_s, rel=0.02)
+
+
 class TestSectorRouterHeadingDiversity:
     """SectorRouter should provide diverse heading options."""
 
@@ -2396,6 +2463,9 @@ class TestSectorRouterRouteQuality:
 
         assert route.simulated_track is not None
         assert route.simulated_track_times is not None
+        assert route.debug is not None
+        assert "maneuver_tack_count" in route.debug
+        assert "maneuver_gybe_count" in route.debug
         assert len(route.simulated_track) == len(route.simulated_track_times)
 
         times = np.asarray(route.simulated_track_times)

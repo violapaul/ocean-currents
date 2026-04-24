@@ -1,0 +1,190 @@
+# Round the County — Saturday leg (counter-clockwise / leave listed marks to port)
+#
+# Start off Lydia Shoal, then leave to port:
+#   Lydia Shoal buoy,
+#   Orcas Island,
+#   Sisters Islands,
+#   Clark Island,
+#   Matia Island,
+#   Clements Reef,
+#   Clements Reef Buoy,
+#   Patos Island,
+#   Waldron Island,
+#   Skipjack Island,
+#   Stuart Island,
+#   Danger Shoal buoy,
+# then finish near Roche Harbor on an RC-set finish line.
+#
+# Mark classes used here:
+#   1) close-round mark:
+#        a discrete buoy/light you are assumed to round closely
+#   2) constraint mark:
+#        a representative point plus a one-way fence that blocks the
+#        illegal-side shortcut. These are routing constraints, not
+#        literal “go to this waypoint” marks.
+#
+# NOTE:
+#   The land/reef constraint points below are routing approximations.
+#   For a production-grade solver, replace them with chart polygons or
+#   shoreline/reef edges and enforce side-of-obstacle topologically.
+#
+# Official fixed-point marks used below:
+#   Lydia Shoal buoy      48.599550  -122.779083
+#   Clements Reef buoy    48.777667  -122.891733
+#   Danger Shoal buoy     48.639167  -123.181000
+#
+# Run with:
+#   conda run -n anaconda python run_route.py routes/rtc_saturday_leg.yaml
+
+task:
+  name: "RTC Saturday leg — Lydia Shoal → Roche Harbor area"
+  description: >
+    Counter-clockwise Saturday leg of Round the County.
+    Fixed buoy marks are rounded closely to port.
+    Island/reef marks are encoded as routing constraints: representative
+    point + fence that blocks the wrong-side shortcut.
+
+departure:
+  datetime: "2026-03-11 08:35"   # test date — update to actual race date before use
+  tz: "America/Los_Angeles"
+
+waypoints:
+  # --- start area ---
+  - lat: 48.599550
+    lon: -122.779083
+    name: "Lydia Shoal buoy G '13'"
+    mark_type: close_round
+    rounding: port
+
+  # --- Orcas / Rosario side gate ---
+  # Representative NE shoulder of Orcas; fence extends east across the would-be shortcut.
+  - lat: 48.685000
+    lon: -122.798000
+    name: "Orcas Island (constraint point)"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 90
+    notes: "Approximate routing point for keep-Orcas-to-port constraint."
+
+  # Representative easternmost of Sisters group; fence extends east.
+  - lat: 48.741000
+    lon: -122.756000
+    name: "Sisters Islands (constraint point)"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 90
+    notes: "Approximate routing point for keep-Sisters-to-port constraint."
+
+  # Representative east side of Clark; fence extends east.
+  - lat: 48.747000
+    lon: -122.703000
+    name: "Clark Island (constraint point)"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 90
+    notes: "Approximate routing point for keep-Clark-to-port constraint."
+
+  # Representative east side of Matia; fence extends east.
+  - lat: 48.765000
+    lon: -122.691000
+    name: "Matia Island (constraint point)"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 90
+    notes: "Approximate routing point for keep-Matia-to-port constraint."
+
+  # Clements Reef itself is a routing obstacle / side constraint.
+  # Use a representative point near the reef apex; fence extends east.
+  - lat: 48.779500
+    lon: -122.905500
+    name: "Clements Reef (constraint point)"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 90
+    notes: "Approximate routing point for keep-Clements-Reef-to-port constraint."
+
+  # Published buoy — close rounding mark
+  - lat: 48.777667
+    lon: -122.891733
+    name: "Clements Reef buoy R '2'"
+    mark_type: close_round
+    rounding: port
+
+  # --- northern outside arc ---
+  # Representative NW side of Patos; fence extends north to block inside cut.
+  - lat: 48.790000
+    lon: -122.973500
+    name: "Patos Island (constraint point)"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 0
+    notes: "Approximate routing point for keep-Patos-to-port constraint."
+
+  # Representative north side of Waldron; fence extends north.
+  - lat: 48.786500
+    lon: -123.024500
+    name: "Waldron Island (constraint point)"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 0
+    notes: "Approximate routing point for keep-Waldron-to-port constraint."
+
+  # Representative north side of Skipjack; fence extends north.
+  - lat: 48.748500
+    lon: -123.102000
+    name: "Skipjack Island (constraint point)"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 0
+    notes: "Approximate routing point for keep-Skipjack-to-port constraint."
+
+  # Representative west/northwest shoulder of Stuart; fence extends west.
+  - lat: 48.686500
+    lon: -123.233500
+    name: "Stuart Island (constraint point)"
+    mark_type: constraint
+    rounding: port
+    barrier_bearing_deg: 270
+    notes: "Approximate routing point for keep-Stuart-to-port constraint."
+
+  # Published buoy — close rounding mark
+  - lat: 48.639167
+    lon: -123.181000
+    name: "Danger Shoal buoy"
+    mark_type: close_round
+    rounding: port
+
+  # --- finish area (RC-set; approximate seed only) ---
+  - lat: 48.615000
+    lon: -123.160000
+    name: "Saturday finish area seed"
+    mark_type: finish_seed
+    notes: >
+      Approximate Roche Harbor area seed only.
+      Actual finish line is RC-set on race day near either:
+      (a) NW corner of Pearl Island, or
+      (b) north of McCracken Point on Henry Island and east of Battleship Island.
+
+boat:
+  speed_kt: 6.0
+  polar: "../../j105_new_polars.csv"
+  minimum_twa: 38
+  maximum_twa: 165
+
+wind:
+  source: "open_meteo_ecmwf"
+
+routing:
+  router_type: "sector"
+  tack_penalty_s: 90
+  tack_threshold_deg: 50
+  gybe_penalty_s: 90
+  gybe_threshold_deg: 120
+  duration_hours: 14
+  polar_sweep_coarse_step: 3
+  use_dense_polar: true
+  use_dot_filter: false
+
+output:
+  save_plots: true
+  plot_dir: "routes/output"

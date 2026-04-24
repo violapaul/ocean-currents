@@ -1,0 +1,62 @@
+# Shilshole → round Alki Point (port) → return
+#
+# Demonstrates land mark rounding constraint.  Alki Point is a headland
+# (land-based mark); the route must pass it on the port (CCW) side, i.e.
+# to the south/west of the point.
+#
+# The barrier extends east (90°) from the tip of Alki Point into Elliott
+# Bay, closing the wrong-side shortcut that cuts north of the headland.
+#
+# On the return leg the same headland is rounded to starboard (CW), and
+# the barrier extends west (270°) from the point.
+#
+# Run with:
+#   conda run -n anaconda python run_route.py routes/shilshole_alki_mark.yaml
+
+task:
+  name: "Shilshole → Alki Point (mark) → Shilshole"
+  description: >
+    Outbound: round Alki Point to port (mark on starboard side of boat).
+    Return:   round Alki Point to starboard (mark on port side of boat).
+    Alki Point is a land-based headland mark — the route passes it, not to it.
+
+departure:
+  datetime: "2026-03-07 10:30"
+  tz: "America/Los_Angeles"
+
+waypoints:
+  - [47.682919, -122.412349]          # Shilshole Bay Marina (start)
+  - lat: 47.576200                     # Alki Point headland tip
+    lon: -122.418700                   #   (land-based mark — not a routing waypoint)
+    rounding: port                     #   round to port (CCW): pass south of point
+    barrier_bearing_deg: 90            #   fence extends east into Elliott Bay
+  - [47.530000, -122.420000]          # open water waypoint south of Alki, mid-Sound
+  - lat: 47.576200                     # same headland on return
+    lon: -122.418700
+    rounding: starboard                #   round to starboard (CW): pass west of point
+    barrier_bearing_deg: 90            #   fence extends east (into shore -- blocks land shortcut)
+  - [47.682919, -122.412349]          # Return to Shilshole
+
+boat:
+  speed_kt: 6.0
+  polar: "../../j105_new_polars.csv"
+  minimum_twa: 38
+  maximum_twa: 165
+
+wind:
+  source: "open_meteo_ecmwf"
+
+routing:
+  router_type: "sector"
+  tack_penalty_s: 90
+  tack_threshold_deg: 50
+  gybe_penalty_s: 90
+  gybe_threshold_deg: 120
+  duration_hours: 10
+  polar_sweep_coarse_step: 3
+  use_dense_polar: true
+  use_dot_filter: false
+
+output:
+  save_plots: true
+  plot_dir: "routes/output"

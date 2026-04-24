@@ -118,10 +118,13 @@ Options:
 `sail_routing.py` finds the time-optimal sailboat path through ocean currents,
 with optional polar-based sail performance and wind fields.  It supports both
 simple `TWA_deg/TWS_kt/BoatSpeed_kt` polars and sail-configuration polars
-(multi-sail with Best Performance envelope), plus a `minimum_twa` no-go zone.
+(multi-sail with Best Performance envelope), plus `minimum_twa` and
+`maximum_twa` no-go zones.  Production J/105 race configs typically allow
+`38 <= abs(TWA) <= 165`.
 
 `run_route.py` wraps that solver in a YAML-driven multi-leg workflow that can
-export route JSON, leg plots, hourly frames, and UTM position-vs-time plots.
+export route JSON, a human-readable Markdown report, leg plots, hourly frames,
+and UTM position-vs-time plots.
 
 ### ECMWF Wind Pipeline (Open-Meteo)
 
@@ -164,7 +167,7 @@ polar interpolation, heading sweep, path smoothing, etc.).
 python sail_routing.py \
     --start-lat 47.63 --start-lon -122.40 \
     --end-lat   47.75 --end-lon   -122.42 \
-    --polar ../../j105_new_polars.csv --minimum-twa 38 \
+    --polar ../../j105_new_polars.csv --minimum-twa 38 --maximum-twa 165 \
     --wind-speed 12 --wind-direction 180 \
     --depart "2026-03-10 09:00" \
     --save route.png
@@ -197,14 +200,21 @@ wind:
 ```yaml
 routing:
   router_type: "sector"
-  tack_penalty_s: 60
+  tack_penalty_s: 90
+  tack_threshold_deg: 50
+  gybe_penalty_s: 90
+  gybe_threshold_deg: 120
   duration_hours: 10
   use_dense_polar: true              # pre-baked 1°×1kt polar table (eliminates binary search)
-  use_dot_filter: true               # skip backward-hemisphere headings (~2× fewer evaluations)
-  polar_sweep_coarse_step: 3         # 1 = exact, 3 = recommended (fast, negligible quality loss)
+  use_dot_filter: false              # experimental; keep off unless validated for the route
+  polar_sweep_coarse_step: 3         # 1 = exact, 3 = fast approximate
   corridor_pad_factors: [0.85, 1.0, 1.35]
   corridor_cache_max: 4
 ```
+
+Route plots and hourly frames use display-only binned averages of the native
+SSCOFS vectors, with normalized black arrows over a speed heatmap.  Routing
+physics still uses the native current field and time-dependent edge costs.
 
 See [POLAR_SWEEP_OPTIMIZATIONS.md](POLAR_SWEEP_OPTIMIZATIONS.md) for benchmarks and details.
 

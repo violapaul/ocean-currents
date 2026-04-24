@@ -146,9 +146,12 @@ data TWA for each column are forced to zero (no-go zone).  A 0° row at
 zero speed is prepended automatically.
 
 The optional `minimum_twa` parameter forces boat speed to zero for any TWA
-below the given angle, regardless of what the polar table says.  For
-sail-config polars, this is auto-set to the global minimum beat-target angle
-if not specified.
+below the given angle, regardless of what the polar table says.  The optional
+`maximum_twa` parameter does the same for too-deep downwind angles.  The
+production J/105 race configs use `38 <= abs(TWA) <= 165`, which rejects both
+dead-upwind and dead-downwind/deep-running shortcuts while treating port and
+starboard symmetrically.  For sail-config polars, `minimum_twa` is auto-set to
+the global minimum beat-target angle if not specified.
 
 ### Bilinear interpolation
 
@@ -251,11 +254,11 @@ of 180 candidate headings** at 2° resolution.  For each heading `θ`:
 4. Compute along-track SOG = `gx * d̂x + gy * d̂y`.
 5. Compute cross-track drift = `|gx * (-d̂y) + gy * d̂x|`.
 
-Accept a heading if: `SOG > 0.01 m/s` **and** `drift ≤ 0.50 * SOG`.
-The drift tolerance (50%, ~27° max crab angle) accommodates Puget Sound's
-strong tidal currents (up to 2.5 kt) while rejecting headings that produce
-unrealistic ground tracks.  See [POLAR_SWEEP_OPTIMIZATIONS.md](POLAR_SWEEP_OPTIMIZATIONS.md)
-for the history and rationale of this threshold.
+Accept a heading if: `SOG > 0.01 m/s` **and** `drift ≤ 0.10 * SOG`.
+The drift tolerance (10%, ~5.7° max crab angle) rejects pseudo-physical
+shortcuts where the boat sails fast on a reach while the ground track points
+inside the no-go zone.  See [POLAR_SWEEP_OPTIMIZATIONS.md](POLAR_SWEEP_OPTIMIZATIONS.md)
+for the history of this threshold.
 
 The **best SOG** across all accepted headings is used as the edge cost
 divisor: `edge_time = dist / max_SOG`.
@@ -307,10 +310,9 @@ new_arrival = arr_t + dt                          ← physical clock only
 new_cost    = cost  + dt + penalty                ← optimisation cost
 ```
 
-The **tacking penalty** is added to `best_cost` but **not** to
-`arrival_time`.  This is critical: the penalty is an optimisation bias to
-discourage tacks; it is not real time on the water and must not corrupt the
-current-lookup timestamps of subsequent cells.
+The maneuver penalty is added to both `best_cost` and the stored arrival time.
+It represents practical maneuver loss and keeps subsequent current/wind lookups
+aligned with the elapsed time implied by the chosen route.
 
 ### Heuristic
 
@@ -324,8 +326,8 @@ This is admissible (never over-estimates), so A\* returns the optimal path.
 ### Tacking penalty
 
 If the incoming direction `d_in` and outgoing direction `d_out` differ by
-more than `tack_threshold_deg` (default 90°), a penalty of `tack_penalty_s`
-seconds (default 60 s) is added to `best_cost`.
+more than `tack_threshold_deg` (default 50°), a penalty of `tack_penalty_s`
+seconds (default 90 s) is added to `best_cost`.
 
 The 8 grid directions' angles are pre-computed in `_DIR_ANGLES` and their
 pairwise differences in `_ANGLE_DIFF` (built once via `_build_angle_diff()`).
@@ -468,14 +470,20 @@ cu, cv = cf.query(mx, my, elapsed_s=arrival_time)
 # then _solve_heading or _fixed_speed_sog
 ```
 
-### Tacking penalty
+### Maneuver penalties
 
-Same bucket system as MeshRouter, but buckets map directly to sectors:
+SectorRouter still uses the COG-sector bucket system as a fallback:
 
 ```
 angle_diff = |sector_in - sector_out| * 11.25°
 if angle_diff > tack_threshold_deg: add tack_penalty_s
 ```
+
+When polar + wind routing is active, the router also tracks the best
+boat-heading selected for each edge.  A wind-relative port/starboard side flip
+near upwind applies `tack_penalty_s`; a side flip with both TWAs at or above
+`gybe_threshold_deg` applies `gybe_penalty_s`.  This catches downwind gybe
+shortcuts even when the COG change is split across multiple small sector steps.
 
 ### Path quality
 
@@ -493,7 +501,7 @@ implementation reduces this with:
 - adaptive corridor retries (`corridor_pad_factors`, tight-to-wide),
 - in-memory corridor graph caching (`corridor_cache_max`),
 - pre-baked dense polar table (`use_dense_polar`) replacing binary search,
-- forward-hemisphere dot filter (`use_dot_filter`) skipping ~90 headings,
+- optional forward-hemisphere dot filter (`use_dot_filter`, experimental),
 - coarse polar heading sweep (`polar_sweep_coarse_step`), and
 - Numba kernels for expansion and polar/wind cost evaluation.
 
@@ -513,9 +521,12 @@ python sail_routing.py \
 ```yaml
 routing:
   router_type: "sector"
-  tack_penalty_s: 60
+  tack_penalty_s: 90
+  tack_threshold_deg: 50
+  gybe_penalty_s: 90
+  gybe_threshold_deg: 120
   use_dense_polar: true
-  use_dot_filter: true
+  use_dot_filter: false
   polar_sweep_coarse_step: 3
   corridor_pad_factors: [0.85, 1.0, 1.35]
   corridor_cache_max: 4
@@ -782,9 +793,10 @@ significantly different, especially in shallow water.
 ### Polar is port/starboard symmetric
 
 `compute_twa` returns a value in [0°, 180°], treating port and starboard
-tacks as equivalent.  Real polars are slightly asymmetric (and downwind
-gybing has a gybe penalty just like tacking).  The current model applies
-the same tacking penalty to all direction changes ≥ 90°.
+tacks/gybes as equivalent for boat speed.  The router still tracks the signed
+wind-relative heading selected for each edge so maneuver diagnostics and
+penalties can distinguish tacks from gybes.  Real polars are slightly
+asymmetric; that asymmetry is not modeled yet.
 
 ### Wind forecast integration
 

@@ -80,9 +80,9 @@ Route quality (distance, ETA) was identical to baseline.
 
 ---
 
-## Optimization 2 — Forward-Hemisphere Filter (`use_dot_filter`)
+## Optimization 2 — Forward-Hemisphere Filter (`use_dot_filter`, Experimental)
 
-### Mathematical basis
+### Original mathematical basis
 
 For any edge, define:
 - `d_hat` = unit vector from current node to neighbour node (desired ground track)
@@ -100,9 +100,8 @@ edge, not of boat heading.  Therefore:
 - Any **backward heading** (dot < 0):  `V_ms × dot ≤ 0`  →  `sog ≤ c_par`
 - Any **forward heading** (dot ≥ 0):   `V_ms × dot ≥ 0`  →  `sog ≥ c_par`
 
-The perpendicular heading (dot = 0) gives exactly `sog = c_par`.  **No backward heading
-can ever produce better SOG than the perpendicular heading, regardless of current
-strength.** The filter is therefore **provably safe**.
+The perpendicular heading (dot = 0) gives exactly `sog = c_par`, so no backward
+heading can beat an otherwise identical forward heading on raw along-track SOG.
 
 > **Key insight:** the question is not "can a strong current carry me to the mark while
 > pointing away from it?" (yes it can, but only as well as pointing perpendicular). The
@@ -110,13 +109,10 @@ strength.** The filter is therefore **provably safe**.
 > the current's c_par contribution is heading-independent; only the polar term changes,
 > and that is always maximised by being in the forward hemisphere.
 
-This means roughly half the sweep (~90 backward headings) can be unconditionally
-discarded — no current-strength caveats needed.
-
-> **Caution (previously raised, now resolved):** An earlier concern was that a strong
-> favourable current might make a backward heading competitive. This turns out to be
-> wrong: c_par is the same for *all* headings, so any forward heading always achieves at
-> least as much SOG. The filter is exact, not approximate.
+In practice the edge accept/reject logic also includes cross-track drift,
+upwind/downwind TWA no-go bands, and current-induced ground-track constraints.
+Those extra constraints mean the filter is no longer treated as production-safe
+without route-specific validation. Production YAMLs keep `use_dot_filter: false`.
 
 ### Implementation
 
@@ -139,7 +135,7 @@ if use_dot_filter and (sweep_hx[h] * d_hat_x + sweep_hy[h] * d_hat_y) < 0.0:
 
 ```yaml
 routing:
-  use_dot_filter: true
+  use_dot_filter: false
   # works with or without use_dense_polar
   polar_sweep_coarse_step: 1    # exact sweep, no coarse approximation
 ```
@@ -164,29 +160,24 @@ between coarse samples, producing marginally worse routes on some legs.
 
 In addition to the polar sweep optimizations, the heading evaluator applies a
 **cross-track drift filter**: a heading is only accepted if its cross-track ground
-velocity (drift) does not exceed **50%** of its along-track progress:
+velocity (drift) does not exceed **10%** of its along-track progress:
 
 ```python
 drift_h = abs(gx * (-d_hat_y) + gy * d_hat_x)
 prog    = max(sog_h, 1e-6)
-if sog_h > 0.01 and drift_h <= 0.50 * prog:
+if sog_h > 0.01 and drift_h <= 0.10 * prog:
     # heading accepted
 ```
 
-This corresponds to a maximum crab angle of ~27° (`arctan(0.50)`).
+This corresponds to a maximum crab angle of ~5.7° (`arctan(0.10)`).
 
 ### Why this matters
 
-The drift constraint rejects headings **even in the forward hemisphere**. In Puget
-Sound conditions with 2–2.5 kt tidal currents and 5 kt boat speed, the current-to-speed
-ratio reaches 0.50. A threshold set too low (the original code used 0.10, or ~5.7° max
-crab) would reject almost all headings in strong cross-current, marking edges impassable
-that the boat can actually sail. The current 0.50 threshold accommodates Puget Sound
-conditions while still rejecting headings that would produce unrealistic ground tracks.
-
-> **History:** the threshold was raised from 0.10 to 0.50 in March 2026 after analysis
-> showed that strong Puget Sound currents were causing valid edges to be rejected.
-> See the [polar sweep optimization session](bd62169a-5fcb-49c1-b106-a1fc3f664124).
+The drift constraint rejects headings **even in the forward hemisphere**. A loose
+threshold can allow pseudo-physical routes where the boat reaches quickly while
+the ground track points into the no-go zone. The current production setting is
+the stricter `0.10` value, matching `_solve_heading()` and the SectorRouter
+Numba kernel.
 
 ---
 
@@ -195,7 +186,7 @@ conditions while still rejecting headings that would produce unrealistic ground 
 | Flag | Effect | Requires |
 |---|---|---|
 | `use_dense_polar: true` | Replace binary-search polar lookup with direct array index | — |
-| `use_dot_filter: true` | Skip ~90 backward headings per edge | — |
+| `use_dot_filter: true` | Experimental: skip ~90 backward headings per edge | route-specific validation |
 | `polar_sweep_coarse_step: N` | Only sample every Nth heading in Pass 1, refine ±N around winner | — |
 
 Estimated headings evaluated per edge:
@@ -210,17 +201,16 @@ Estimated headings evaluated per edge:
 | on | 5 | ~18 |
 
 Recommended production settings:
-- **Recommended:** `use_dense_polar: true`, `use_dot_filter: true`, `coarse_step: 3`
-- **Exact (slower, no quality benefit observed):** `use_dense_polar: true`, `use_dot_filter: true`, `coarse_step: 1`
+- **Recommended:** `use_dense_polar: true`, `use_dot_filter: false`, `coarse_step: 3`
+- **Exact comparison:** `use_dense_polar: true`, `use_dot_filter: false`, `coarse_step: 1`
 
 On the TTP benchmark route, `coarse_step=3` is the fastest config and matches or beats
 `coarse_step=1` and `coarse_step=2` on route quality — the 6° coarse pass + 2° refine
 window is sufficient to find the optimal heading.
 
-> **Note:** the dense polar lookup and dot filter are both **mathematically exact** —
-> they produce identical results to the original sparse-search code. The only source
-> of approximation is `coarse_step > 1`, which may miss the optimal heading when it
-> falls between coarse samples.
+> **Note:** the dense polar lookup is exact. The dot filter remains available as an
+> experimental optimization, but production YAMLs keep it disabled until tests cover
+> the drift/no-go edge cases that can make backward boat headings feasible.
 
 ---
 
@@ -228,10 +218,9 @@ window is sufficient to find the optimal heading.
 
 | File | Change |
 |---|---|
-| `sail_routing.py` | `PolarTable._build_dense_lookup()`; new params on `_sector_astar_jit`; `SectorRouter.__init__` kwarg wiring; drift threshold 0.10→0.50; dot filter decoupled from dense polar |
-| `run_route.py` | Parse `use_dense_polar`, `use_dot_filter` from YAML |
-| `routes/shilshole_ttp_return.yaml` | TTP route config — uses recommended settings (dense + dot filter + cs=3) |
-| `routes/shilshole_alki_return.yaml` | Alki route config — uses recommended settings (dense + dot filter + cs=3) |
+| `sail_routing.py` | `PolarTable._build_dense_lookup()`; `_sector_astar_jit` dense-polar params; production drift threshold `0.10`; optional experimental dot filter |
+| `run_route.py` | Parses `use_dense_polar`, `use_dot_filter`, and route YAML performance controls |
+| `routes/*.yaml` | Production route configs use dense polar, coarse step 3, and `use_dot_filter: false` |
 
 ---
 

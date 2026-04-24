@@ -26,6 +26,8 @@ YAML schema:
     boat:
       speed_kt: 6.0                   # fallback fixed speed
       polar: "path/to/polar.csv"      # optional; relative to this script's dir
+      minimum_twa: 38                 # optional upwind no-go
+      maximum_twa: 165                # optional downwind no-go
 
     wind:                             # optional; only used with a polar
       # Option A: constant wind
@@ -54,12 +56,16 @@ YAML schema:
 
     routing:
       router_type: "sector"           # required; only supported router
-      tack_penalty_s: 60
+      tack_penalty_s: 90
+      tack_threshold_deg: 50
+      gybe_penalty_s: 90              # defaults to tack_penalty_s
+      gybe_threshold_deg: 120         # TWA >= this is downwind/gybe territory
       duration_hours: 10              # forecast window to load per leg
       # Optional performance knobs (all have safe defaults):
       # polar_sweep_coarse_step: 5    # 1=exact, >1 faster approximate
       # corridor_pad_factors: [0.85, 1.0, 1.35]
       # corridor_cache_max: 4
+      # use_dot_filter: false         # experimental; disabled in production YAMLs
 
     output:
       save_plots: true
@@ -466,13 +472,20 @@ def build_boat_and_wind(doc: dict, context: dict | None = None):
     polar = None
     polar_path_str = boat_cfg.get("polar")
     minimum_twa = float(boat_cfg.get("minimum_twa", 0.0))
+    maximum_twa = float(boat_cfg.get("maximum_twa", 180.0))
     if polar_path_str:
         polar_path = Path(polar_path_str)
         if not polar_path.is_absolute():
             polar_path = HERE / polar_path
         if polar_path.exists():
-            polar = PolarTable(polar_path, minimum_twa=minimum_twa)
-            nogo = f", no-go zone < {minimum_twa:.0f}°" if minimum_twa > 0 else ""
+            polar = PolarTable(polar_path, minimum_twa=minimum_twa,
+                               maximum_twa=maximum_twa)
+            zones = []
+            if minimum_twa > 0:
+                zones.append(f"TWA < {minimum_twa:.0f}°")
+            if maximum_twa < 180:
+                zones.append(f"TWA > {maximum_twa:.0f}°")
+            nogo = f", no-go zone {' and '.join(zones)}" if zones else ""
             print(f"Polar loaded from {polar_path}: max {polar.max_speed_kt:.1f} kt{nogo}")
         else:
             print(f"Warning: polar file not found at {polar_path}, using fixed speed.")
@@ -556,6 +569,11 @@ def print_leg_summary(leg_num: int, label: str, route, depart_utc, tz):
     print(f"  Avg SOG:   {route.avg_sog_knots:.2f} kt")
     print(f"  Boat STW:  {route.boat_speed_knots:.1f} kt")
     print(f"  SOG adv:   {route.avg_sog_knots - route.boat_speed_knots:+.2f} kt")
+    if route.debug:
+        tacks = int(route.debug.get("maneuver_tack_count", 0))
+        gybes = int(route.debug.get("maneuver_gybe_count", 0))
+        turns = int(route.debug.get("maneuver_turn_count", 0))
+        print(f"  Maneuvers: {tacks} tacks, {gybes} gybes, {turns} other turns")
 
 
 def print_trip_summary(routes, labels, total_start_utc, tz):
@@ -658,7 +676,7 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
         all_utm.append((x, y))
 
     pad = 4000.0
-    res = 400.0  # coarser grid for speed — just for background viz
+    res = 300.0  # display grid for binned SSCOFS vector averages
     x_min = min(p[0] for p in all_utm) - pad
     x_max = max(p[0] for p in all_utm) + pad
     y_min = min(p[1] for p in all_utm) - pad
@@ -678,6 +696,23 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
     # ── full simulated track for all legs (used as the "planned route" overlay) ──
     route_x = list(tx)
     route_y = list(ty)
+
+    # ── maneuver overlays from route diagnostics ─────────────────────────
+    maneuver_x, maneuver_y, maneuver_t, maneuver_type = [], [], [], []
+    for route in routes:
+        dbg = route.debug or {}
+        mx = np.asarray(dbg.get("maneuver_x", []), dtype=np.float64)
+        my = np.asarray(dbg.get("maneuver_y", []), dtype=np.float64)
+        mt = np.asarray(dbg.get("maneuver_time_s", []), dtype=np.float64)
+        mtype = np.asarray(dbg.get("maneuver_type", []), dtype=np.int8)
+        maneuver_x.extend(mx.tolist())
+        maneuver_y.extend(my.tolist())
+        maneuver_t.extend(mt.tolist())
+        maneuver_type.extend(mtype.tolist())
+    maneuver_x = np.asarray(maneuver_x, dtype=np.float64)
+    maneuver_y = np.asarray(maneuver_y, dtype=np.float64)
+    maneuver_t = np.asarray(maneuver_t, dtype=np.float64)
+    maneuver_type = np.asarray(maneuver_type, dtype=np.int8)
 
     # ── compute max current speed for consistent colorscale ──────────────
     speed_max = cf.max_current_speed * MS_TO_KNOTS
@@ -707,6 +742,20 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
                                             foreground="white",
                                             alpha=0.7),
                                   pe.Normal()])
+
+        if maneuver_type.size:
+            tack_mask = maneuver_type == 1
+            if np.any(tack_mask):
+                ax.plot(maneuver_x[tack_mask], maneuver_y[tack_mask], "o",
+                        color="black", markersize=6, zorder=9,
+                        markeredgecolor="white", markeredgewidth=1.0,
+                        label="Tacks" if show_legend else None)
+            gybe_mask = maneuver_type == 2
+            if np.any(gybe_mask):
+                ax.plot(maneuver_x[gybe_mask], maneuver_y[gybe_mask], "D",
+                        color="black", markersize=6, zorder=9,
+                        markeredgecolor="white", markeredgewidth=1.0,
+                        label="Gybes" if show_legend else None)
 
         for k, (wx, wy) in enumerate(all_utm):
             if k == 0:
@@ -768,10 +817,12 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
         frame_local = frame_utc.astimezone(tz)
 
         # Current field at this hour
-        u_grid, v_grid = cf.query_grid(xs, ys_g, elapsed_s=elapsed_s)
+        u_grid, v_grid = cf.query_binned_grid(xs, ys_g, elapsed_s=elapsed_s)
         speed_grid = np.hypot(u_grid, v_grid) * MS_TO_KNOTS
         water_mask = ~np.isnan(u_grid)
         speed_grid[~water_mask] = np.nan
+        frame_speed_max = (np.nanpercentile(speed_grid, 95)
+                           if np.any(~np.isnan(speed_grid)) else 1.0)
 
         # Boat position at this hour
         bx, by = position_at_time(tx, ty, tt, elapsed_s)
@@ -782,14 +833,13 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
         track_y_past = ty[mask_past]
 
         # Arrow subsampling
-        step = max(1, len(xs) // 18)
+        step = max(1, int(round(900.0 / res)))
         xx, yy = np.meshgrid(xs, ys_g)
-        arrow_scale = 1.0 / (step * res) * 0.65
 
         if wind_field is None:
             fig, ax = plt.subplots(figsize=(10, 14))
 
-            _setup_ax(ax, f"{task_name}  —  Hour {h}")
+            _setup_ax(ax, f"{task_name}  —  Hour {h}  —  {frame_local:%I:%M %p %Z}")
 
             ax.pcolormesh(xs, ys_g, np.where(water_mask, 0.0, np.nan),
                           cmap="Blues", vmin=0, vmax=1, alpha=0.08,
@@ -797,7 +847,7 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
 
             im = ax.pcolormesh(xs, ys_g, speed_grid,
                                cmap="plasma", alpha=0.5, shading="auto",
-                               vmin=0, vmax=max(speed_max, 1.0), zorder=1)
+                               vmin=0, vmax=max(frame_speed_max, 1.0), zorder=1)
             cbar = fig.colorbar(im, ax=ax, label="Current (kt)",
                                 pad=0.01, shrink=0.6, fraction=0.03)
 
@@ -806,17 +856,17 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
             spd_sub = speed_grid[::step, ::step]
             mag = np.hypot(u_sub, v_sub)
             mag_safe = np.where(mag < 1e-8, 1.0, mag)
-            u_norm = u_sub / mag_safe
-            v_norm = v_sub / mag_safe
+            u_arrow = u_sub / mag_safe
+            v_arrow = v_sub / mag_safe
             visible = (mag > 0.04) & ~np.isnan(spd_sub)
-            u_norm[~visible] = np.nan
-            v_norm[~visible] = np.nan
+            u_arrow[~visible] = np.nan
+            v_arrow[~visible] = np.nan
             ax.quiver(xx[::step, ::step], yy[::step, ::step],
-                      u_norm, v_norm, spd_sub,
-                      cmap="cool", clim=(0, max(speed_max, 1.0)),
-                      scale=arrow_scale, scale_units="xy",
+                      u_arrow, v_arrow,
+                      color="black",
+                      scale=1.0 / (step * res) * 1.0, scale_units="xy",
                       width=0.003, headwidth=4, headlength=5,
-                      alpha=0.7, zorder=3)
+                      alpha=0.75, zorder=2.5)
 
             _draw_route_overlay(ax, frame_local, track_x_past, track_y_past, bx, by)
             ax.legend(loc="upper right", framealpha=0.9,
@@ -834,7 +884,7 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
 
             im_cur = ax_cur.pcolormesh(xs, ys_g, speed_grid,
                                        cmap="plasma", alpha=0.5, shading="auto",
-                                       vmin=0, vmax=max(speed_max, 1.0), zorder=1)
+                                       vmin=0, vmax=max(frame_speed_max, 1.0), zorder=1)
             cbar_cur = fig.colorbar(im_cur, ax=ax_cur, label="Current (kt)",
                                     pad=0.02, shrink=0.7)
 
@@ -843,17 +893,17 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
             spd_sub = speed_grid[::step, ::step]
             mag = np.hypot(u_sub, v_sub)
             mag_safe = np.where(mag < 1e-8, 1.0, mag)
-            u_norm = u_sub / mag_safe
-            v_norm = v_sub / mag_safe
+            u_arrow = u_sub / mag_safe
+            v_arrow = v_sub / mag_safe
             visible = (mag > 0.04) & ~np.isnan(spd_sub)
-            u_norm[~visible] = np.nan
-            v_norm[~visible] = np.nan
+            u_arrow[~visible] = np.nan
+            v_arrow[~visible] = np.nan
             ax_cur.quiver(xx[::step, ::step], yy[::step, ::step],
-                          u_norm, v_norm, spd_sub,
-                          cmap="cool", clim=(0, max(speed_max, 1.0)),
-                          scale=arrow_scale, scale_units="xy",
+                          u_arrow, v_arrow,
+                          color="black",
+                          scale=1.0 / (step * res) * 1.0, scale_units="xy",
                           width=0.003, headwidth=4, headlength=5,
-                          alpha=0.7, zorder=3)
+                          alpha=0.75, zorder=2.5)
 
             wu_grid = np.zeros_like(u_grid)
             wv_grid = np.zeros_like(v_grid)
@@ -886,11 +936,11 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
             wu_norm[~wvisible] = np.nan
             wv_norm[~wvisible] = np.nan
             ax_wind.quiver(xx[::step, ::step], yy[::step, ::step],
-                           wu_norm, wv_norm, wspd_sub,
-                           cmap="Reds", clim=(0, wind_max),
-                           scale=arrow_scale, scale_units="xy",
+                           wu_norm, wv_norm,
+                           color="black",
+                           scale=1.0 / (step * res) * 1.0, scale_units="xy",
                            width=0.003, headwidth=4, headlength=5,
-                           alpha=0.7, zorder=3)
+                           alpha=0.75, zorder=2.5)
 
             _draw_route_overlay(ax_cur, frame_local, track_x_past, track_y_past, bx, by, show_legend=True)
             _draw_route_overlay(ax_wind, frame_local, track_x_past, track_y_past, bx, by, show_legend=False)
@@ -931,7 +981,8 @@ def generate_hourly_frames(routes, wps, cf, depart_utc, depart_time_s,
                                       edgecolor="#cccccc"))
 
         if wind_field is not None:
-            fig.suptitle(f"{task_name}  —  Hour {h}", fontsize=12, y=0.98)
+            fig.suptitle(f"{task_name}  —  Hour {h}  —  {frame_local:%I:%M %p %Z}",
+                         fontsize=12, y=0.98)
 
         plt.tight_layout()
         out_path = plot_dir / f"{slug}_hour{h:02d}.png"
@@ -984,6 +1035,25 @@ def save_route_json(routes, wps, depart_utc, depart_time_s, tz,
     legs_out = []
     for li, r in enumerate(routes):
         wp_ll = [[float(lat), float(lon)] for lat, lon in r.waypoints_latlon]
+        dbg = r.debug or {}
+        tack_count = int(dbg.get("maneuver_tack_count", 0))
+        gybe_count = int(dbg.get("maneuver_gybe_count", 0))
+        turn_count = int(dbg.get("maneuver_turn_count", 0))
+        maneuvers = []
+        if "maneuver_type" in dbg:
+            mtype_names = {1: "tack", 2: "gybe", 3: "turn"}
+            mx = np.asarray(dbg.get("maneuver_x", []), dtype=np.float64)
+            my = np.asarray(dbg.get("maneuver_y", []), dtype=np.float64)
+            mt = np.asarray(dbg.get("maneuver_time_s", []), dtype=np.float64)
+            mtypes = np.asarray(dbg.get("maneuver_type", []), dtype=np.int8)
+            for x, y, t_s, mtype in zip(mx, my, mt, mtypes):
+                lon, lat = inv_tf.transform(float(x), float(y))
+                maneuvers.append({
+                    "type": mtype_names.get(int(mtype), "unknown"),
+                    "elapsed_s": round(float(t_s - depart_time_s), 1),
+                    "lat": round(float(lat), 6),
+                    "lon": round(float(lon), 6),
+                })
         legs_out.append({
             "leg": li + 1,
             "from": list(wps[li]),
@@ -991,6 +1061,10 @@ def save_route_json(routes, wps, depart_utc, depart_time_s, tz,
             "distance_nm": round(r.total_distance_m / 1852.0, 3),
             "time_min":    round(r.total_time_s / 60.0, 1),
             "avg_sog_kt":  round(r.avg_sog_knots, 3),
+            "tack_count": tack_count,
+            "gybe_count": gybe_count,
+            "turn_count": turn_count,
+            "maneuvers": maneuvers,
             "waypoints_latlon": wp_ll,
         })
 
@@ -1037,6 +1111,116 @@ def save_route_json(routes, wps, depart_utc, depart_time_s, tz,
         json.dump(out, f, indent=2)
     print(f"Route data saved  → {out_path.name}  "
           f"({len(track_out):,} track points)")
+    return out_path
+
+
+def save_route_report(routes, wps, depart_utc, depart_time_s, tz,
+                      task_name, plot_dir, slug, doc):
+    """Save a human-readable Markdown report next to the JSON output."""
+    import datetime as _dt
+    from pyproj import CRS, Transformer as _T
+
+    ref_lat, ref_lon = wps[0]
+    utm_crs = CRS.from_dict({
+        "proj": "utm",
+        "zone": int((ref_lon + 180) / 6) + 1,
+        "north": ref_lat >= 0,
+        "ellps": "WGS84",
+    })
+    inv_tf = _T.from_crs(utm_crs, CRS.from_epsg(4326), always_xy=True)
+
+    total_time_s = sum(r.total_time_s for r in routes)
+    total_dist_nm = sum(r.total_distance_m for r in routes) / 1852.0
+    depart_local = depart_utc.astimezone(tz)
+    arrive_local = (depart_utc + _dt.timedelta(seconds=total_time_s)).astimezone(tz)
+    avg_sog = total_dist_nm / (total_time_s / 3600.0) if total_time_s > 0 else 0.0
+
+    wind_cfg = doc.get("wind") or {}
+    wind_source = str(wind_cfg.get("source", "none"))
+    if wind_source.lower() in ("open_meteo_ecmwf", "ecmwf_openmeteo", "ecmwf_route"):
+        wind_desc = (
+            "Open-Meteo ECMWF `wind_speed_10m` and `wind_direction_10m` "
+            "(10 m sustained/average wind). `wind_gusts_10m` is fetched into "
+            "the cache for reference/coverage checks but is not used by the router."
+        )
+    elif wind_source.lower() in ("schedule", "manual_schedule", "piecewise"):
+        wind_desc = "Manual schedule wind from YAML anchors."
+    elif wind_source.lower() in ("constant", "met", "manual"):
+        wind_desc = "Constant wind from YAML."
+    else:
+        wind_desc = wind_source
+
+    lines = [
+        f"# {task_name}",
+        "",
+        "## Summary",
+        "",
+        f"- Departure: {depart_local:%Y-%m-%d %I:%M %p %Z}",
+        f"- Estimated finish: {arrive_local:%Y-%m-%d %I:%M %p %Z}",
+        f"- Total time: {total_time_s / 3600.0:.2f} hr ({total_time_s / 60.0:.0f} min)",
+        f"- Total distance: {total_dist_nm:.2f} nm",
+        f"- Average SOG: {avg_sog:.2f} kt",
+        "",
+        "## Wind",
+        "",
+        f"- Source: `{wind_source}`",
+        f"- Details: {wind_desc}",
+        "",
+        "## Leg Breakdown",
+        "",
+        "| Leg | From -> To | Depart | Arrive | Distance | Time | Avg SOG | Tacks | Gybes |",
+        "|---:|---|---|---|---:|---:|---:|---:|---:|",
+    ]
+
+    leg_depart = depart_utc
+    for i, route in enumerate(routes):
+        leg_arrive = leg_depart + _dt.timedelta(seconds=route.total_time_s)
+        dbg = route.debug or {}
+        tacks = int(dbg.get("maneuver_tack_count", 0))
+        gybes = int(dbg.get("maneuver_gybe_count", 0))
+        from_ll = f"{wps[i][0]:.4f},{wps[i][1]:.4f}"
+        to_ll = f"{wps[i + 1][0]:.4f},{wps[i + 1][1]:.4f}"
+        lines.append(
+            f"| {i + 1} | {from_ll} -> {to_ll} | "
+            f"{leg_depart.astimezone(tz):%I:%M %p} | "
+            f"{leg_arrive.astimezone(tz):%I:%M %p} | "
+            f"{route.total_distance_m / 1852.0:.2f} nm | "
+            f"{route.total_time_s / 60.0:.1f} min | "
+            f"{route.avg_sog_knots:.2f} kt | {tacks} | {gybes} |"
+        )
+        leg_depart = leg_arrive
+
+    lines.extend(["", "## Maneuvers", ""])
+    any_maneuvers = False
+    for i, route in enumerate(routes):
+        dbg = route.debug or {}
+        mtypes = np.asarray(dbg.get("maneuver_type", []), dtype=np.int8)
+        mtimes = np.asarray(dbg.get("maneuver_time_s", []), dtype=np.float64)
+        mx = np.asarray(dbg.get("maneuver_x", []), dtype=np.float64)
+        my = np.asarray(dbg.get("maneuver_y", []), dtype=np.float64)
+        if not len(mtypes):
+            continue
+        any_maneuvers = True
+        lines.append(f"### Leg {i + 1}")
+        lines.append("")
+        lines.append("| Type | Local Time | Latitude | Longitude |")
+        lines.append("|---|---|---:|---:|")
+        for mtype, t_s, x, y in zip(mtypes, mtimes, mx, my):
+            kind = {1: "tack", 2: "gybe", 3: "turn"}.get(int(mtype), "unknown")
+            lon, lat = inv_tf.transform(float(x), float(y))
+            local = (depart_utc + _dt.timedelta(seconds=float(t_s - depart_time_s))).astimezone(tz)
+            lines.append(f"| {kind} | {local:%I:%M:%S %p} | {lat:.6f} | {lon:.6f} |")
+        lines.append("")
+
+    if not any_maneuvers:
+        lines.append("No tacks, gybes, or large turns detected.")
+        lines.append("")
+
+    out_path = plot_dir / f"{slug}_report.md"
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines))
+        f.write("\n")
+    print(f"Human-readable report saved → {out_path.name}")
     return out_path
 
 
@@ -1237,6 +1421,8 @@ def main():
     r_cfg = doc.get("routing", {})
     tack_penalty = float(r_cfg.get("tack_penalty_s", 90))
     tack_threshold_deg = float(r_cfg.get("tack_threshold_deg", 50))
+    gybe_penalty = float(r_cfg.get("gybe_penalty_s", tack_penalty))
+    gybe_threshold_deg = float(r_cfg.get("gybe_threshold_deg", 120))
     duration_h   = int(r_cfg.get("duration_hours", 10))
     router_type  = str(r_cfg.get("router_type", "sector")).strip().lower()
     if router_type != "sector":
@@ -1312,6 +1498,8 @@ def main():
     router = SectorRouter(cf, boat, wind=wind,
                           tack_penalty_s=tack_penalty,
                           tack_threshold_deg=tack_threshold_deg,
+                          gybe_penalty_s=gybe_penalty,
+                          gybe_threshold_deg=gybe_threshold_deg,
                           polar_sweep_coarse_step=polar_sweep_coarse_step,
                           corridor_pad_factors=corridor_pad_factors,
                           corridor_cache_max=corridor_cache_max,
@@ -1376,6 +1564,17 @@ def main():
         task_name=task_name,
         plot_dir=plot_dir,
         slug=yaml_path.stem,
+    )
+    save_route_report(
+        routes=routes,
+        wps=wps,
+        depart_utc=depart_utc,
+        depart_time_s=start_time_s,
+        tz=tz,
+        task_name=task_name,
+        plot_dir=plot_dir,
+        slug=yaml_path.stem,
+        doc=doc,
     )
 
     # ---- Position time-series ----

@@ -17,6 +17,7 @@ boat:
   speed_kt: 6.0
   polar: "../../j105_new_polars.csv"
   minimum_twa: 38
+  maximum_twa: 165
 
 wind:
   source: schedule
@@ -27,12 +28,14 @@ wind:
 
 routing:
   router_type: "sector"
-  tack_penalty_s: 60
+  tack_penalty_s: 90
   tack_threshold_deg: 50
+  gybe_penalty_s: 90
+  gybe_threshold_deg: 120
   duration_hours: 5
   polar_sweep_coarse_step: 3
   use_dense_polar: true
-  use_dot_filter: true
+  use_dot_filter: false
 
 output:
   save_plots: true

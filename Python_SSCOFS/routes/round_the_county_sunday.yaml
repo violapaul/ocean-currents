@@ -1,0 +1,75 @@
+# Round the County — Sunday Leg
+#
+# Mosquito Pass (start) → south through San Juan Channel → round Iceberg Point
+# → east across south Lopez / Strait of Juan de Fuca entry → north up
+# Rosario Strait → Lydia Shoal (finish).
+#
+# Race direction: counter-clockwise around San Juan County (continuing from Saturday).
+#
+# Mark types:
+#   Lydia Shoal buoy (finish) → regular waypoint.
+#   Headland (Iceberg Point, SW tip of Lopez Island) → land mark with barrier.
+#
+# Iceberg Point barrier (bearing 0° = north):
+#   Correct route keeps Iceberg Point to port heading east = passes SOUTH of
+#   the Lopez Island tip into the Strait of Juan de Fuca.
+#   The fence extends north from Iceberg Point, closing the Cattle Pass
+#   inside-line shortcut (which would leave the point to starboard).
+#
+# Iceberg Point coordinates are from official lighthouse reference.
+#
+# Run with:
+#   conda run -n anaconda python run_route.py routes/round_the_county_sunday.yaml
+
+task:
+  name: "Round the County — Sunday (Mosquito Pass → Lydia Shoal)"
+  description: >
+    Counter-clockwise leg 2. Start off south end of Mosquito Pass, south through
+    San Juan Channel with San Juan Island to port (west), round Iceberg Point
+    (SW tip of Lopez Island) to port — passing SOUTH of the headland into the
+    Strait of Juan de Fuca — then northeast up Rosario Strait to finish at
+    Lydia Shoal buoy.
+
+departure:
+  datetime: "2026-03-12 09:00"   # test date — update to actual race date before use
+  tz: "America/Los_Angeles"
+
+waypoints:
+  - [48.590, -123.005]        # Start — south end of Mosquito Pass (approx RC position)
+  - [48.530, -122.970]        # San Juan Channel — southbound, SJI to port (west)
+
+  # Land mark: Iceberg Point Light 2 (SW tip of Lopez Island).
+  # Correct route keeps Iceberg Point to port heading east = SOUTH of the tip.
+  # Barrier extends north, closing the inside-line shortcut through Cattle Pass.
+  - lat: 48.422050
+    lon: -122.894283
+    rounding: port
+    barrier_bearing_deg: 0    # fence north into Cattle Pass, blocks inside-line shortcut
+
+  - [48.400, -122.870]        # South of Iceberg Point — Strait of Juan de Fuca entry
+  - [48.445, -122.780]        # Rosario Strait south — east of Lopez / Davidson Rock
+  - [48.5996, -122.7791]      # Lydia Shoal buoy — finish line reference / leave to port
+
+boat:
+  speed_kt: 6.0
+  polar: "../../j105_new_polars.csv"
+  minimum_twa: 38
+  maximum_twa: 165
+
+wind:
+  source: "open_meteo_ecmwf"
+
+routing:
+  router_type: "sector"
+  tack_penalty_s: 90
+  tack_threshold_deg: 50
+  gybe_penalty_s: 90
+  gybe_threshold_deg: 120
+  duration_hours: 20
+  polar_sweep_coarse_step: 3
+  use_dense_polar: true
+  use_dot_filter: false
+
+output:
+  save_plots: true
+  plot_dir: "routes/output"

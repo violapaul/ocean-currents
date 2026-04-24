@@ -95,14 +95,19 @@ class PolarTable:
     minimum_twa : float, optional
         No-go zone: TWAs below this angle are forced to zero speed.
         Default 0 (use raw polar values).
+    maximum_twa : float, optional
+        Downwind no-go: TWAs above this angle are forced to zero speed.
+        Default 180 (allow dead downwind).
     sail_filter : str, optional
         Which sail / row group to use from a sail-config polar.
         Default ``"Best Performance"``.
     """
 
-    def __init__(self, csv_path, minimum_twa=0.0, sail_filter="Best Performance"):
+    def __init__(self, csv_path, minimum_twa=0.0, maximum_twa=180.0,
+                 sail_filter="Best Performance"):
         csv_path = Path(csv_path)
         self.minimum_twa = float(minimum_twa)
+        self.maximum_twa = float(maximum_twa)
 
         with open(csv_path, newline='') as f:
             reader = csv.DictReader(f)
@@ -118,6 +123,8 @@ class PolarTable:
 
         if self.minimum_twa > 0:
             self._speeds[self._twas < self.minimum_twa, :] = 0.0
+        if self.maximum_twa < 180.0:
+            self._speeds[self._twas > self.maximum_twa, :] = 0.0
 
         self.max_speed_kt = float(np.nanmax(self._speeds))
         self.max_speed_ms = self.max_speed_kt * KNOTS_TO_MS
@@ -177,10 +184,13 @@ class PolarTable:
                 alpha * beta * self._speeds[i1, j1]
             )
 
-        # Enforce the no-go zone already applied to _speeds.
+        # Enforce the no-go zones already applied to _speeds.
         if self.minimum_twa > 0:
             cutoff = min(int(np.ceil(self.minimum_twa)), n_twa)
             dense[:cutoff, :] = 0.0
+        if self.maximum_twa < 180.0:
+            cutoff = max(0, int(np.floor(self.maximum_twa)) + 1)
+            dense[cutoff:, :] = 0.0
 
         self._polar_dense = dense
         self._polar_dense_max_tws = max_tws_kt
@@ -306,6 +316,8 @@ class PolarTable:
         float  (knots)
         """
         if self.minimum_twa > 0 and twa_deg < self.minimum_twa:
+            return 0.0
+        if self.maximum_twa < 180.0 and twa_deg > self.maximum_twa:
             return 0.0
         twa_c = float(np.clip(twa_deg, self._twas[0], self._twas[-1]))
         tws_c = float(np.clip(tws_kt, self._twss[0], self._twss[-1]))
@@ -704,8 +716,8 @@ class CurrentField:
                 self._inv_transformer = Transformer.from_crs(
                     transformer.target_crs, transformer.source_crs, always_xy=True
                 )
-            except Exception:
-                pass  # Nav mask is optional, fall back to Delaunay only
+            except Exception as exc:
+                print(f"Warning: failed to load nav mask {nav_mask_path}: {exc}")
 
         self.u_frames = [np.asarray(u, dtype=np.float64) for u in u_frames]
         self.v_frames = [np.asarray(v, dtype=np.float64) for v in v_frames]
@@ -717,13 +729,10 @@ class CurrentField:
 
     # ------------------------------------------------------------------
 
-    def _idw_prepare(self, x, y):
-        """Precompute neighbour indices/weights for IDW interpolation."""
-        dists, idxs = self.tree.query(np.column_stack([x, y]), k=self.k)
-        if self.k == 1:
-            dists = dists[:, np.newaxis]
-            idxs = idxs[:, np.newaxis]
-
+    def _land_mask_for_points(self, x, y, dists=None):
+        """Return True for points outside the navigable water domain."""
+        x = np.atleast_1d(np.asarray(x, dtype=np.float64))
+        y = np.atleast_1d(np.asarray(y, dtype=np.float64))
         # Land detection: use Delaunay triangulation if available
         if self.delaunay is not None and self.valid_triangle is not None:
             # find_simplex returns triangle index, or -1 if outside convex hull
@@ -733,7 +742,12 @@ class CurrentField:
             land_mask[in_hull] = ~self.valid_triangle[simplex_idx[in_hull]]
         else:
             # Fallback to distance-based detection
-            land_mask = dists[:, 0] > self.land_threshold
+            if dists is None:
+                dists, _ = self.tree.query(np.column_stack([x, y]), k=1)
+                nearest_dist = np.atleast_1d(dists)
+            else:
+                nearest_dist = np.asarray(dists)[:, 0]
+            land_mask = nearest_dist > self.land_threshold
 
         # Supplement with nav mask (DEM-based) if available
         if self._nav_mask is not None and self._inv_transformer is not None:
@@ -747,6 +761,25 @@ class CurrentField:
             nav_water = np.ones(len(x), dtype=bool)
             nav_water[in_bounds] = self._nav_mask[row[in_bounds], col[in_bounds]]
             land_mask = land_mask | ~nav_water
+        return land_mask
+
+    def is_water(self, x_utm, y_utm):
+        """Return True where points are navigable water under the active masks."""
+        x = np.atleast_1d(np.asarray(x_utm, dtype=np.float64))
+        y = np.atleast_1d(np.asarray(y_utm, dtype=np.float64))
+        water = ~self._land_mask_for_points(x, y)
+        if x.size == 1:
+            return bool(water[0])
+        return water
+
+    def _idw_prepare(self, x, y):
+        """Precompute neighbour indices/weights for IDW interpolation."""
+        dists, idxs = self.tree.query(np.column_stack([x, y]), k=self.k)
+        if self.k == 1:
+            dists = dists[:, np.newaxis]
+            idxs = idxs[:, np.newaxis]
+
+        land_mask = self._land_mask_for_points(x, y, dists=dists)
 
         weights = np.where(dists < 1e-12, 1e12, 1.0 / dists)
         w_sum = weights.sum(axis=1, keepdims=True)
@@ -813,6 +846,75 @@ class CurrentField:
         yf = yy.ravel()
         u, v = self.query(xf, yf, elapsed_s)
         return u.reshape(xx.shape), v.reshape(xx.shape)
+
+    def _node_values_at_time(self, elapsed_s=0.0):
+        """Return node-aligned u/v arrays interpolated to elapsed_s."""
+        if self.n_frames == 1:
+            return self.u_frames[0], self.v_frames[0]
+
+        t = float(np.clip(elapsed_s, self.frame_times[0], self.frame_times[-1]))
+        idx = int(np.searchsorted(self.frame_times, t, side='right')) - 1
+        idx = int(np.clip(idx, 0, self.n_frames - 2))
+        t0 = self.frame_times[idx]
+        t1 = self.frame_times[idx + 1]
+        alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+        u = self.u_frames[idx] * (1 - alpha) + self.u_frames[idx + 1] * alpha
+        v = self.v_frames[idx] * (1 - alpha) + self.v_frames[idx + 1] * alpha
+        return u, v
+
+    def query_binned_grid(self, xs, ys, elapsed_s=0.0, min_count=1):
+        """Average native SSCOFS vectors into display grid cells.
+
+        This is for visualization only.  Routing continues to use point queries
+        against the native current field.  Empty bins fall back to IDW so plots
+        remain continuous over water.
+        """
+        xs = np.asarray(xs, dtype=np.float64)
+        ys = np.asarray(ys, dtype=np.float64)
+        u_fallback, v_fallback = self.query_grid(xs, ys, elapsed_s=elapsed_s)
+
+        if xs.size < 2 or ys.size < 2:
+            return u_fallback, v_fallback
+
+        dx = float(np.median(np.diff(xs)))
+        dy = float(np.median(np.diff(ys)))
+        x_edges = np.concatenate([[xs[0] - 0.5 * dx],
+                                  0.5 * (xs[:-1] + xs[1:]),
+                                  [xs[-1] + 0.5 * dx]])
+        y_edges = np.concatenate([[ys[0] - 0.5 * dy],
+                                  0.5 * (ys[:-1] + ys[1:]),
+                                  [ys[-1] + 0.5 * dy]])
+
+        x = self._x_utm
+        y = self._y_utm
+        in_bounds = ((x >= x_edges[0]) & (x < x_edges[-1]) &
+                     (y >= y_edges[0]) & (y < y_edges[-1]))
+        if not np.any(in_bounds):
+            return u_fallback, v_fallback
+
+        xi = np.searchsorted(x_edges, x[in_bounds], side='right') - 1
+        yi = np.searchsorted(y_edges, y[in_bounds], side='right') - 1
+        valid = ((xi >= 0) & (xi < xs.size) & (yi >= 0) & (yi < ys.size))
+        if not np.any(valid):
+            return u_fallback, v_fallback
+
+        xi = xi[valid]
+        yi = yi[valid]
+        flat_idx = yi * xs.size + xi
+        node_idx = np.where(in_bounds)[0][valid]
+        u_nodes, v_nodes = self._node_values_at_time(elapsed_s)
+
+        n_cells = xs.size * ys.size
+        counts = np.bincount(flat_idx, minlength=n_cells).astype(np.float64)
+        u_sum = np.bincount(flat_idx, weights=u_nodes[node_idx], minlength=n_cells)
+        v_sum = np.bincount(flat_idx, weights=v_nodes[node_idx], minlength=n_cells)
+
+        u_grid = u_fallback.copy().ravel()
+        v_grid = v_fallback.copy().ravel()
+        use_avg = counts >= float(min_count)
+        u_grid[use_avg] = u_sum[use_avg] / counts[use_avg]
+        v_grid[use_avg] = v_sum[use_avg] / counts[use_avg]
+        return u_grid.reshape((ys.size, xs.size)), v_grid.reshape((ys.size, xs.size))
 
 
 # ===================================================================
@@ -1075,6 +1177,8 @@ def _polar_boat_speeds(boat_model, wind_u, wind_v):
             alpha       * beta       * polar._speeds[i1, j1])
     if polar.minimum_twa > 0:
         V_kt = np.where(twa_arr < polar.minimum_twa, 0.0, V_kt)
+    if polar.maximum_twa < 180.0:
+        V_kt = np.where(twa_arr > polar.maximum_twa, 0.0, V_kt)
     return V_kt * KNOTS_TO_MS
 
 
@@ -1457,6 +1561,7 @@ def _build_corridor_sector_graph(
     corridor_mask,
     n_sectors, sector_width,
     k_candidates, min_edge_m, max_edge_m, n_los_samples,
+    is_water_func=None,
 ):
     """Build sector adjacency for corridor nodes using vectorized ops.
 
@@ -1516,9 +1621,13 @@ def _build_corridor_sector_graph(
         flat_ok = np.zeros(len(flat_pts), dtype=bool)
         for c0 in range(0, len(flat_pts), CHUNK):
             c1 = min(c0 + CHUNK, len(flat_pts))
-            simplex = delaunay.find_simplex(flat_pts[c0:c1])
-            in_hull = simplex >= 0
-            flat_ok[c0:c1][in_hull] = valid_triangle[simplex[in_hull]]
+            if is_water_func is not None:
+                flat_ok[c0:c1] = is_water_func(
+                    flat_pts[c0:c1, 0], flat_pts[c0:c1, 1])
+            else:
+                simplex = delaunay.find_simplex(flat_pts[c0:c1])
+                in_hull = simplex >= 0
+                flat_ok[c0:c1][in_hull] = valid_triangle[simplex[in_hull]]
         return flat_ok.reshape(len(src_nodes), n_los_samples).all(axis=1)
 
     for _ in range(max_sector_los_attempts):
@@ -1665,15 +1774,17 @@ if _NUMBA_AVAILABLE:
         boat_speed_ms, max_speed,
         # Polar table (pass empty arrays + has_polar=False to disable)
         has_polar, polar_twas, polar_twss, polar_speeds, polar_min_twa,
+        polar_max_twa,
         sweep_hx, sweep_hy, sweep_rads, n_sweep, polar_coarse_step,
         # Dense pre-baked polar (pass empty array + use_dense_polar=False to disable)
         use_dense_polar, polar_dense, polar_dense_max_tws,
-        # Forward-hemisphere filter: skip headings pointing away from the target
+        # Experimental forward-hemisphere filter.
         use_dot_filter,
         # Wind at nodes (pass empty arrays + has_wind=False to disable)
         has_wind, wind_wu_nodes, wind_wv_nodes, wind_frame_times_w,
         # Routing params
         tack_penalty_s, tack_threshold_deg,
+        gybe_penalty_s, gybe_threshold_deg,
         n_sectors, start_sentinel, max_iterations,
         # Rounding mark barriers (pass n_barriers=0 and empty arrays to disable)
         n_barriers, bar_x1, bar_y1, bar_x2, bar_y2,
@@ -1800,6 +1911,8 @@ if _NUMBA_AVAILABLE:
             Boat speeds (knots) at each (TWA, TWS) grid point.
         polar_min_twa : float
             Headings within this many degrees of dead upwind give zero speed.
+        polar_max_twa : float
+            Headings deeper than this TWA give zero speed.
         sweep_hx, sweep_hy : shape (n_sweep,)
             Pre-computed unit vectors (east, north) for every candidate
             heading.  Typically the module-level ``_SWEEP_HX/_SWEEP_HY``
@@ -1821,14 +1934,10 @@ if _NUMBA_AVAILABLE:
         polar_dense_max_tws : int
             Maximum TWS column index (= number of 1-kt TWS steps covered).
         use_dot_filter : bool
-            When True, skip any candidate heading whose unit vector has a
-            negative dot product with ``d_hat`` (the desired ground track).
-            This discards the entire backward hemisphere (~90 headings) with a
-            single multiply-add per candidate before doing any polar work.
-            Can be combined with ``polar_coarse_step`` and
-            ``use_dense_polar``.  The filter is exact — no valid heading is
-            discarded — because a heading pointing away from the target can
-            never produce positive SOG along the track.
+            Experimental optimization: skip candidate headings whose boat
+            vector points away from ``d_hat``.  Keep disabled unless a route
+            has been validated against the exact sweep because drift/no-go
+            constraints can make backward boat headings relevant.
         has_wind : bool
             Whether wind arrays are populated and should be used.
         wind_wu_nodes, wind_wv_nodes : shape (n_wf, n_nodes)
@@ -1884,6 +1993,7 @@ if _NUMBA_AVAILABLE:
         # Parent pointers for path reconstruction after the search completes.
         came_from_node = np.full((n_nodes, n_buckets), -1, dtype=np.int32)
         came_from_bucket = np.full((n_nodes, n_buckets), -1, dtype=np.int32)
+        arrival_heading = np.full((n_nodes, n_buckets), np.nan)
 
         best_cost[start_node, start_sentinel] = 0.0
         arrival_time[start_node, start_sentinel] = start_time_s
@@ -2066,6 +2176,8 @@ if _NUMBA_AVAILABLE:
 
                 # ----- Edge cost: find the best achievable SOG along d_hat -----
                 best_sog = 0.0
+                best_heading_rad = np.arctan2(d_hat_y, d_hat_x)
+                wind_from_rad = 0.0
 
                 if has_polar:
                     tws_ms = np.sqrt(wu_mid * wu_mid + wv_mid * wv_mid)
@@ -2080,6 +2192,7 @@ if _NUMBA_AVAILABLE:
                             s = np.sqrt(bs2 - c_perp_sq) + c_par
                             if s > 0.01:
                                 best_sog = s
+                                best_heading_rad = np.arctan2(d_hat_y, d_hat_x)
                     else:
                         # Direction the wind blows FROM (radians), used to compute TWA.
                         wind_from_rad = np.arctan2(-wv_mid, -wu_mid)
@@ -2100,8 +2213,7 @@ if _NUMBA_AVAILABLE:
 
                             # --- Pass 1: coarse sweep (dense) ---
                             for h in range(0, n_sweep, coarse_step):
-                                # Forward-hemisphere filter: a heading pointing away
-                                # from d_hat can never produce positive SOG along it.
+                                # Experimental forward-hemisphere filter.
                                 if use_dot_filter and (sweep_hx[h] * d_hat_x +
                                                        sweep_hy[h] * d_hat_y) < 0.0:
                                     continue
@@ -2109,7 +2221,7 @@ if _NUMBA_AVAILABLE:
                                 delta_h = (delta_h + PI) % (2.0 * PI) - PI
                                 twa_deg = np.abs(delta_h) * (180.0 / PI)
 
-                                if twa_deg < polar_min_twa:
+                                if twa_deg < polar_min_twa or twa_deg > polar_max_twa:
                                     V_ms = 0.0
                                 else:
                                     # Direct index — no search needed.
@@ -2136,6 +2248,7 @@ if _NUMBA_AVAILABLE:
                                     if sog_h > best_sog:
                                         best_sog = sog_h
                                         best_idx = h
+                                        best_heading_rad = sweep_rads[h]
 
                             # --- Pass 2: refine (dense) ---
                             # Dot filter not applied here: the refine window is small
@@ -2147,7 +2260,7 @@ if _NUMBA_AVAILABLE:
                                     delta_h = (delta_h + PI) % (2.0 * PI) - PI
                                     twa_deg = np.abs(delta_h) * (180.0 / PI)
 
-                                    if twa_deg < polar_min_twa:
+                                    if twa_deg < polar_min_twa or twa_deg > polar_max_twa:
                                         V_ms = 0.0
                                     else:
                                         i_d = int(twa_deg)
@@ -2172,6 +2285,7 @@ if _NUMBA_AVAILABLE:
                                     if sog_h > 0.01 and drift_h <= 0.10 * prog:
                                         if sog_h > best_sog:
                                             best_sog = sog_h
+                                            best_heading_rad = sweep_rads[h]
 
                         else:
                             # ---- Sparse path: binary search on TWS then TWA ----
@@ -2208,7 +2322,7 @@ if _NUMBA_AVAILABLE:
                                 delta_h = (delta_h + PI) % (2.0 * PI) - PI  # wrap to [-π, π]
                                 twa_deg = np.abs(delta_h) * (180.0 / PI)
 
-                                if twa_deg < polar_min_twa:
+                                if twa_deg < polar_min_twa or twa_deg > polar_max_twa:
                                     # Too close to dead upwind — polar gives zero speed.
                                     V_ms = 0.0
                                 else:
@@ -2254,6 +2368,7 @@ if _NUMBA_AVAILABLE:
                                     if sog_h > best_sog:
                                         best_sog = sog_h
                                         best_idx = h
+                                        best_heading_rad = sweep_rads[h]
 
                             # --- Pass 2: refine around the coarse winner ---
                             # Re-evaluate the (2*coarse_step - 1) headings bracketing
@@ -2265,7 +2380,7 @@ if _NUMBA_AVAILABLE:
                                     delta_h = (delta_h + PI) % (2.0 * PI) - PI
                                     twa_deg = np.abs(delta_h) * (180.0 / PI)
 
-                                    if twa_deg < polar_min_twa:
+                                    if twa_deg < polar_min_twa or twa_deg > polar_max_twa:
                                         V_ms = 0.0
                                     else:
                                         twa_c = twa_deg
@@ -2301,6 +2416,7 @@ if _NUMBA_AVAILABLE:
                                     if sog_h > 0.01 and drift_h <= 0.10 * prog:
                                         if sog_h > best_sog:
                                             best_sog = sog_h
+                                            best_heading_rad = sweep_rads[h]
 
                 else:
                     # --- Fixed-speed mode (no polar): crabbing formula ---
@@ -2317,20 +2433,39 @@ if _NUMBA_AVAILABLE:
                         s = np.sqrt(bs2 - c_perp_sq) + c_par
                         if s > 0.01:
                             best_sog = s
+                            best_heading_rad = np.arctan2(d_hat_y, d_hat_x)
 
                 if best_sog <= 0.01:
                     continue                         # edge is impassable; skip
                 dt = dist / best_sog                # travel time for this edge (seconds)
 
-                # --- Tack penalty ---
-                # Apply a time penalty when the boat changes direction by more than
-                # tack_threshold_deg between the incoming and outgoing sectors.
+                # --- Maneuver penalty ---
+                # In polar mode, catch real tack/gybe side flips even when COG
+                # changes are split across several small sector steps.  The COG
+                # threshold remains a fallback for fixed-speed mode.
                 penalty = 0.0
-                if tack_penalty_s > 0.0 and bucket_in != start_sentinel:
+                if bucket_in != start_sentinel:
                     diff = abs(bucket_in - sector_out)
                     if diff > n_sectors // 2:
                         diff = n_sectors - diff      # shortest angular distance across sectors
-                    if float(diff) * SECTOR_WIDTH > tack_threshold_deg:
+                    angle_diff = float(diff) * SECTOR_WIDTH
+
+                    if has_polar and has_wind:
+                        prev_heading = arrival_heading[node, bucket_in]
+                        if not np.isnan(prev_heading):
+                            delta_prev = prev_heading - wind_from_rad
+                            delta_prev = (delta_prev + PI) % (2.0 * PI) - PI
+                            delta_new = best_heading_rad - wind_from_rad
+                            delta_new = (delta_new + PI) % (2.0 * PI) - PI
+                            if delta_prev * delta_new < 0.0:
+                                prev_twa = np.abs(delta_prev) * (180.0 / PI)
+                                new_twa = np.abs(delta_new) * (180.0 / PI)
+                                if prev_twa >= gybe_threshold_deg and new_twa >= gybe_threshold_deg:
+                                    penalty = gybe_penalty_s
+                                elif prev_twa <= 90.0 and new_twa <= 90.0:
+                                    penalty = tack_penalty_s
+
+                    if penalty <= 0.0 and tack_penalty_s > 0.0 and angle_diff > tack_threshold_deg:
                         penalty = tack_penalty_s
 
                 new_cost = cost + dt + penalty
@@ -2340,6 +2475,7 @@ if _NUMBA_AVAILABLE:
                     arrival_time[nb, sector_out] = arr_t + dt + penalty
                     came_from_node[nb, sector_out] = node
                     came_from_bucket[nb, sector_out] = bucket_in
+                    arrival_heading[nb, sector_out] = best_heading_rad
 
                     if heap_size < max_heap:
                         hdx2 = goal_x - node_x[nb]
@@ -2366,11 +2502,12 @@ if _NUMBA_AVAILABLE:
                     else:
                         # Frontier overflow: abort instead of silently dropping states.
                         return (best_cost, arrival_time,
-                                came_from_node, came_from_bucket, -2)
+                                came_from_node, came_from_bucket,
+                                arrival_heading, -2)
 
         # explored >= 0 : normal exit (goal reached or graph exhausted)
         # explored == -1: max_iterations cap hit
-        return best_cost, arrival_time, came_from_node, came_from_bucket, explored
+        return best_cost, arrival_time, came_from_node, came_from_bucket, arrival_heading, explored
 
 else:
     _sector_astar_jit = None
@@ -3809,6 +3946,8 @@ class SectorRouter:
                  wind: 'WindField | None' = None,
                  tack_penalty_s: float = 90.0,
                  tack_threshold_deg: float = 50.0,
+                 gybe_penalty_s: float | None = None,
+                 gybe_threshold_deg: float = 120.0,
                  max_edge_m: float = 2000.0,
                  min_edge_m: float = 50.0,
                  k_candidates: int = 50,
@@ -3830,6 +3969,10 @@ class SectorRouter:
             Time penalty (seconds) for course changes > tack_threshold_deg.
         tack_threshold_deg : float
             Minimum angle change that triggers tack penalty.
+        gybe_penalty_s : float, optional
+            Time penalty for wind-relative gybes. Defaults to tack_penalty_s.
+        gybe_threshold_deg : float
+            TWA at or above this angle is treated as downwind for gybe detection.
         max_edge_m : float
             Maximum edge length in meters.
         min_edge_m : float
@@ -3850,10 +3993,10 @@ class SectorRouter:
             both the TWS bracket search (per edge) and the TWA bracket search
             (per heading) from the Numba hot loop.  Default False.
         use_dot_filter : bool, optional
-            When True, skip any candidate heading whose unit vector has a
-            negative dot product with the desired ground track, pruning the
-            backward hemisphere (~90 of 180 headings) with a single
-            multiply-add.  Works with both dense and sparse polar paths.
+            Experimental: skip candidate headings whose boat vector has a
+            negative dot product with the desired ground track.  Works with
+            both dense and sparse polar paths, but production YAMLs keep it
+            disabled until route-specific validation proves equivalence.
             Default False.
         """
         self.cf = current_field
@@ -3861,6 +4004,8 @@ class SectorRouter:
         self.wind = wind
         self.tack_penalty_s = tack_penalty_s
         self.tack_threshold_deg = tack_threshold_deg
+        self.gybe_penalty_s = tack_penalty_s if gybe_penalty_s is None else gybe_penalty_s
+        self.gybe_threshold_deg = gybe_threshold_deg
         self.max_edge_m = max_edge_m
         self.min_edge_m = min_edge_m
         self.k_candidates = k_candidates
@@ -3918,7 +4063,7 @@ class SectorRouter:
             self._polar_dense_max_tws = 0
             self._use_dense_polar = False
 
-        # Dot-product forward-hemisphere filter (works with both dense and sparse paths)
+        # Dot-product forward-hemisphere filter (experimental).
         self._use_dot_filter = bool(use_dot_filter)
         if self._use_dot_filter:
             mode = "dense" if self._use_dense_polar else "sparse"
@@ -4030,6 +4175,111 @@ class SectorRouter:
             diff = self.N_SECTORS - diff
         return diff * self.SECTOR_WIDTH
 
+    def _maneuver_penalty(self, prev_heading_rad, new_heading_rad,
+                          x_mid, y_mid, elapsed_s, angle_diff_deg):
+        """Classify wind-relative maneuvers; fall back to COG turn penalty."""
+        if (self._use_polar and self.wind is not None
+                and np.isfinite(prev_heading_rad)):
+            wu, wv = self.wind.query(x_mid, y_mid, elapsed_s=elapsed_s)
+            if np.hypot(wu, wv) > 1e-6:
+                wind_from = np.arctan2(-wv, -wu)
+                d_prev = (prev_heading_rad - wind_from + np.pi) % (2 * np.pi) - np.pi
+                d_new = (new_heading_rad - wind_from + np.pi) % (2 * np.pi) - np.pi
+                if d_prev * d_new < 0.0:
+                    prev_twa = abs(np.degrees(d_prev))
+                    new_twa = abs(np.degrees(d_new))
+                    if (prev_twa >= self.gybe_threshold_deg
+                            and new_twa >= self.gybe_threshold_deg):
+                        return self.gybe_penalty_s
+                    if prev_twa <= 90.0 and new_twa <= 90.0:
+                        return self.tack_penalty_s
+
+        if self.tack_penalty_s > 0 and angle_diff_deg > self.tack_threshold_deg:
+            return self.tack_penalty_s
+        return 0.0
+
+    def _compute_maneuver_diagnostics(self, raw_path, raw_times, raw_headings):
+        """Return tack/gybe/turn diagnostics along the raw A* path."""
+        out = {
+            "maneuver_idx": np.empty(0, dtype=np.int32),
+            "maneuver_type": np.empty(0, dtype=np.int8),  # 1=tack, 2=gybe, 3=turn
+            "maneuver_time_s": np.empty(0, dtype=np.float64),
+            "maneuver_x": np.empty(0, dtype=np.float64),
+            "maneuver_y": np.empty(0, dtype=np.float64),
+            "maneuver_turn_deg": np.empty(0, dtype=np.float64),
+            "maneuver_twa_before_deg": np.empty(0, dtype=np.float64),
+            "maneuver_twa_after_deg": np.empty(0, dtype=np.float64),
+            "maneuver_tack_count": np.int32(0),
+            "maneuver_gybe_count": np.int32(0),
+            "maneuver_turn_count": np.int32(0),
+        }
+        if len(raw_path) < 3:
+            return out
+
+        headings = np.asarray(raw_headings, dtype=np.float64)
+        idxs, types, times = [], [], []
+        xs, ys, turns = [], [], []
+        twa_before, twa_after = [], []
+
+        for i in range(1, len(raw_path) - 1):
+            h0 = headings[i]
+            h1 = headings[i + 1]
+            if not (np.isfinite(h0) and np.isfinite(h1)):
+                continue
+            d = abs(np.degrees(((h1 - h0 + np.pi) % (2 * np.pi)) - np.pi))
+            mtype = 0
+            tb = np.nan
+            ta = np.nan
+
+            if self._use_polar and self.wind is not None:
+                x = self.node_x[raw_path[i]]
+                y = self.node_y[raw_path[i]]
+                wu, wv = self.wind.query(x, y, elapsed_s=raw_times[i])
+                if np.hypot(wu, wv) > 1e-6:
+                    wind_from = np.arctan2(-wv, -wu)
+                    delta0 = (h0 - wind_from + np.pi) % (2 * np.pi) - np.pi
+                    delta1 = (h1 - wind_from + np.pi) % (2 * np.pi) - np.pi
+                    tb = abs(np.degrees(delta0))
+                    ta = abs(np.degrees(delta1))
+                    if delta0 * delta1 < 0.0:
+                        if tb >= self.gybe_threshold_deg and ta >= self.gybe_threshold_deg:
+                            mtype = 2
+                        elif tb <= 90.0 and ta <= 90.0:
+                            mtype = 1
+
+            if mtype == 0 and d > self.tack_threshold_deg:
+                mtype = 3
+            if mtype == 0:
+                continue
+
+            idxs.append(i)
+            types.append(mtype)
+            times.append(float(raw_times[i]))
+            xs.append(float(self.node_x[raw_path[i]]))
+            ys.append(float(self.node_y[raw_path[i]]))
+            turns.append(float(d))
+            twa_before.append(float(tb))
+            twa_after.append(float(ta))
+
+        if not idxs:
+            return out
+
+        type_arr = np.asarray(types, dtype=np.int8)
+        out.update({
+            "maneuver_idx": np.asarray(idxs, dtype=np.int32),
+            "maneuver_type": type_arr,
+            "maneuver_time_s": np.asarray(times, dtype=np.float64),
+            "maneuver_x": np.asarray(xs, dtype=np.float64),
+            "maneuver_y": np.asarray(ys, dtype=np.float64),
+            "maneuver_turn_deg": np.asarray(turns, dtype=np.float64),
+            "maneuver_twa_before_deg": np.asarray(twa_before, dtype=np.float64),
+            "maneuver_twa_after_deg": np.asarray(twa_after, dtype=np.float64),
+            "maneuver_tack_count": np.int32(np.sum(type_arr == 1)),
+            "maneuver_gybe_count": np.int32(np.sum(type_arr == 2)),
+            "maneuver_turn_count": np.int32(np.sum(type_arr == 3)),
+        })
+        return out
+
     def _line_of_sight(self, x1, y1, x2, y2):
         """Check if a straight line between two points crosses land.
 
@@ -4041,8 +4291,7 @@ class SectorRouter:
             frac = i / n
             mx = x1 + frac * (x2 - x1)
             my = y1 + frac * (y2 - y1)
-            cu, _ = self.cf.query(mx, my, elapsed_s=0.0)
-            if np.isnan(cu):
+            if not self.cf.is_water(mx, my):
                 return False
         return True
 
@@ -4279,11 +4528,10 @@ class SectorRouter:
             fracs = np.linspace(0.0, 1.0, dense_n + 2)[1:-1]
             sx = x1 + fracs * (x2 - x1)
             sy = y1 + fracs * (y2 - y1)
-            cu_dense, _ = self.cf.query(np.asarray(sx, dtype=np.float64),
-                                        np.asarray(sy, dtype=np.float64),
-                                        elapsed_s=t_start)
-            cu_dense = np.atleast_1d(cu_dense)
-            land_frac = float(np.isnan(cu_dense).sum()) / max(1, len(cu_dense))
+            water_dense = self.cf.is_water(np.asarray(sx, dtype=np.float64),
+                                           np.asarray(sy, dtype=np.float64))
+            water_dense = np.atleast_1d(water_dense)
+            land_frac = float((~water_dense).sum()) / max(1, len(water_dense))
             sailable = (devs.max() <= tol) and (land_frac <= 0.10)
 
             if sailable:
@@ -4341,9 +4589,8 @@ class SectorRouter:
             fracs = np.linspace(0.0, 1.0, n_dense + 2)[1:-1]
             sx = np.asarray(x1 + fracs * (x2 - x1), dtype=np.float64)
             sy = np.asarray(y1 + fracs * (y2 - y1), dtype=np.float64)
-            cu, _ = self.cf.query(sx, sy, elapsed_s=0.0)
-            cu = np.atleast_1d(cu)
-            return float(np.isnan(cu).sum()) / max(1, len(cu)) <= 0.10
+            water = np.atleast_1d(self.cf.is_water(sx, sy))
+            return float((~water).sum()) / max(1, len(water)) <= 0.10
 
         def _strip_redundant(path):
             """Iteratively drop two kinds of redundant waypoints:
@@ -4712,11 +4959,13 @@ class SectorRouter:
                 polar_twss = np.ascontiguousarray(p._twss.astype(np.float64))
                 polar_speeds = np.ascontiguousarray(p._speeds.astype(np.float64))
                 polar_min_twa = float(p.minimum_twa)
+                polar_max_twa = float(p.maximum_twa)
             else:
                 polar_twas = np.empty(0, dtype=np.float64)
                 polar_twss = np.empty(0, dtype=np.float64)
                 polar_speeds = np.empty((0, 0), dtype=np.float64)
                 polar_min_twa = 0.0
+                polar_max_twa = 180.0
 
             has_wind = self._numba_wind_ready
             if has_wind:
@@ -4785,7 +5034,7 @@ class SectorRouter:
                         self.cf.delaunay, self.cf.valid_triangle,
                         corridor, self.N_SECTORS, self.SECTOR_WIDTH,
                         self.k_candidates, self.min_edge_m, self.max_edge_m,
-                        self._los_samples,
+                        self._los_samples, is_water_func=self.cf.is_water,
                     )
                     n_edges = len(g_tgt)
                     dt_build = _time.monotonic() - t0
@@ -4797,7 +5046,7 @@ class SectorRouter:
                           f"(built in {dt_build:.2f}s)")
 
                 t0 = _time.monotonic()
-                best_cost_arr, arrival_arr, cf_node_arr, cf_bucket_arr, explored = \
+                best_cost_arr, arrival_arr, cf_node_arr, cf_bucket_arr, heading_arr, explored = \
                     _sector_astar_jit(
                         g_off, g_tgt, g_dis, g_sec,
                         self.node_x, self.node_y,
@@ -4806,7 +5055,7 @@ class SectorRouter:
                         start_node, end_node, start_time_s,
                         boat_speed, max_speed,
                         has_polar, polar_twas, polar_twss, polar_speeds,
-                        polar_min_twa,
+                        polar_min_twa, polar_max_twa,
                         _SWEEP_HX, _SWEEP_HY, _SWEEP_RADS, len(_SWEEP_HX),
                         self._polar_sweep_coarse_step,
                         self._use_dense_polar, self._polar_dense_arr,
@@ -4814,6 +5063,7 @@ class SectorRouter:
                         self._use_dot_filter,
                         has_wind, wind_wu, wind_wv, wind_ft,
                         self.tack_penalty_s, self.tack_threshold_deg,
+                        self.gybe_penalty_s, self.gybe_threshold_deg,
                         self.N_SECTORS, self.START_SENTINEL, max_iterations,
                         _n_barriers, _bar_x1, _bar_y1, _bar_x2, _bar_y2,
                     )
@@ -4848,11 +5098,13 @@ class SectorRouter:
 
             raw_path = []
             raw_times = []
+            raw_headings = []
             node = end_node
             bucket = final_sector
             while True:
                 raw_path.append(node)
                 raw_times.append(float(arrival_arr[node, bucket]))
+                raw_headings.append(float(heading_arr[node, bucket]))
                 pn = int(cf_node_arr[node, bucket])
                 if pn < 0:
                     break
@@ -4861,6 +5113,7 @@ class SectorRouter:
                 bucket = pb
             raw_path.reverse()
             raw_times.reverse()
+            raw_headings.reverse()
 
             # All nodes that were reached by A* (any bucket with finite cost)
             explored_mask = np.any(best_cost_arr < np.inf, axis=1)
@@ -4877,9 +5130,11 @@ class SectorRouter:
             best_cost = {}
             came_from = {}
             arrival_time_d = {}
+            arrival_heading_d = {}
             start_state = (start_node, self.START_SENTINEL)
             best_cost[start_state] = 0.0
             arrival_time_d[start_state] = start_time_s
+            arrival_heading_d[start_state] = np.nan
             open_set = [(self._heuristic(start_node, goal_x, goal_y, max_speed),
                          0.0, start_node, self.START_SENTINEL)]
             explored = 0
@@ -4915,15 +5170,21 @@ class SectorRouter:
                     dt = self._edge_cost(node, neighbor, dist, arr_t)
                     if dt == INF:
                         continue
-                    penalty = 0.0
                     angle_diff = self._sector_angle_diff(sector_in, sector_out)
-                    if self.tack_penalty_s > 0 and angle_diff > self.tack_threshold_deg:
-                        penalty = self.tack_penalty_s
+                    new_heading = np.arctan2(
+                        self.node_y[neighbor] - self.node_y[node],
+                        self.node_x[neighbor] - self.node_x[node])
+                    prev_heading = arrival_heading_d.get(state, np.nan)
+                    mx = 0.5 * (self.node_x[node] + self.node_x[neighbor])
+                    my = 0.5 * (self.node_y[node] + self.node_y[neighbor])
+                    penalty = self._maneuver_penalty(
+                        prev_heading, new_heading, mx, my, arr_t, angle_diff)
                     new_cost = cost + dt + penalty
                     new_state = (neighbor, sector_out)
                     if new_cost < best_cost.get(new_state, INF):
                         best_cost[new_state] = new_cost
                         arrival_time_d[new_state] = arr_t + dt + penalty
+                        arrival_heading_d[new_state] = new_heading
                         came_from[new_state] = state
                         h = self._heuristic(neighbor, goal_x, goal_y, max_speed)
                         heapq.heappush(open_set,
@@ -4939,11 +5200,13 @@ class SectorRouter:
             t0 = _time.monotonic()
             raw_path = []
             raw_times = []
+            raw_headings = []
             state = (end_node, final_sector)
             while state in came_from or state == start_state:
                 node, _ = state
                 raw_path.append(node)
                 raw_times.append(arrival_time_d.get(state, start_time_s))
+                raw_headings.append(arrival_heading_d.get(state, np.nan))
                 if state == start_state:
                     break
                 state = came_from.get(state)
@@ -4951,6 +5214,7 @@ class SectorRouter:
                     break
             raw_path.reverse()
             raw_times.reverse()
+            raw_headings.reverse()
             _perf['reconstruct'] = _time.monotonic() - t0
 
         # ------------------------------------------------------------------
@@ -5049,6 +5313,7 @@ class SectorRouter:
         _dbg['raw_x'] = self.node_x[raw_ids]
         _dbg['raw_y'] = self.node_y[raw_ids]
         _dbg['raw_arrival_s'] = np.array(raw_times, dtype=np.float64)
+        _dbg['raw_best_heading_rad'] = np.array(raw_headings, dtype=np.float64)
 
         raw_ll = np.empty((len(raw_ids), 2))
         for ri, nid in enumerate(raw_ids):
@@ -5099,6 +5364,8 @@ class SectorRouter:
             with np.errstate(divide='ignore', invalid='ignore'):
                 _dbg['raw_sog_kt'] = np.where(
                     raw_dt > 0, raw_dd / raw_dt * MS_TO_KNOTS, 0.0)
+
+        _dbg.update(self._compute_maneuver_diagnostics(raw_path, raw_times, raw_headings))
 
         # ---- Smoothed path (after smooth + stub + tack filter, before leg timing) ----
         smooth_ids = np.array(smooth_ids_before_timing, dtype=np.int32)
@@ -5287,7 +5554,7 @@ def plot_route(route, xs, ys, water_mask, current_field,
     xx, yy = np.meshgrid(xs, ys)
     margin = 500
 
-    u_grid, v_grid = current_field.query_grid(xs, ys, elapsed_s=elapsed_s)
+    u_grid, v_grid = current_field.query_binned_grid(xs, ys, elapsed_s=elapsed_s)
     speed_grid = np.sqrt(u_grid**2 + v_grid**2) * MS_TO_KNOTS
     speed_grid[~water_mask] = np.nan
 
@@ -5307,7 +5574,7 @@ def plot_route(route, xs, ys, water_mask, current_field,
             if rx:
                 ax.plot(rx, ry, 'o', color='#e63946', markersize=5, zorder=6,
                         markeredgecolor='white', markeredgewidth=1,
-                        label='Tack points' if show_legend else None)
+                        label='Route waypoints' if show_legend else None)
         else:
             rx = [p[0] for p in route.waypoints_utm]
             ry = [p[1] for p in route.waypoints_utm]
@@ -5315,6 +5582,23 @@ def plot_route(route, xs, ys, water_mask, current_field,
                     label='Optimal route' if show_legend else None,
                     path_effects=[pe.Stroke(linewidth=5, foreground='white'),
                                   pe.Normal()])
+
+        if route.debug:
+            mtype = np.asarray(route.debug.get('maneuver_type', []), dtype=np.int8)
+            mx = np.asarray(route.debug.get('maneuver_x', []), dtype=np.float64)
+            my = np.asarray(route.debug.get('maneuver_y', []), dtype=np.float64)
+            tack_mask = mtype == 1
+            if np.any(tack_mask):
+                ax.plot(mx[tack_mask], my[tack_mask], 'o', color='black',
+                        markersize=7, zorder=9, markeredgecolor='white',
+                        markeredgewidth=1.0,
+                        label='Detected tacks' if show_legend else None)
+            gybe_mask = mtype == 2
+            if np.any(gybe_mask):
+                ax.plot(mx[gybe_mask], my[gybe_mask], 'D', color='black',
+                        markersize=7, zorder=9, markeredgecolor='white',
+                        markeredgewidth=1.0,
+                        label='Detected gybes' if show_legend else None)
 
         sx, sy = transformer.transform(start_latlon[1], start_latlon[0])
         ex, ey = transformer.transform(end_latlon[1], end_latlon[0])
@@ -5372,7 +5656,8 @@ def plot_route(route, xs, ys, water_mask, current_field,
 
         _setup_ax(ax, 'Sail Routing -- Time-Optimal Path Through Currents')
 
-        speed_max = np.nanmax(speed_grid) if np.any(~np.isnan(speed_grid)) else 1.0
+        speed_max = (np.nanpercentile(speed_grid, 95)
+                     if np.any(~np.isnan(speed_grid)) else 1.0)
         im = ax.pcolormesh(xs, ys, speed_grid,
                            cmap='cividis', alpha=0.35, shading='auto',
                            vmin=0, vmax=max(speed_max, 0.5), zorder=1)
@@ -5388,19 +5673,19 @@ def plot_route(route, xs, ys, water_mask, current_field,
 
         mag = np.sqrt(u_sub**2 + v_sub**2)
         mag_safe = np.where(mag < 1e-8, 1.0, mag)
-        u_norm = u_sub / mag_safe
-        v_norm = v_sub / mag_safe
+        u_arrow = u_sub / mag_safe
+        v_arrow = v_sub / mag_safe
         visible = (mag > 0.02) & ~np.isnan(spd_sub)
-        u_norm[~visible] = np.nan
-        v_norm[~visible] = np.nan
+        u_arrow[~visible] = np.nan
+        v_arrow[~visible] = np.nan
 
-        arrow_scale = 1.0 / (step * (xs[1] - xs[0])) * 0.7
+        arrow_scale = 1.0 / (step * (xs[1] - xs[0])) * 1.0
         ax.quiver(
-            xx_sub, yy_sub, u_norm, v_norm, spd_sub,
-            cmap='plasma', clim=(0, max(speed_max, 0.5)),
+            xx_sub, yy_sub, u_arrow, v_arrow,
+            color="black",
             scale=arrow_scale, scale_units='xy',
             width=0.004, headwidth=4, headlength=5, headaxislength=4,
-            alpha=0.85, zorder=3, edgecolors='#333333', linewidth=0.3,
+            alpha=0.75, zorder=2.5,
         )
 
         _draw_shoreline(ax)
@@ -5434,7 +5719,8 @@ def plot_route(route, xs, ys, water_mask, current_field,
         _setup_ax(ax_cur, 'Ocean Current')
         _setup_ax(ax_wind, 'Wind')
 
-        speed_max = np.nanmax(speed_grid) if np.any(~np.isnan(speed_grid)) else 1.0
+        speed_max = (np.nanpercentile(speed_grid, 95)
+                     if np.any(~np.isnan(speed_grid)) else 1.0)
         im_cur = ax_cur.pcolormesh(xs, ys, speed_grid,
                                    cmap='cividis', alpha=0.35, shading='auto',
                                    vmin=0, vmax=max(speed_max, 0.5), zorder=1)
@@ -5450,19 +5736,19 @@ def plot_route(route, xs, ys, water_mask, current_field,
 
         mag = np.sqrt(u_sub**2 + v_sub**2)
         mag_safe = np.where(mag < 1e-8, 1.0, mag)
-        u_norm = u_sub / mag_safe
-        v_norm = v_sub / mag_safe
+        u_arrow = u_sub / mag_safe
+        v_arrow = v_sub / mag_safe
         visible = (mag > 0.02) & ~np.isnan(spd_sub)
-        u_norm[~visible] = np.nan
-        v_norm[~visible] = np.nan
+        u_arrow[~visible] = np.nan
+        v_arrow[~visible] = np.nan
 
-        arrow_scale = 1.0 / (step * (xs[1] - xs[0])) * 0.7
+        arrow_scale = 1.0 / (step * (xs[1] - xs[0])) * 1.0
         ax_cur.quiver(
-            xx_sub, yy_sub, u_norm, v_norm, spd_sub,
-            cmap='plasma', clim=(0, max(speed_max, 0.5)),
+            xx_sub, yy_sub, u_arrow, v_arrow,
+            color="black",
             scale=arrow_scale, scale_units='xy',
             width=0.004, headwidth=4, headlength=5, headaxislength=4,
-            alpha=0.85, zorder=3, edgecolors='#333333', linewidth=0.3,
+            alpha=0.75, zorder=2.5,
         )
 
         wu_grid = np.zeros_like(u_grid)
@@ -5499,11 +5785,12 @@ def plot_route(route, xs, ys, water_mask, current_field,
         wv_norm[~wvisible] = np.nan
 
         ax_wind.quiver(
-            xx_sub, yy_sub, wu_norm, wv_norm, wspd_sub,
-            cmap='Reds', clim=(0, max(wind_max, 5.0)),
-            scale=arrow_scale, scale_units='xy',
+            xx_sub, yy_sub, wu_norm, wv_norm,
+            color="black",
+            scale=1.0 / (step * (xs[1] - xs[0])) * 1.0,
+            scale_units='xy',
             width=0.004, headwidth=4, headlength=5, headaxislength=4,
-            alpha=0.85, zorder=3, edgecolors='#333333', linewidth=0.3,
+            alpha=0.75, zorder=2.5,
         )
 
         _draw_shoreline(ax_cur)
@@ -5789,15 +6076,26 @@ def main():
                         help="Path to polar CSV (TWA_deg, TWS_kt, BoatSpeed_kt)")
     parser.add_argument("--minimum-twa", type=float, default=0.0,
                         help="No-go zone: zero boat speed below this TWA (degrees)")
+    parser.add_argument("--maximum-twa", type=float, default=180.0,
+                        help="Downwind no-go: zero boat speed above this TWA (degrees)")
     parser.add_argument("--wind-speed", type=float, default=None,
                         help="Constant true wind speed in knots")
     parser.add_argument("--wind-direction", type=float, default=None,
                         help="Constant wind direction in degrees, "
                              "meteorological 'from' convention (CW from north)")
-    parser.add_argument("--tack-penalty", type=float, default=60.0,
+    parser.add_argument("--tack-penalty", type=float, default=90.0,
                         help="Time penalty in seconds added whenever the boat "
-                             "makes a course change exceeding 90 degrees "
-                             "(default: 60).  Set 0 to disable.")
+                             "makes a tack-scale course change (default: 90). "
+                             "Set 0 to disable.")
+    parser.add_argument("--tack-threshold", type=float, default=50.0,
+                        help="COG turn threshold in degrees for fallback tack "
+                             "penalty detection (default: 50).")
+    parser.add_argument("--gybe-penalty", type=float, default=None,
+                        help="Time penalty for wind-relative gybes in seconds "
+                             "(default: same as --tack-penalty).")
+    parser.add_argument("--gybe-threshold", type=float, default=120.0,
+                        help="TWA threshold for downwind gybe detection "
+                             "(default: 120).")
     parser.add_argument("--no-cache", action="store_true",
                         help="Skip SSCOFS cache, always download fresh")
     parser.add_argument("--save", type=str, default=None,
@@ -5826,8 +6124,14 @@ def main():
     # ---- Polar / wind ----
     polar = None
     if args.polar:
-        polar = PolarTable(args.polar, minimum_twa=args.minimum_twa)
-        nogo = f", no-go < {args.minimum_twa:.0f}°" if args.minimum_twa > 0 else ""
+        polar = PolarTable(args.polar, minimum_twa=args.minimum_twa,
+                           maximum_twa=args.maximum_twa)
+        zones = []
+        if args.minimum_twa > 0:
+            zones.append(f"TWA < {args.minimum_twa:.0f}°")
+        if args.maximum_twa < 180:
+            zones.append(f"TWA > {args.maximum_twa:.0f}°")
+        nogo = f", no-go {' and '.join(zones)}" if zones else ""
         print(f"Polar loaded: max speed {polar.max_speed_kt:.1f} kt{nogo}")
 
     wind = None
@@ -5842,7 +6146,10 @@ def main():
 
     print(f"Using SectorRouter ({SectorRouter.N_SECTORS}-sector heading-binned connectivity)")
     router = SectorRouter(cf, boat, wind=wind,
-                          tack_penalty_s=args.tack_penalty)
+                          tack_penalty_s=args.tack_penalty,
+                          tack_threshold_deg=args.tack_threshold,
+                          gybe_penalty_s=args.gybe_penalty,
+                          gybe_threshold_deg=args.gybe_threshold)
 
     start = (args.start_lat, args.start_lon)
     end = (args.end_lat, args.end_lon)
