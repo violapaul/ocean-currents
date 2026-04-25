@@ -113,7 +113,7 @@ if ! aws lambda get-function-url-config --function-name "$LAMBDA_FN" --region "$
   aws lambda create-function-url-config \
     --function-name "$LAMBDA_FN" \
     --auth-type NONE \
-    --cors '{"AllowOrigins":["*"],"AllowMethods":["POST","OPTIONS"],"AllowHeaders":["Content-Type"],"MaxAge":300}' \
+    --cors '{"AllowOrigins":["*"],"AllowMethods":["POST"],"AllowHeaders":["Content-Type"],"MaxAge":300}' \
     --region "$REGION" >/dev/null
   # Public URL must also have an explicit invoke permission for principal *.
   aws lambda add-permission \

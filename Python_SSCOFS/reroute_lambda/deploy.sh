@@ -30,8 +30,11 @@ mode="${1:-deploy}"
 echo "==> Build context: $REPO_ROOT"
 echo "==> ECR URI: ${ECR_URI}:${IMAGE_TAG}"
 
-# 1. Build
+# 1. Build. --provenance/--sbom disabled because Lambda's CreateFunction
+# rejects OCI-format manifests (the default for buildx attestations);
+# turning them off makes buildx emit Docker-v2-schema-2 media types.
 docker build \
+  --provenance=false --sbom=false \
   --platform linux/amd64 \
   -f OceanCurrents/Python_SSCOFS/reroute_lambda/Dockerfile \
   -t "${REPO}:${IMAGE_TAG}" \

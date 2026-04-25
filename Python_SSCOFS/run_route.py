@@ -79,6 +79,7 @@ YAML schema:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 import datetime as _dt
@@ -386,7 +387,8 @@ def _build_openmeteo_route_wind(wind_cfg: dict, ctx: dict) -> WindField:
     models = wind_cfg.get("models")
     min_non_null_coverage = float(wind_cfg.get("min_non_null_coverage", 0.05))
 
-    cache_dir = HERE / ".wind_cache"
+    # WIND_CACHE_DIR override for read-only filesystems (Lambda's /var/task).
+    cache_dir = Path(os.environ.get("WIND_CACHE_DIR") or (HERE / ".wind_cache"))
     cache_dir.mkdir(parents=True, exist_ok=True)
     slug = ctx["task_slug"]
 

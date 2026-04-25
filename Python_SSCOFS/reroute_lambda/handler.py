@@ -37,10 +37,27 @@ import os
 import sys
 from pathlib import Path
 
-# /var/task on Lambda; the Python_SSCOFS code lives one level up so the
-# imports below resolve.
+# Lambda's /var/task is read-only. numba's @njit(cache=True) tries to write
+# pycache next to the source and aborts with "no locator available" if it
+# can't. Point its cache at /tmp BEFORE any of the heavy modules below get
+# imported. (setdefault so a future move to a writable layout, e.g. EFS,
+# Just Works.) Matplotlib is NOT installed in the Lambda image — all our
+# matplotlib imports are inside plot-only function bodies and Lambda runs
+# with --no-plots.
+os.environ.setdefault("NUMBA_CACHE_DIR",        "/tmp/numba")
+os.environ.setdefault("SSCOFS_CACHE_DIR",       "/tmp/sscofs_cache")
+os.environ.setdefault("SSCOFS_SURFACE_CACHE_DIR","/tmp/sscofs_surface_cache")
+os.environ.setdefault("WIND_CACHE_DIR",         "/tmp/wind_cache")
+for _k in ("NUMBA_CACHE_DIR", "SSCOFS_CACHE_DIR",
+           "SSCOFS_SURFACE_CACHE_DIR", "WIND_CACHE_DIR"):
+    Path(os.environ[_k]).mkdir(parents=True, exist_ok=True)
+
+# On Lambda the Dockerfile lays everything (handler.py + the router
+# modules + routes/races/ + j105_new_polars.csv) directly under
+# /var/task, not in the Python_SSCOFS subdir we have locally. So HERE
+# is also where the imports + race YAMLs live.
 HERE = Path(__file__).parent
-PYTHON_SSCOFS = HERE.parent
+PYTHON_SSCOFS = HERE
 sys.path.insert(0, str(PYTHON_SSCOFS))
 
 # /tmp is the only writable path in the Lambda runtime. Pre-create the

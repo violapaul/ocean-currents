@@ -34,6 +34,7 @@ import argparse
 import csv
 import datetime as _dt
 import heapq
+import os
 import sys
 import time as _time
 from dataclasses import dataclass, field
@@ -5866,7 +5867,10 @@ def plot_route(route, xs, ys, water_mask, current_field,
 #  Data loading helpers
 # ===================================================================
 
-_SURFACE_CACHE_DIR = Path(__file__).parent / ".sscofs_surface_cache"
+# Cache dir defaults next to this source. On Lambda the source is in
+# read-only /var/task, so SSCOFS_SURFACE_CACHE_DIR=/tmp/... overrides it.
+_SURFACE_CACHE_DIR = Path(os.environ.get("SSCOFS_SURFACE_CACHE_DIR") or
+                          (Path(__file__).parent / ".sscofs_surface_cache"))
 
 
 def _surface_cache_path(run_date, cycle_hour, fh):

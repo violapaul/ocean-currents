@@ -17,13 +17,14 @@ import datetime as dt
 from datetime import timezone, timedelta
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import xarray as xr
-from matplotlib.patches import Circle, Ellipse
-from matplotlib import cm
-import matplotlib.patches as mpatches
 from pathlib import Path
 from pyproj import Transformer
+
+# matplotlib is imported lazily inside plot_currents_at_location() / main()
+# so importers that only want get_latest_current_data / create_utm_transformer
+# (e.g. sail_routing.py, the Lambda reroute handler) don't pull in matplotlib
+# and its native deps.
 
 # Import helper functions from existing modules
 from latest_cycle import latest_cycle_and_url_for_local_hour
@@ -125,9 +126,14 @@ def get_latest_current_data(use_cache=True, target_datetime=None, tz_str="Americ
     
     return ds, info
 
-def plot_currents_at_location(ds, center_lat, center_lon, radius_miles=5, 
+def plot_currents_at_location(ds, center_lat, center_lon, radius_miles=5,
                              time_index=0, save_file=None, subsample_n=3,
                              vector_scale_multiplier=10.0):
+    # Lazy matplotlib import — the rest of this module is matplotlib-free.
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle, Ellipse
+    from matplotlib import cm
+    import matplotlib.patches as mpatches
     """
     Plot current vectors and speed within a radius of a center point.
     Uses UTM projection for accurate scaling in meters.

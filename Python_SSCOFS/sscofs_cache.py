@@ -7,14 +7,17 @@ This module provides a consistent caching mechanism for all scripts
 that download SSCOFS data.
 """
 
+import os
 import xarray as xr
 import s3fs
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Default cache directory - can be overridden
-DEFAULT_CACHE_DIR = Path(__file__).parent / ".sscofs_cache"
+# Default cache directory - can be overridden by SSCOFS_CACHE_DIR env var
+# (Lambda's /var/task is read-only; point it at /tmp).
+DEFAULT_CACHE_DIR = Path(os.environ.get("SSCOFS_CACHE_DIR") or
+                         (Path(__file__).parent / ".sscofs_cache"))
 
 
 def get_cached_filename(run_info: Dict) -> str:

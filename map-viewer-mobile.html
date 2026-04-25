@@ -917,7 +917,7 @@
       // OceanCurrents/Python_SSCOFS/reroute_lambda/setup.sh (it prints the
       // URL on success). Empty = Phase-2 not yet deployed; GO falls back
       // to the test_reroute path on localhost, or a stub alert otherwise.
-      LAMBDA_REROUTE_URL: '',
+      LAMBDA_REROUTE_URL: 'https://cksemdnatpp2zu3quxabfpzpfu0wwvnn.lambda-url.us-west-2.on.aws/',
     };
     
     // ========== APPLICATION STATE ==========
@@ -3281,7 +3281,9 @@ window.addEventListener('resize', handleViewportChange);
           };
           logger.info('POST reroute:', CONFIG.LAMBDA_REROUTE_URL, body);
           const ctrl = new AbortController();
-          const t = setTimeout(() => ctrl.abort(), 75000);
+          // Cold start (handler import + numba JIT + SSCOFS byte-range fetch
+          // + solve) can land at ~2 min. Warm path is ~30-60 s. 4 min ceiling.
+          const t = setTimeout(() => ctrl.abort(), 240000);
           let resp;
           try {
             resp = await fetch(CONFIG.LAMBDA_REROUTE_URL, {
