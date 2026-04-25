@@ -1,0 +1,6 @@
+{
+  "version": "2.0",
+  "requestContext": { "http": { "method": "POST" } },
+  "body": "{\"race_slug\":\"shilshole_double_bluff_return\",\"start\":{\"lat\":47.85,\"lon\":-122.48},\"depart_utc\":null,\"next_waypoint_index\":1}",
+  "isBase64Encoded": false
+}

@@ -913,6 +913,11 @@
       RACE_BASE_URL: (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
         ? `${location.origin}/race-dev`
         : 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/races',
+      // Lambda Function URL for on-demand reroute. Filled in after running
+      // OceanCurrents/Python_SSCOFS/reroute_lambda/setup.sh (it prints the
+      // URL on success). Empty = Phase-2 not yet deployed; GO falls back
+      // to the test_reroute path on localhost, or a stub alert otherwise.
+      LAMBDA_REROUTE_URL: '',
     };
     
     // ========== APPLICATION STATE ==========
@@ -3257,6 +3262,7 @@ window.addEventListener('resize', handleViewportChange);
       try {
         let geojson;
         if (TEST_REROUTE) {
+          // Test path: GET a pre-staged reroute.geojson. No backend needed.
           const base = `${CONFIG.RACE_BASE_URL}/${CONFIG.RACE_SLUG}`;
           const bust = Date.now();
           const url = `${base}/reroute.geojson?t=${bust}`;
@@ -3264,12 +3270,43 @@ window.addEventListener('resize', handleViewportChange);
           const resp = await fetch(url);
           if (!resp.ok) throw new Error(`reroute fetch failed: ${resp.status}`);
           geojson = await resp.json();
+        } else if (CONFIG.LAMBDA_REROUTE_URL) {
+          // Production path: POST to Lambda. Cold start ~30s, warm ~25-45s,
+          // so we don't add a client-side timeout shorter than ~75s.
+          const body = {
+            race_slug:   CONFIG.RACE_SLUG,
+            start:       { lat: state.userLocation.lat, lon: state.userLocation.lng },
+            depart_utc:  new Date().toISOString(),
+            next_waypoint_index: 1,
+          };
+          logger.info('POST reroute:', CONFIG.LAMBDA_REROUTE_URL, body);
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 75000);
+          let resp;
+          try {
+            resp = await fetch(CONFIG.LAMBDA_REROUTE_URL, {
+              method:  'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body:    JSON.stringify(body),
+              signal:  ctrl.signal,
+            });
+          } finally {
+            clearTimeout(t);
+          }
+          if (!resp.ok) {
+            const errBody = await resp.text().catch(() => '');
+            throw new Error(`reroute HTTP ${resp.status}: ${errBody.slice(0, 200)}`);
+          }
+          const respBody = await resp.json();
+          // Server response wraps the FeatureCollection one level deep.
+          geojson = respBody.geojson;
+          if (!geojson) throw new Error('reroute response missing .geojson');
+          logger.info('Reroute summary:', respBody.summary);
         } else {
-          // TODO(phase-2): POST to Lambda Function URL with
-          //   {race_slug, start:{lat,lon}, depart_utc, next_waypoint_index}
-          alert('Reroute endpoint not yet deployed. Current GPS: '
-              + state.userLocation.lat.toFixed(5) + ', '
-              + state.userLocation.lng.toFixed(5));
+          // No Lambda URL configured yet. Stub.
+          alert('Reroute endpoint not yet deployed.\n'
+              + 'Current GPS: ' + state.userLocation.lat.toFixed(5)
+              + ', ' + state.userLocation.lng.toFixed(5));
           return;
         }
         state.raceRerouteGeojson = geojson;

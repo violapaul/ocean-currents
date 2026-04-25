@@ -1689,6 +1689,13 @@ def main():
                         help="Bypass --only-if-within and --min-lead-min. "
                              "For local/test compute only; never in "
                              "production precomputes.")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        metavar="DIR",
+                        help="Override the per-route output directory. "
+                             "Use an absolute path under /tmp on Lambda "
+                             "(or anywhere writable in tests). When set, "
+                             "takes precedence over the YAML's "
+                             "output.plot_dir and the slug-default.")
     args = parser.parse_args()
 
     # --race-mode implies --no-plots and --geojson. Publishing to S3 is an
@@ -1856,7 +1863,10 @@ def main():
     # Default to a per-route subdirectory so outputs from many YAMLs don't
     # collide.  An explicit "plot_dir" in the YAML is taken as-is (no
     # auto-subdir) so users can override.
-    if "plot_dir" in out_cfg:
+    if args.output_dir:
+        # Lambda / test override: absolute path wins over everything.
+        plot_dir = Path(args.output_dir)
+    elif "plot_dir" in out_cfg:
         plot_dir = HERE / out_cfg["plot_dir"]
     else:
         plot_dir = HERE / "routes/output" / yaml_path.stem
