@@ -76,25 +76,22 @@ import race_publish  # noqa: F401  -- imported for symmetry; also pulled by rr
 RACES_DIR = PYTHON_SSCOFS / "routes" / "races"
 POLAR_PATH = PYTHON_SSCOFS / "j105_new_polars.csv"  # bundled by Dockerfile
 
-# CORS headers: permissive because the PWA lives at violapaul.github.io
-# while the Function URL is on amazonaws.com.
-_CORS = {
-    "Access-Control-Allow-Origin":  "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-}
+# CORS is owned by the Function URL config (set by setup.sh:
+# AllowOrigins/AllowMethods/AllowHeaders). We must NOT also emit
+# Access-Control-Allow-* from the handler — duplicate headers turn
+# into "*, <origin>" which the browser rejects.
 
 
 def _ok(body):
     return {"statusCode": 200,
-            "headers": {"Content-Type": "application/json", **_CORS},
+            "headers": {"Content-Type": "application/json"},
             "body": json.dumps(body, separators=(",", ":"))}
 
 
 def _err(status, msg):
     print(f"[reroute] ERROR {status}: {msg}")
     return {"statusCode": status,
-            "headers": {"Content-Type": "application/json", **_CORS},
+            "headers": {"Content-Type": "application/json"},
             "body": json.dumps({"error": msg})}
 
 
@@ -120,7 +117,9 @@ def _parse_body(event):
 def handler(event, context):
     method = _http_method(event)
     if method == "OPTIONS":
-        return {"statusCode": 204, "headers": _CORS}
+        # Function URL handles CORS preflights itself; this branch only
+        # fires for an explicit OPTIONS sent through to the handler.
+        return {"statusCode": 204}
     if method != "POST":
         return _err(405, f"method {method} not allowed; POST only")
 
