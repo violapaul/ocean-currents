@@ -34,9 +34,9 @@ wind:
 
 routing:
   router_type: "sector"
-  tack_penalty_s: 90
+  tack_penalty_s: 30
   tack_threshold_deg: 50
-  gybe_penalty_s: 90
+  gybe_penalty_s: 30
   gybe_threshold_deg: 120
   duration_hours: 8                # ~6.5 hr expected, +1.5 hr slack
   polar_sweep_coarse_step: 3
