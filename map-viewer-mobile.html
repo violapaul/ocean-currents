@@ -678,6 +678,12 @@
       color: white;
       animation: pulse 1s ease-in-out infinite;
     }
+    /* Filled state when a reroute is currently overlaid on the map.
+       Same colors as .loading but no animation — clear "ON" indicator. */
+    .reroute-btn.showing {
+      background: #0a7d00;
+      color: white;
+    }
 
     /* User location marker */
     .user-location-marker {
@@ -3183,11 +3189,17 @@ window.addEventListener('resize', handleViewportChange);
       const enabled = isInRaceWindow() && !!state.userLocation;
       btn.classList.toggle('enabled', enabled);
       btn.disabled = !enabled;
-      btn.title = enabled
-        ? 'Reroute from my current position'
-        : (!state.userLocation
-            ? 'Enable location to reroute'
-            : 'Reroute enables at T-30m');
+      btn.title = state.raceRerouteVisible
+        ? 'Tap to clear the reroute overlay'
+        : (enabled
+            ? 'Reroute from my current position'
+            : (!state.userLocation
+                ? 'Enable location to reroute'
+                : 'Reroute enables at T-30m'));
+      // Make sure the toggle-off path is always tappable when there's
+      // a reroute on screen, even if the gates have flipped (e.g. RACE
+      // turned off mid-race). Otherwise the user can't dismiss it.
+      if (state.raceRerouteVisible) btn.disabled = false;
     }
 
     // Called on load + every time the app comes to foreground. Silent
@@ -3250,13 +3262,30 @@ window.addEventListener('resize', handleViewportChange);
 
     document.getElementById('race-toggle').addEventListener('click', toggleRaceRoute);
 
-    // REROUTE button. Two paths:
-    //   - ?test_reroute=1: GET ${base}/reroute.geojson (pre-staged). Lets
-    //     us fully exercise the render pipeline while the Phase-2 Lambda
-    //     is still undeployed.
-    //   - otherwise: POST to the Lambda Function URL with the live GPS
-    //     fix + race slug. Not yet wired (shows "not deployed" alert).
+    // REROUTE button. Three-way toggle:
+    //   - reroute currently visible      -> tap clears the overlay (no fetch)
+    //   - reroute hidden, GO available   -> tap fetches a fresh reroute
+    //                                       (so re-tapping after a clear
+    //                                       always recomputes against the
+    //                                       latest GPS + cycle data)
+    //   - GO disabled (out of window /
+    //     no GPS / RACE off)             -> tap shows the gating reason
+    //
+    // Paths within the fetch case:
+    //   - ?test_reroute=1: GET ${base}/reroute.geojson (pre-staged).
+    //   - otherwise: POST to the Lambda Function URL.
     document.getElementById('reroute-btn').addEventListener('click', async () => {
+      const btn = document.getElementById('reroute-btn');
+
+      // Toggle off path: take precedence so the user can hide the overlay
+      // even if (somehow) the gates have flipped since the reroute landed.
+      if (state.raceRerouteVisible) {
+        state.raceRerouteVisible = false;
+        btn.classList.remove('showing');
+        scheduleRaceRender();
+        return;
+      }
+
       if (!isInRaceWindow()) return;
       if (!state.userLocation) {
         alert('Enable your location first (tap the locate button).');
@@ -3267,7 +3296,6 @@ window.addEventListener('resize', handleViewportChange);
         alert('Turn the RACE layer on first.');
         return;
       }
-      const btn = document.getElementById('reroute-btn');
       const origLabel = btn.textContent;
       btn.classList.add('loading');
       btn.textContent = '…';   // obvious "in flight" indicator
@@ -3326,6 +3354,7 @@ window.addEventListener('resize', handleViewportChange);
         state.raceRerouteGeojson = geojson;
         state.raceRerouteVisible = true;
         scheduleRaceRender();
+        btn.classList.add('showing');
         logger.info('Reroute applied:', geojson?.properties?.slug,
                     'total_nm=', geojson?.properties?.total_distance_nm);
       } catch (err) {
