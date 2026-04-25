@@ -876,6 +876,10 @@
     const RACE_OVERRIDE = URL_PARAMS.get('race');
     const TEST_GPS_RAW  = URL_PARAMS.get('test_gps');
     const TEST_REROUTE  = URL_PARAMS.get('test_reroute') === '1';
+    // ?force_reroute=1 bypasses the T-30m race-window gate so the GO
+    // button can be tested before race day. Doesn't bypass the
+    // "GPS required" gate.
+    const FORCE_REROUTE = URL_PARAMS.get('force_reroute') === '1';
     
     const logger = {
       error: console.error,
@@ -3161,6 +3165,7 @@ window.addEventListener('resize', handleViewportChange);
     // precomputing at this point, so manifest polling also stops and the
     // reroute button takes over as the only update path.
     function isInRaceWindow() {
+      if (FORCE_REROUTE) return true;
       const m = state.raceLastManifest;
       if (!m || !m.event_start_utc) return false;
       const start = Date.parse(m.event_start_utc);
