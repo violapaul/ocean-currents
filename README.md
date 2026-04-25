@@ -2,6 +2,8 @@
 
 A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current forecasts from NOAA's Salish Sea Coastal Ocean Forecast System (SSCOFS) with tide data integration.
 
+Live app: https://violapaul.github.io/ocean-currents/map-viewer-mobile.html
+
 ## 🌊 Features
 
 - **Self-hosted data pipeline** - No dependency on unreliable third-party tile servers
@@ -26,7 +28,7 @@ A mobile-optimized Progressive Web App (PWA) for viewing real-time ocean current
 │  GitHub Actions (every 6 hours)                                 │
 │  └── generate_current_data.py --mode fast                       │
 │      - Extracts u,v,lonc,latc at surface layer                 │
-│      - 12 parallel workers                                      │
+│      - 8 parallel workers in GitHub Actions                     │
 │      - ~2 minutes total runtime                                 │
 └─────────────────────────────────────────────────────────────────┘
                               │
@@ -102,6 +104,9 @@ OceanCurrents/
 ├── manifest.json             # PWA manifest
 ├── service-worker.js         # Offline caching
 ├── app-icon.svg              # App icon
+├── app-icon-192.png          # PWA icon
+├── app-icon-512.png          # PWA icon
+├── apple-touch-icon.png      # iOS install icon
 └── Python_SSCOFS/            # Data pipeline + sailboat routing
     ├── generate_current_data.py   # Current data pipeline
     ├── water_boundary.py          # Delaunay-based land detection
@@ -141,6 +146,7 @@ http://localhost:8080/map-viewer-mobile.html?debug
 
 | Component | URL |
 |-----------|-----|
+| **Live App** | https://violapaul.github.io/ocean-currents/map-viewer-mobile.html |
 | **S3 Data** | https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents/ |
 | **NOAA Tides** | https://api.tidesandcurrents.noaa.gov/api/prod/datagetter |
 | **Actions** | https://github.com/violapaul/WaysWaterMoves/actions |
