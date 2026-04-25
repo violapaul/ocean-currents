@@ -673,6 +673,11 @@
       cursor: pointer;
     }
     .reroute-btn.enabled:active { transform: scale(0.95); }
+    .reroute-btn.loading {
+      background: #0a7d00;
+      color: white;
+      animation: pulse 1s ease-in-out infinite;
+    }
 
     /* User location marker */
     .user-location-marker {
@@ -3263,7 +3268,9 @@ window.addEventListener('resize', handleViewportChange);
         return;
       }
       const btn = document.getElementById('reroute-btn');
+      const origLabel = btn.textContent;
       btn.classList.add('loading');
+      btn.textContent = '…';   // obvious "in flight" indicator
       try {
         let geojson;
         if (TEST_REROUTE) {
@@ -3326,6 +3333,7 @@ window.addEventListener('resize', handleViewportChange);
         alert('Reroute failed:\n' + err.message);
       } finally {
         btn.classList.remove('loading');
+        btn.textContent = origLabel;
       }
     });
 
