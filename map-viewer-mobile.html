@@ -644,6 +644,60 @@
     }
     .race-toggle.has-update .race-new-badge { display: flex; }
 
+    /* Race picker — populated from races/index.json on long-press of RACE. */
+    .race-picker {
+      position: fixed;
+      bottom: calc(160px + env(safe-area-inset-bottom, 0px));
+      left: 64px;
+      background: rgba(255, 255, 255, 0.98);
+      border: 2px solid #d95f0e;
+      border-radius: 12px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+      z-index: 11;
+      display: none;
+      min-width: 240px;
+      max-width: calc(100vw - 80px);
+      max-height: 60vh;
+      overflow-y: auto;
+      font-size: 13px;
+      color: #333;
+    }
+    .race-picker.open { display: block; }
+    .race-picker-header {
+      padding: 10px 14px 6px;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #888;
+      border-bottom: 1px solid #eee;
+      position: sticky; top: 0;
+      background: rgba(255, 255, 255, 0.98);
+    }
+    .race-picker-item {
+      padding: 10px 14px;
+      cursor: pointer;
+      border-bottom: 1px solid #f5f5f5;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .race-picker-item:last-child { border-bottom: none; }
+    .race-picker-item:active { background: #fdf6e3; }
+    .race-picker-item.current {
+      background: #d95f0e;
+      color: white;
+    }
+    .race-picker-item .name { font-weight: 600; }
+    .race-picker-item .meta {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 2px;
+    }
+    .race-picker-empty {
+      padding: 14px;
+      color: #999;
+      font-style: italic;
+    }
+
     /* Reroute button (enabled at T-30m; stub until Phase 2 Lambda ships). */
     .reroute-btn {
       position: fixed;
@@ -767,7 +821,8 @@
     <!-- View toggle button -->
     <button class="view-toggle" id="view-toggle" aria-label="Toggle raw data view" title="Toggle raw data view">RAW</button>
 
-    <button class="race-toggle" id="race-toggle" aria-label="Toggle race route overlay" title="Show race route">RACE<span class="race-new-badge" id="race-new-badge">NEW</span></button>
+    <button class="race-toggle" id="race-toggle" aria-label="Toggle race route overlay" title="Tap: show/hide race. Long-press: pick a different race.">RACE<span class="race-new-badge" id="race-new-badge">NEW</span></button>
+    <div class="race-picker" id="race-picker" role="menu" aria-label="Race picker"></div>
 
     <button class="reroute-btn" id="reroute-btn" aria-label="Reroute from my position" title="Reroute enables at T-30m (requires GPS)" disabled>GO</button>
     
@@ -3260,7 +3315,184 @@ window.addEventListener('resize', handleViewportChange);
       }
     }
 
-    document.getElementById('race-toggle').addEventListener('click', toggleRaceRoute);
+    // ===== Race picker (long-press on RACE button) =====
+    // The picker reads races/index.json (written by race_publish.update_index
+    // on every successful S3 publish) and lets the user swap between published
+    // races without editing the URL. Short tap on RACE = toggle visibility.
+    // Long-press (>= 500ms) = open picker.
+
+    let raceIndex = null;
+    const RACE_LONGPRESS_MS = 500;
+    const RACE_INDEX_MAX_STALE_DAYS = 14;  // hide races whose start is older
+
+    async function fetchRaceIndex() {
+      try {
+        const url = `${CONFIG.RACE_BASE_URL}/index.json?t=${Date.now()}`;
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        raceIndex = await r.json();
+        logger.info('Race index loaded:', (raceIndex.races || []).length, 'races');
+      } catch (err) {
+        logger.warn('Race index fetch failed:', err.message);
+        raceIndex = null;
+      }
+    }
+
+    function populateRacePicker() {
+      const panel = document.getElementById('race-picker');
+      panel.innerHTML = '';
+      const header = document.createElement('div');
+      header.className = 'race-picker-header';
+      header.textContent = 'Pick a race';
+      panel.appendChild(header);
+
+      let races = (raceIndex && Array.isArray(raceIndex.races)) ? raceIndex.races : [];
+      // Drop races whose start is far in the past; the index is append-only
+      // so old entries hang around forever, but the UI doesn't need them.
+      const cutoff = Date.now() - RACE_INDEX_MAX_STALE_DAYS * 86400000;
+      races = races.filter((r) => {
+        if (!r.event_start_utc) return true;
+        const t = Date.parse(r.event_start_utc);
+        return isNaN(t) || t > cutoff;
+      });
+
+      if (races.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'race-picker-empty';
+        empty.textContent = raceIndex
+          ? 'No upcoming races.'
+          : 'Could not load race list.';
+        panel.appendChild(empty);
+        return;
+      }
+
+      for (const r of races) {
+        const item = document.createElement('div');
+        item.className = 'race-picker-item';
+        if (r.slug === CONFIG.RACE_SLUG) item.classList.add('current');
+        const name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = r.name || r.slug;
+        item.appendChild(name);
+        if (r.event_start_utc) {
+          const meta = document.createElement('div');
+          meta.className = 'meta';
+          const d = new Date(r.event_start_utc);
+          meta.textContent = isNaN(d.getTime())
+            ? r.event_start_utc
+            : d.toLocaleString([], {
+                weekday: 'short', month: 'short', day: 'numeric',
+                hour: 'numeric', minute: '2-digit',
+              });
+          item.appendChild(meta);
+        }
+        item.addEventListener('click', (e) => {
+          e.stopPropagation();
+          selectRace(r.slug);
+        });
+        panel.appendChild(item);
+      }
+    }
+
+    function openRacePicker() {
+      populateRacePicker();
+      document.getElementById('race-picker').classList.add('open');
+    }
+    function closeRacePicker() {
+      document.getElementById('race-picker').classList.remove('open');
+    }
+
+    // Close on outside tap (but not on the RACE button itself, since the
+    // long-press logic handles that).
+    document.addEventListener('click', (e) => {
+      const panel = document.getElementById('race-picker');
+      if (!panel.classList.contains('open')) return;
+      if (panel.contains(e.target)) return;
+      if (e.target.closest('#race-toggle')) return;
+      closeRacePicker();
+    });
+
+    async function selectRace(slug) {
+      closeRacePicker();
+      if (slug === CONFIG.RACE_SLUG) return;
+      CONFIG.RACE_SLUG = slug;
+      // Persist in URL so refresh / share keeps the choice.
+      const u = new URL(location.href);
+      u.searchParams.set('race', slug);
+      history.replaceState({}, '', u.toString());
+      // Reset cached race state so the next fetch is unconditional.
+      state.raceRouteLoaded = false;
+      state.raceInputsHash = null;
+      state.raceLastManifest = null;
+      state.raceRerouteGeojson = null;
+      state.raceRerouteVisible = false;
+      raceGeojson = null;
+      const btn = document.getElementById('race-toggle');
+      btn.classList.remove('has-update');
+      if (state.raceRouteVisible) {
+        // Race was on — refetch and re-render in place.
+        btn.classList.add('loading');
+        try {
+          await fetchRaceRoute('load-route');
+          scheduleRaceRender();
+          updateRerouteBtn();
+        } catch (err) {
+          logger.error('Race switch fetch failed:', err);
+          alert('Could not load race route:\n' + err.message);
+        } finally {
+          btn.classList.remove('loading');
+        }
+      } else {
+        // Race was hidden — drop the canvas; user can re-tap RACE to show.
+        raceCanvas.style.display = 'none';
+      }
+    }
+
+    // Long-press detection on the RACE button.
+    (function wireRaceButton() {
+      const btn = document.getElementById('race-toggle');
+      let pressTimer = null;
+      let pressFired = false;
+
+      const start = () => {
+        pressFired = false;
+        if (pressTimer) clearTimeout(pressTimer);
+        pressTimer = setTimeout(() => {
+          pressFired = true;
+          pressTimer = null;
+          openRacePicker();
+        }, RACE_LONGPRESS_MS);
+      };
+      const cancel = () => {
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+      };
+
+      btn.addEventListener('pointerdown', start);
+      btn.addEventListener('pointerup',     cancel);
+      btn.addEventListener('pointerleave',  cancel);
+      btn.addEventListener('pointercancel', cancel);
+      // Desktop right-click also opens the picker.
+      btn.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        cancel();
+        openRacePicker();
+      });
+
+      btn.addEventListener('click', (e) => {
+        if (pressFired) {
+          // Long-press just opened the picker — suppress the trailing click.
+          pressFired = false;
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        toggleRaceRoute();
+      });
+    })();
+
+    // Kick off an index fetch in the background; the picker will show
+    // whatever it gets (or an error message if it fails).
+    fetchRaceIndex();
 
     // REROUTE button. Three-way toggle:
     //   - reroute currently visible      -> tap clears the overlay (no fetch)
