@@ -78,15 +78,8 @@ GitHub Actions runs every 6 hours to fetch fresh NOAA data:
 
 ### Manual Run
 
-```bash
-cd OceanCurrents/Python_SSCOFS
-
-# Fast mode (byte-range S3 reads, ~2 min for 73 hours)
-python generate_current_data.py --mode fast --workers 12 --upload --s3-bucket viola-ocean-currents
-
-# Cache mode (full file downloads, ~20 min, for offline use)
-python generate_current_data.py --mode cache --upload --s3-bucket viola-ocean-currents
-```
+The data-pipeline source lives in the private `violapaul/WaysWaterMoves` repo
+under `race_routing/` and is not mirrored here.
 
 ### Performance
 
@@ -98,28 +91,21 @@ python generate_current_data.py --mode cache --upload --s3-bucket viola-ocean-cu
 
 ## Files
 
+This repo contains **only the viewer**. The data-pipeline and sailboat-
+routing source live in the private `violapaul/WaysWaterMoves` repo under
+`race_routing/`; the viewer consumes their published artifacts via S3.
+
 ```
-OceanCurrents/
+ocean-currents/
 ├── map-viewer-mobile.html    # Main PWA with Canvas renderer
 ├── manifest.json             # PWA manifest
 ├── service-worker.js         # Offline caching
+├── index.html                # Splash + install prompt
+├── update-helper.html        # PWA cache-flush utility
 ├── app-icon.svg              # App icon
 ├── app-icon-192.png          # PWA icon
 ├── app-icon-512.png          # PWA icon
-├── apple-touch-icon.png      # iOS install icon
-└── Python_SSCOFS/            # Data pipeline + sailboat routing
-    ├── generate_current_data.py   # Current data pipeline
-    ├── water_boundary.py          # Delaunay-based land detection
-    ├── sail_routing.py            # A* sailboat routing engine
-    ├── run_route.py               # YAML-driven multi-leg route runner
-    ├── ecmwf_wind.py              # ECMWF 9 km wind via Open-Meteo
-    ├── latest_cycle.py            # Model cycle detection
-    ├── fetch_sscofs.py            # URL construction
-    ├── sscofs_cache.py            # Cache management
-    ├── routes/                    # Route YAML configs + output
-    ├── test_sail_routing.py       # 86 routing tests (synthetic fields)
-    ├── test_ecmwf_wind.py         # Wind pipeline tests
-    └── requirements.txt           # Python dependencies
+└── apple-touch-icon.png      # iOS install icon
 ```
 
 ## Development
@@ -127,9 +113,7 @@ OceanCurrents/
 ### Local Testing
 
 ```bash
-cd OceanCurrents
-
-# Start local server
+# From the repo root
 python3 -m http.server 8080
 
 # Open http://localhost:8080/map-viewer-mobile.html
@@ -153,7 +137,10 @@ http://localhost:8080/map-viewer-mobile.html?debug
 
 ## Deployment
 
-See [../DEPLOYMENT.md](../DEPLOYMENT.md) for AWS credentials, GitHub Actions setup, and infrastructure details.
+Pushing to `main` here triggers a GitHub Pages rebuild (~30–60s) at
+https://violapaul.github.io/ocean-currents/. AWS/IAM/GHA setup for the data
+pipeline lives in the private `violapaul/WaysWaterMoves` repo's
+`DEPLOYMENT.md`.
 
 ## Data Format
 
