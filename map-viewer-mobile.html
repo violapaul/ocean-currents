@@ -961,7 +961,7 @@
     const isLowPowerDevice = isMobileDevice && window.innerWidth < 768;
     
     const CONFIG = {
-      APP_VERSION: 'v3.0.2', // Default to Blake Island race
+      APP_VERSION: 'v3.0.3', // Race picker duration display
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
@@ -3373,16 +3373,26 @@ window.addEventListener('resize', handleViewportChange);
         name.className = 'name';
         name.textContent = r.name || r.slug;
         item.appendChild(name);
+        const metaParts = [];
         if (r.event_start_utc) {
-          const meta = document.createElement('div');
-          meta.className = 'meta';
           const d = new Date(r.event_start_utc);
-          meta.textContent = isNaN(d.getTime())
+          metaParts.push(isNaN(d.getTime())
             ? r.event_start_utc
             : d.toLocaleString([], {
                 weekday: 'short', month: 'short', day: 'numeric',
                 hour: 'numeric', minute: '2-digit',
-              });
+              }));
+        }
+        if (Number.isFinite(Number(r.total_time_hr))) {
+          const totalMinutes = Math.round(Number(r.total_time_hr) * 60);
+          const hours = Math.floor(totalMinutes / 60);
+          const minutes = totalMinutes % 60;
+          metaParts.push(hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`);
+        }
+        if (metaParts.length > 0) {
+          const meta = document.createElement('div');
+          meta.className = 'meta';
+          meta.textContent = metaParts.join(' • ');
           item.appendChild(meta);
         }
         item.addEventListener('click', (e) => {
