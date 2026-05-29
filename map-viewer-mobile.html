@@ -961,7 +961,7 @@
     const isLowPowerDevice = isMobileDevice && window.innerWidth < 768;
     
     const CONFIG = {
-      APP_VERSION: 'v3.0.1', // Split-repo local-dev path cleanup
+      APP_VERSION: 'v3.0.2', // Default to Blake Island race
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
@@ -976,7 +976,7 @@
       WATER_BITMAP_RES: 0.0005,
       // Race route published by the GHA precompute workflow.
       // ?race=<slug> URL param lets tests point at a different published race.
-      RACE_SLUG: RACE_OVERRIDE || 'shilshole_double_bluff_return',
+      RACE_SLUG: RACE_OVERRIDE || 'blake_island_west_point_2026_05_30_stbd',
       // On localhost we look for the route under /race-dev/<slug>/ so you can
       // symlink the run_route.py output dir there for pre-deploy verification.
       RACE_BASE_URL: (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
