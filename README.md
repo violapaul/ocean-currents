@@ -7,7 +7,7 @@ Live app: https://violapaul.github.io/ocean-currents/map-viewer-mobile.html
 ## 🌊 Features
 
 - **Self-hosted data pipeline** - No dependency on unreliable third-party tile servers
-- **Automatic updates** - GitHub Actions refreshes data every 6 hours
+- **Automatic updates** - the WaysWaterMoves GitHub Actions pipeline refreshes data every 6 hours
 - **Canvas-based rendering** - Fast, smooth vector visualization with 310K+ mesh elements
 - **Speed heatmap** - Color-coded water showing current speed
 - **Tide integration** - Seattle tide chart with current time indicator
@@ -25,7 +25,7 @@ Live app: https://violapaul.github.io/ocean-currents/map-viewer-mobile.html
                               │ Byte-range reads (~3MB/file)
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  GitHub Actions (every 6 hours)                                 │
+│  WaysWaterMoves GitHub Actions (every 6 hours)                  │
 │  └── generate_current_data.py --mode fast                       │
 │      - Extracts u,v,lonc,latc at surface layer                 │
 │      - 8 parallel workers in GitHub Actions                     │
@@ -100,8 +100,10 @@ ocean-currents/
 ├── map-viewer-mobile.html    # Main PWA with Canvas renderer
 ├── manifest.json             # PWA manifest
 ├── service-worker.js         # Offline caching
-├── index.html                # Splash + install prompt
+├── index.html                # Redirect to the mobile viewer
 ├── update-helper.html        # PWA cache-flush utility
+├── serve.sh                  # Local sync + dev server helper
+├── sync_from_s3.sh           # Public S3 data sync for local testing
 ├── app-icon.svg              # App icon
 ├── app-icon-192.png          # PWA icon
 ├── app-icon-512.png          # PWA icon
@@ -114,10 +116,15 @@ ocean-currents/
 
 ```bash
 # From the repo root
-python3 -m http.server 8080
+./serve.sh
 
 # Open http://localhost:8080/map-viewer-mobile.html
 ```
+
+`serve.sh` syncs the latest public S3 current-data bundle into
+`current_data/` before starting the local server. If you only need the static
+viewer shell, `python3 -m http.server 8080` still works, but currents will load
+from localhost only after `./sync_from_s3.sh` has populated `current_data/`.
 
 ### Debug Mode
 

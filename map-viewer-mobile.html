@@ -938,7 +938,7 @@
     //   ?race=<slug>      — override CONFIG.RACE_SLUG
     //   ?test_gps=LAT,LON — seed state.userLocation (bypass geolocation)
     //   ?test_reroute=1   — GO button fetches /reroute.geojson instead of
-    //                       POSTing to Lambda (which isn't deployed yet)
+    //                       POSTing to Lambda
     const RACE_OVERRIDE = URL_PARAMS.get('race');
     const TEST_GPS_RAW  = URL_PARAMS.get('test_gps');
     const TEST_REROUTE  = URL_PARAMS.get('test_reroute') === '1';
@@ -961,15 +961,14 @@
     const isLowPowerDevice = isMobileDevice && window.innerWidth < 768;
     
     const CONFIG = {
-      APP_VERSION: 'v3.0.0', // Delaunay-based land detection, water boundary polygon
-      S3_BUCKET_URL: 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
+      APP_VERSION: 'v3.0.1', // Split-repo local-dev path cleanup
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
       TIDE_STATION_ID: '9447130', // Seattle
       MAX_FORECAST_HOURS: 72,
       CURRENT_DATA_URL: location.hostname === 'localhost' || location.hostname === '127.0.0.1'
-        ? `${location.origin}/Python_SSCOFS/current_data`
+        ? `${location.origin}/current_data`
         : 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/ocean-currents',
       // Adaptive quality: fewer arrows on slower devices
       ARROWS_PER_TILE: isLowPowerDevice ? 12 : 16,
@@ -984,9 +983,9 @@
         ? `${location.origin}/race-dev`
         : 'https://viola-ocean-currents.s3.us-west-2.amazonaws.com/races',
       // Lambda Function URL for on-demand reroute. Filled in after running
-      // OceanCurrents/Python_SSCOFS/reroute_lambda/setup.sh (it prints the
-      // URL on success). Empty = Phase-2 not yet deployed; GO falls back
-      // to the test_reroute path on localhost, or a stub alert otherwise.
+      // WaysWaterMoves/race_routing/reroute_lambda/setup.sh (it prints the
+      // URL on success). If empty, GO falls back to the test_reroute path on
+      // localhost, or a stub alert otherwise.
       LAMBDA_REROUTE_URL: 'https://cksemdnatpp2zu3quxabfpzpfu0wwvnn.lambda-url.us-west-2.on.aws/',
     };
     

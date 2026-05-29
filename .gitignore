@@ -1,16 +1,4 @@
-__pycache__/
-*.pyc
 .DS_Store
-Python_SSCOFS/current_data/
-Python_SSCOFS/current_data_fast_test*/
-Python_SSCOFS/data/cache/
-Python_SSCOFS/data/shoreline_wa_ecology_raw.geojson
-Python_SSCOFS/data/shoreline_puget_candidate.geojson
-Python_SSCOFS/data/shoreline_puget_min0.geojson
-Python_SSCOFS/data/experiments/
-Python_SSCOFS/routes/output/
+current_data/
 # Local dev dir for race-route smoke testing via map-viewer-mobile.html localhost override.
 race-dev/
-Python_SSCOFS/.sscofs_cache/
-Python_SSCOFS/.sscofs_surface_cache/
-Python_SSCOFS/.wind_cache/

@@ -4,8 +4,8 @@
 cd "$(dirname "$0")"
 
 echo "Checking for new data..."
-Python_SSCOFS/sync_from_s3.sh
+./sync_from_s3.sh
 echo ""
 
-echo "Serving at http://localhost:8000/map-viewer-mobile.html"
-python -m http.server 8000
+echo "Serving at http://localhost:8080/map-viewer-mobile.html"
+python3 -m http.server 8080

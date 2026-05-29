@@ -1,7 +1,7 @@
 // Ocean Currents PWA Service Worker
 // Enables offline functionality by caching tiles and assets
 
-const CACHE_VERSION = 'ocean-currents-v3';
+const CACHE_VERSION = 'ocean-currents-v4';
 const TILE_CACHE = `${CACHE_VERSION}-tiles`;
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 
@@ -122,6 +122,7 @@ self.addEventListener('fetch', (event) => {
   // the freshest data.
   const isDynamicData = (
     url.pathname.includes('/current_data/') ||
+    url.pathname.includes('/ocean-currents/') ||
     url.pathname.includes('/race-dev/')     ||
     url.pathname.includes('/races/')        ||
     url.pathname.endsWith('/latest.json')
