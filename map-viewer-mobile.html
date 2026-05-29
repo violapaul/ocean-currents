@@ -961,7 +961,7 @@
     const isLowPowerDevice = isMobileDevice && window.innerWidth < 768;
     
     const CONFIG = {
-      APP_VERSION: 'v3.0.3', // Race picker duration display
+      APP_VERSION: 'v3.0.4', // Race picker duration display
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
@@ -3060,6 +3060,93 @@ window.addEventListener('resize', handleViewportChange);
     };
     const RACE_LEG_DEFAULT = '#111';
 
+    // Out-and-back legs trace nearly the same geometry; if drawn on top of each
+    // other the later leg hides the earlier one. We shift every leg a few screen
+    // pixels to the RIGHT of its travel direction. Antiparallel out/back legs
+    // then offset to opposite sides and separate into two parallel lines, while
+    // direction chevrons make the out -> turn -> back structure explicit. Offset
+    // is in screen px so the separation is zoom-independent.
+    const RACE_LEG_OFFSET_PX   = 7;   // half-separation between antiparallel legs
+    const RACE_CHEVRON_STRIDE_PX = 44; // spacing between direction arrowheads
+    const RACE_CHEVRON_SIZE_PX = 7;    // arrowhead half-length
+
+    // Shift a projected screen polyline perpendicular to travel by offsetPx,
+    // toward the right-hand side of travel direction. In y-down screen space the
+    // right normal of a heading d=(dx,dy) is (-dy, dx) (normalized). Interior
+    // vertices use the averaged normal of their two adjacent segments so the
+    // offset line stays continuous through bends.
+    function offsetScreenPolyline(pts, offsetPx) {
+      const n = pts.length;
+      if (n < 2 || offsetPx === 0) return pts;
+      // Per-segment right-hand unit normals (skip zero-length segments).
+      const segN = [];
+      for (let i = 0; i < n - 1; i++) {
+        const dx = pts[i + 1].x - pts[i].x;
+        const dy = pts[i + 1].y - pts[i].y;
+        const len = Math.hypot(dx, dy);
+        segN.push(len > 1e-6 ? { x: -dy / len, y: dx / len } : null);
+      }
+      // Carry the last valid normal forward so degenerate segments inherit it.
+      let prev = segN.find((s) => s) || { x: 0, y: 0 };
+      for (let i = 0; i < segN.length; i++) {
+        if (segN[i]) prev = segN[i]; else segN[i] = prev;
+      }
+      const out = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const a = segN[i - 1];           // incoming segment normal (undefined at i=0)
+        const b = segN[i];               // outgoing segment normal (undefined at i=n-1)
+        let nx, ny;
+        if (a && b) {                    // interior vertex: average + renormalize
+          nx = a.x + b.x; ny = a.y + b.y;
+          const m = Math.hypot(nx, ny);
+          if (m > 1e-6) { nx /= m; ny /= m; } else { nx = b.x; ny = b.y; }
+          // Miter clamp: keep the offset from blowing up at acute corners.
+          const cos = a.x * b.x + a.y * b.y;          // dot of unit normals
+          const scale = Math.min(1 / Math.max(Math.sqrt((1 + cos) / 2), 0.5), 2);
+          nx *= scale; ny *= scale;
+        } else {                         // endpoints use the single adjacent normal
+          const s = b || a;
+          nx = s.x; ny = s.y;
+        }
+        out[i] = { x: pts[i].x + nx * offsetPx, y: pts[i].y + ny * offsetPx };
+      }
+      return out;
+    }
+
+    // Walk a screen polyline and draw a chevron (open arrowhead) every stridePx,
+    // oriented along the local travel direction, so each leg shows which way it
+    // runs. White outline + colored fill keeps it legible over water tints.
+    function drawChevrons(ctx, pts, stridePx, sizePx, color) {
+      if (pts.length < 2) return;
+      let acc = stridePx * 0.5;          // first chevron offset in from the start
+      for (let i = 0; i < pts.length - 1; i++) {
+        const ax = pts[i].x, ay = pts[i].y;
+        const dx = pts[i + 1].x - ax, dy = pts[i + 1].y - ay;
+        const segLen = Math.hypot(dx, dy);
+        if (segLen < 1e-6) continue;
+        const ux = dx / segLen, uy = dy / segLen;
+        for (acc; acc <= segLen; acc += stridePx) {
+          const cx = ax + ux * acc, cy = ay + uy * acc;
+          // Two wings pointing back from the tip along the travel heading.
+          const bx = cx - ux * sizePx, by = cy - uy * sizePx;     // base behind tip
+          const px = -uy, py = ux;                                 // perpendicular
+          ctx.beginPath();
+          ctx.moveTo(bx + px * sizePx * 0.7, by + py * sizePx * 0.7);
+          ctx.lineTo(cx, cy);
+          ctx.lineTo(bx - px * sizePx * 0.7, by - py * sizePx * 0.7);
+          ctx.lineJoin = 'round';
+          ctx.lineCap = 'round';
+          ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+          ctx.lineWidth = 4;
+          ctx.stroke();
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+        acc -= segLen;                   // carry remainder into the next segment
+      }
+    }
+
     function resizeRaceCanvas() {
       const dpr = window.devicePixelRatio || 1;
       raceCanvas.width  = raceCanvas.clientWidth  * dpr;
@@ -3087,18 +3174,22 @@ window.addEventListener('resize', handleViewportChange);
       ctx.clearRect(0, 0, w, h);
       if (!state.raceRouteVisible || !raceGeojson) return;
 
-      // Pass 1: nominal legs (white casing + dark inner line).
+      // Pass 1: nominal legs (white casing + dark inner line), each shifted
+      // right-of-travel so overlapping out/back legs split apart, plus direction
+      // chevrons.
       for (const feat of raceGeojson.features) {
         if (feat.geometry.type !== 'LineString') continue;
         const coords = feat.geometry.coordinates;
         if (coords.length < 2) continue;
 
+        const pts = coords.map(([lon, lat]) => map.project([lon, lat]));
+        const off = offsetScreenPolyline(pts, RACE_LEG_OFFSET_PX);
+        const legColor = RACE_LEG_COLORS[feat.properties.leg] || RACE_LEG_DEFAULT;
+
         ctx.beginPath();
-        for (let i = 0; i < coords.length; i++) {
-          const [lon, lat] = coords[i];
-          const p = map.project([lon, lat]);
-          if (i === 0) ctx.moveTo(p.x, p.y);
-          else         ctx.lineTo(p.x, p.y);
+        for (let i = 0; i < off.length; i++) {
+          if (i === 0) ctx.moveTo(off[i].x, off[i].y);
+          else         ctx.lineTo(off[i].x, off[i].y);
         }
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
@@ -3106,9 +3197,11 @@ window.addEventListener('resize', handleViewportChange);
         ctx.strokeStyle = 'rgba(255,255,255,0.85)';
         ctx.lineWidth = 9;
         ctx.stroke();
-        ctx.strokeStyle = RACE_LEG_COLORS[feat.properties.leg] || RACE_LEG_DEFAULT;
+        ctx.strokeStyle = legColor;
         ctx.lineWidth = 5;
         ctx.stroke();
+
+        drawChevrons(ctx, off, RACE_CHEVRON_STRIDE_PX, RACE_CHEVRON_SIZE_PX, legColor);
       }
 
       // Pass 2: reroute overlay (dashed contrast color, on top of nominal).
@@ -3117,12 +3210,12 @@ window.addEventListener('resize', handleViewportChange);
           if (feat.geometry.type !== 'LineString') continue;
           const coords = feat.geometry.coordinates;
           if (coords.length < 2) continue;
+          const pts = coords.map(([lon, lat]) => map.project([lon, lat]));
+          const off = offsetScreenPolyline(pts, RACE_LEG_OFFSET_PX);
           ctx.beginPath();
-          for (let i = 0; i < coords.length; i++) {
-            const [lon, lat] = coords[i];
-            const p = map.project([lon, lat]);
-            if (i === 0) ctx.moveTo(p.x, p.y);
-            else         ctx.lineTo(p.x, p.y);
+          for (let i = 0; i < off.length; i++) {
+            if (i === 0) ctx.moveTo(off[i].x, off[i].y);
+            else         ctx.lineTo(off[i].x, off[i].y);
           }
           ctx.setLineDash([10, 6]);
           ctx.lineCap = 'butt';
@@ -3132,6 +3225,8 @@ window.addEventListener('resize', handleViewportChange);
           ctx.strokeStyle = '#c2410c';  // dark orange
           ctx.lineWidth = 6;
           ctx.stroke();
+          ctx.setLineDash([]);
+          drawChevrons(ctx, off, RACE_CHEVRON_STRIDE_PX, RACE_CHEVRON_SIZE_PX, '#c2410c');
         }
         ctx.setLineDash([]);
 
