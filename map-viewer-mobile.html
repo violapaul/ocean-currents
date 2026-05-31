@@ -698,7 +698,7 @@
       font-style: italic;
     }
 
-    /* Reroute button (enabled at T-30m; stub until Phase 2 Lambda ships). */
+    /* Reroute (GO) button: enabled at T-30m with GPS; POSTs to the live Lambda. */
     .reroute-btn {
       position: fixed;
       bottom: calc(210px + env(safe-area-inset-bottom, 0px));
@@ -738,6 +738,48 @@
       background: #0a7d00;
       color: white;
     }
+    /* Course-progress chip (P1): sits in the left button stack just above GO.
+       Hidden until the RACE layer is on (toggled by renderCourseProgress). */
+    .course-progress {
+      position: fixed;
+      bottom: calc(262px + env(safe-area-inset-bottom, 0px));
+      left: 10px;
+      display: none;          /* -> flex when a route is visible */
+      align-items: center;
+      gap: 4px;
+      padding: 2px 4px;
+      background: rgba(255, 255, 255, 0.95);
+      border: 2px solid #0a7d00;
+      border-radius: 16px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      z-index: 10;
+      font-size: 12px;
+      font-weight: 600;
+      color: #0a7d00;
+    }
+    .course-progress .cp-label {
+      padding: 0 2px;
+      white-space: nowrap;
+      max-width: 120px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .course-progress .cp-btn {
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      border-radius: 11px;
+      border: 1px solid #0a7d00;
+      background: white;
+      color: #0a7d00;
+      font-size: 15px;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .course-progress .cp-btn:active { transform: scale(0.92); }
 
     /* User location marker */
     .user-location-marker {
@@ -825,7 +867,15 @@
     <div class="race-picker" id="race-picker" role="menu" aria-label="Race picker"></div>
 
     <button class="reroute-btn" id="reroute-btn" aria-label="Reroute from my position" title="Reroute enables at T-30m (requires GPS)" disabled>GO</button>
-    
+
+    <!-- Course-progress chip: which mark the reroute will target next, with
+         manual ‹/› correction for when GPS auto-detect desyncs. -->
+    <div class="course-progress" id="course-progress" role="group" aria-label="Course progress">
+      <button class="cp-btn" id="cp-back" aria-label="Previous mark" title="Step the next-mark target back">‹</button>
+      <span class="cp-label">→</span>
+      <button class="cp-btn" id="cp-fwd" aria-label="Next mark" title="Step the next-mark target forward">›</button>
+    </div>
+
     <!-- Location button -->
     <button class="locate-btn" id="locate-btn" aria-label="Show my location" title="Show my location">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
@@ -891,8 +941,10 @@
       });
     }
 
-    // Register service worker for offline support and reliable updates
-    if ('serviceWorker' in navigator) {
+    // Register service worker for offline support and reliable updates.
+    // ?nosw=1 skips it — used by automated tests so the SW's controllerchange
+    // reload can't disrupt a screenshot run.
+    if ('serviceWorker' in navigator && !new URLSearchParams(location.search).has('nosw')) {
       navigator.serviceWorker.register('./service-worker.js', { updateViaCache: 'none' })
         .then((reg) => {
           console.log('Service Worker registered');
@@ -939,9 +991,17 @@
     //   ?test_gps=LAT,LON — seed state.userLocation (bypass geolocation)
     //   ?test_reroute=1   — GO button fetches /reroute.geojson instead of
     //                       POSTing to Lambda
+    //   ?reroute_url=<url>— POST the reroute to this URL instead of the prod
+    //                       Lambda (e.g. http://localhost:8787 for the local
+    //                       reroute server in WaysWaterMoves tests/).
     const RACE_OVERRIDE = URL_PARAMS.get('race');
     const TEST_GPS_RAW  = URL_PARAMS.get('test_gps');
     const TEST_REROUTE  = URL_PARAMS.get('test_reroute') === '1';
+    const REROUTE_URL_OVERRIDE = URL_PARAMS.get('reroute_url');
+    // ?sim=<scenario> injects a synthetic breadcrumb trail derived from the
+    // route legs (no real GPS) for offline dry-run testing + screenshots.
+    // Scenarios: clean | leg1 | blake | westpoint | late | dropout | jitter | sparse
+    const SIM = URL_PARAMS.get('sim');
     // ?force_reroute=1 bypasses the T-30m race-window gate so the GO
     // button can be tested before race day. Doesn't bypass the
     // "GPS required" gate.
@@ -985,8 +1045,10 @@
       // Lambda Function URL for on-demand reroute. Filled in after running
       // WaysWaterMoves/race_routing/reroute_lambda/setup.sh (it prints the
       // URL on success). If empty, GO falls back to the test_reroute path on
-      // localhost, or a stub alert otherwise.
-      LAMBDA_REROUTE_URL: 'https://cksemdnatpp2zu3quxabfpzpfu0wwvnn.lambda-url.us-west-2.on.aws/',
+      // localhost, or a stub alert otherwise. ?reroute_url= overrides it for
+      // local testing against the local reroute server.
+      LAMBDA_REROUTE_URL: REROUTE_URL_OVERRIDE
+        || 'https://cksemdnatpp2zu3quxabfpzpfu0wwvnn.lambda-url.us-west-2.on.aws/',
     };
     
     // ========== APPLICATION STATE ==========
@@ -1008,6 +1070,21 @@
       raceLastManifest: null,   // last manifest seen (for event_start_utc + T-30m gate)
       raceRerouteGeojson: null, // pre-staged or Lambda-returned reroute FC
       raceRerouteVisible: false,
+      // --- Course progress (breadcrumb) -----------------------------------
+      // The boat's GPS trail is buffered here and sent to the reroute Lambda,
+      // which replays it through the course automaton (the SAME gate-crossing /
+      // mark-rounding logic the router uses) to decide which marks are already
+      // rounded. The client no longer detects roundings itself — it only
+      // buffers + sends the trail, shows what the server decided, and offers a
+      // manual ‹/› correction for when breadcrumbs are spotty (GPS dropout,
+      // backgrounding, or the app opened mid-race).
+      track: [],               // breadcrumb buffer: {lat,lng,t,acc}
+      trackSlug: null,         // slug whose persisted trail is currently loaded
+      trackSaveTick: 0,        // throttle counter for localStorage writes
+      courseMarks: [],         // ordered marks from raceGeojson (for chip + ‹/›)
+      nextMarkOrder: null,     // geojson `order` of the next mark to make
+      markManualOverride: false, // user corrected the chip → send explicit index
+      serverNextMarkName: null,  // next-mark name the server last reported
     };
 
     // ?test_gps=LAT,LON bypasses navigator.geolocation entirely. The render
@@ -2835,7 +2912,17 @@ window.addEventListener('resize', handleViewportChange);
       };
       
       updateUserLocationMarker();
-      
+
+      // Buffer the breadcrumb (sent to the server on GO for rounding detection)
+      // and persist it periodically so a reload / backgrounding mid-race keeps
+      // the trail. No rounding is computed client-side.
+      state.track.push({
+        lat: state.userLocation.lat, lng: state.userLocation.lng,
+        t: Date.now(), acc: state.userLocation.accuracy,
+      });
+      if (state.track.length > TRACK_MAX_POINTS) state.track.shift();
+      if ((++state.trackSaveTick % TRACK_SAVE_EVERY) === 0) saveTrack();
+
       // Center map on first location fix
       if (!state.locationActive) {
         state.locationActive = true;
@@ -3278,6 +3365,285 @@ window.addEventListener('resize', handleViewportChange);
           ctx.fillText(name, p.x, ty);
         }
       }
+
+      // Pass 4: breadcrumb trail (magenta line + dots). The line reveals gaps
+      // (dropouts), the dots reveal sparsity/jitter — i.e. exactly the trail
+      // quality the server sees. Drawn on top so it's the visible subject.
+      if (state.track && state.track.length > 0) {
+        const tp = state.track.map((p) => map.project([p.lng, p.lat]));
+        ctx.beginPath();
+        for (let i = 0; i < tp.length; i++) {
+          if (i === 0) ctx.moveTo(tp[i].x, tp[i].y);
+          else         ctx.lineTo(tp[i].x, tp[i].y);
+        }
+        ctx.setLineDash([]);
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.strokeStyle = 'rgba(214,31,138,0.55)';   // magenta, semi-transparent
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+        for (const p of tp) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 2.2, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(214,31,138,0.9)';
+          ctx.fill();
+        }
+      }
+    }
+
+    // ===== Course progress (breadcrumb trail) =====
+    // The server does all rounding detection: it replays state.track through the
+    // course automaton (gates + marks) and returns the next_waypoint_index it
+    // used. The client only buffers + sends the trail, displays the result, and
+    // offers a manual ‹/› correction for unreliable breadcrumbs.
+    const TRACK_MAX_POINTS = 4000;     // ring-buffer cap; memory-trivial
+    const TRACK_UP_MIN_S   = 12;       // min seconds between uploaded fixes
+    const TRACK_UP_MIN_M   = 40;       // ...or min metres moved — whichever first
+    const TRACK_UP_MAX_PTS = 800;      // cap uploaded points (payload size)
+    const TRACK_SAVE_EVERY = 10;       // persist to localStorage every Nth fix
+    const TRACK_MAX_AGE_MS = 12 * 3600 * 1000;  // drop persisted trail older than this
+    const COURSE_COLOCATED_M = 30;     // marks closer than this share a rounding zone
+
+    function metersBetween(aLat, aLon, bLat, bLon) {
+      const R = 6371000, toRad = Math.PI / 180;
+      const dLat = (bLat - aLat) * toRad, dLon = (bLon - aLon) * toRad;
+      const s = Math.sin(dLat / 2) ** 2 +
+                Math.cos(aLat * toRad) * Math.cos(bLat * toRad) * Math.sin(dLon / 2) ** 2;
+      return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+    }
+
+    // --- Trail persistence (survives reload / backgrounding mid-race) ---
+    function trackKey(slug) { return `rr_track_${slug}`; }
+
+    function saveTrack() {
+      if (!state.trackSlug) return;
+      try {
+        localStorage.setItem(trackKey(state.trackSlug),
+          JSON.stringify({ t: Date.now(), pts: state.track }));
+      } catch (e) { /* quota / private mode — non-fatal */ }
+    }
+
+    // Load (or reset) the buffered trail for `slug`. Called when a route loads
+    // or the user switches races, so trails never bleed between courses.
+    function loadTrackForSlug(slug) {
+      if (state.trackSlug === slug) return;
+      state.trackSlug = slug;
+      state.track = [];
+      // New course → reset progress; let the trail/server re-derive it.
+      state.nextMarkOrder = null;
+      state.serverNextMarkName = null;
+      state.markManualOverride = false;
+      try {
+        const raw = localStorage.getItem(trackKey(slug));
+        if (raw) {
+          const obj = JSON.parse(raw);
+          if (obj && Array.isArray(obj.pts) && (Date.now() - (obj.t || 0)) < TRACK_MAX_AGE_MS) {
+            state.track = obj.pts.slice(-TRACK_MAX_POINTS);
+            logger.info('Restored breadcrumb trail:', state.track.length, 'pts for', slug);
+          } else {
+            localStorage.removeItem(trackKey(slug));  // stale
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    // Decimate state.track for upload: keep a fix only if >= TRACK_UP_MIN_S or
+    // >= TRACK_UP_MIN_M from the last kept one; cap to the most recent points.
+    // Server-side gate crossings only need enough resolution to cross the rays.
+    function trailForUpload() {
+      const out = [];
+      let last = null;
+      for (const p of state.track) {
+        if (!last ||
+            (p.t - last.t) >= TRACK_UP_MIN_S * 1000 ||
+            metersBetween(last.lat, last.lng, p.lat, p.lng) >= TRACK_UP_MIN_M) {
+          out.push([p.lat, p.lng]);
+          last = p;
+        }
+      }
+      // Always include the very latest fix so the trail ends at "now".
+      const tail = state.track[state.track.length - 1];
+      if (tail && (out.length === 0 ||
+          out[out.length - 1][0] !== tail.lat || out[out.length - 1][1] !== tail.lng)) {
+        out.push([tail.lat, tail.lng]);
+      }
+      return out.slice(-TRACK_UP_MAX_PTS);
+    }
+
+    // --- Chip display + manual override (the marks list is display-only now) ---
+    function extractCourseMarks(fc) {
+      if (!fc || !Array.isArray(fc.features)) return [];
+      return fc.features
+        .filter((f) => f.properties && f.properties.kind === 'mark'
+                    && f.geometry && f.geometry.type === 'Point')
+        .map((f) => ({
+          order: f.properties.order,
+          name:  f.properties.name || `Mark ${f.properties.order}`,
+          kind:  f.properties.mark_kind,
+          lon:   f.geometry.coordinates[0],
+          lat:   f.geometry.coordinates[1],
+        }))
+        .sort((a, b) => a.order - b.order);
+    }
+
+    function currentTargetMark() {
+      if (state.nextMarkOrder == null) return null;
+      return state.courseMarks.find((m) => m.order === state.nextMarkOrder) || null;
+    }
+
+    // next_waypoint_index = index into the YAML waypoint list. geojson order is
+    // 1-based with start = 1, so order-1. Clamp >=1 (never route to the start).
+    function courseNextWaypointIndex() {
+      if (state.nextMarkOrder == null) return 1;
+      return Math.max(1, state.nextMarkOrder - 1);
+    }
+
+    // Map a server-returned next_waypoint_index back to a geojson mark order
+    // (order = index + 1), then snap the chip to it.
+    function setNextFromServerIndex(idx, name) {
+      if (Number.isFinite(idx)) state.nextMarkOrder = idx + 1;
+      state.serverNextMarkName = name || null;
+      state.markManualOverride = false;   // server is now the source of truth
+      renderCourseProgress();
+    }
+
+    // Step the displayed next-mark pointer, skipping co-located marks (a gate's
+    // staged rounds share one coordinate). Never the start, never past finish.
+    function stepMark(fromOrder, dir) {
+      const ms = state.courseMarks;
+      const lo = Math.max(0, ms.findIndex((m) => m.kind !== 'start'));
+      const hi = ms.length - 1;
+      const i = ms.findIndex((m) => m.order === fromOrder);
+      if (i < 0) return fromOrder;
+      const cur = ms[i];
+      let n = i + dir;
+      while (n > lo && n < hi &&
+             metersBetween(cur.lat, cur.lon, ms[n].lat, ms[n].lon) < COURSE_COLOCATED_M) {
+        n += dir;
+      }
+      n = Math.max(lo, Math.min(hi, n));
+      return ms[n].order;
+    }
+
+    function initCourseProgress() {
+      state.courseMarks = extractCourseMarks(raceGeojson);
+      loadTrackForSlug(CONFIG.RACE_SLUG);
+      // Default the chip to the first non-start mark; the server overwrites this
+      // from the trail on the next GO, and ‹/› lets the user correct it.
+      if (state.nextMarkOrder == null) {
+        const firstTurn = state.courseMarks.find((m) => m.kind !== 'start');
+        state.nextMarkOrder = firstTurn ? firstTurn.order : null;
+      }
+      renderCourseProgress();
+    }
+
+    // Manual correction: when breadcrumbs were spotty, the user nudges the next
+    // mark by hand. This flags the next reroute to send an explicit index that
+    // overrides the server's trail replay.
+    function advanceMark(dir) {
+      if (state.nextMarkOrder == null) return;
+      state.nextMarkOrder = stepMark(state.nextMarkOrder, dir);
+      state.markManualOverride = true;
+      state.serverNextMarkName = null;
+      logger.info('Course mark set manually:', currentTargetMark()?.name,
+                  'next_waypoint_index=', courseNextWaypointIndex());
+      renderCourseProgress();
+    }
+
+    function renderCourseProgress() {
+      const el = document.getElementById('course-progress');
+      if (!el) return;
+      const show = state.raceRouteVisible && state.courseMarks.length > 0
+                && state.nextMarkOrder != null;
+      el.style.display = show ? 'flex' : 'none';
+      if (!show) return;
+      const name = state.serverNextMarkName || currentTargetMark()?.name;
+      const tag = state.markManualOverride ? ' ✎' : '';   // ✎ = manually set
+      el.querySelector('.cp-label').textContent = name ? `→ ${name}${tag}` : 'Finish';
+    }
+
+    // ===== Dry-run simulator (?sim=<scenario>) =====
+    // Builds a synthetic breadcrumb trail from the route legs and loads it as if
+    // it were real GPS — no driving, deterministic, screenshot-friendly. Pairs
+    // with the local reroute server (?reroute_url=) so GO exercises the REAL
+    // server-side rounding detection on the synthetic (possibly bad) trail.
+    function _legLatLng() {
+      // Ordered [{lat,lng}] vertices of the nominal route legs, concatenated.
+      const legs = (raceGeojson?.features || [])
+        .filter((f) => f.geometry?.type === 'LineString' && f.properties?.kind === 'leg')
+        .sort((a, b) => (a.properties.leg || 0) - (b.properties.leg || 0));
+      const out = [];
+      for (const f of legs) {
+        out.push(f.geometry.coordinates.map(([lon, lat]) => ({ lat, lng: lon, leg: f.properties.leg })));
+      }
+      return out;   // array of per-leg arrays
+    }
+
+    // Deterministic PRNG so jitter is reproducible across runs/screenshots.
+    function _mulberry32(seed) {
+      return function () {
+        seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    function buildSimTrack(scenario) {
+      const legs = _legLatLng();
+      if (legs.length === 0) return [];
+      const flat = (sel) => sel.flat();
+      let pts;
+      switch (scenario) {
+        case 'leg1':      pts = flat(legs.slice(0, 1)); break;
+        case 'blake':     pts = flat(legs.slice(0, 3)); break;
+        case 'westpoint': pts = flat(legs.slice(0, 4)); break;
+        case 'late':      pts = flat(legs.slice(3));    break;  // app opened mid-race
+        case 'dropout': {                                        // gap straddling West Pt gate
+          const l = legs;
+          pts = flat(l.slice(0, 3)).concat(l[3].slice(0, Math.floor(l[3].length / 2)));
+          break;
+        }
+        case 'sparse':    pts = flat(legs.slice(0, 4)).filter((_, i) => i % 8 === 0); break;
+        case 'jitter': {
+          const rng = _mulberry32(12345);
+          pts = flat(legs.slice(0, 4)).map((p) => {
+            const dlat = (rng() - 0.5) * 2 * 30 / 111320;
+            const dlon = (rng() - 0.5) * 2 * 30 / (111320 * Math.cos(p.lat * Math.PI / 180));
+            return { lat: p.lat + dlat, lng: p.lng + dlon };
+          });
+          break;
+        }
+        case 'clean':
+        default:          pts = flat(legs); break;
+      }
+      // Stamp synthetic timestamps (10 s apart) ending ~now.
+      const now = Date.now();
+      const n = pts.length;
+      return pts.map((p, i) => ({ lat: p.lat, lng: p.lng, t: now - (n - 1 - i) * 10000, acc: 8 }));
+    }
+
+    async function runSim(scenario) {
+      // Make sure the route + marks are loaded and the layer is visible.
+      try { await fetchRaceRoute('load-route'); } catch (e) { logger.error('sim route load failed', e); }
+      raceCanvas.style.display = 'block';
+      resizeRaceCanvas();
+      state.raceRouteVisible = true;
+      document.getElementById('race-toggle').classList.add('active');
+      initCourseProgress();
+
+      state.track = buildSimTrack(scenario);
+      const tail = state.track[state.track.length - 1];
+      if (tail) {
+        state.userLocation = { lat: tail.lat, lng: tail.lng, accuracy: 8, faked: true };
+        state.locationActive = true;
+        document.getElementById('locate-btn').classList.add('active');
+        updateUserLocationMarker();
+        map.jumpTo({ center: [tail.lng, tail.lat] });
+      }
+      logger.info('SIM', scenario, '→', state.track.length, 'breadcrumbs');
+      updateRerouteBtn();
+      scheduleRaceRender();
     }
 
     // Three-valued fetch:
@@ -3315,6 +3681,7 @@ window.addEventListener('resize', handleViewportChange);
       raceGeojson = geojson;
       state.raceRouteLoaded = true;
       state.raceInputsHash = hash;
+      initCourseProgress();   // (re)extract marks + reset progress to first leg
       document.getElementById('race-toggle').classList.remove('has-update');
       logger.info('Race route loaded:', manifest.slug, 'hash=', hash,
                   'total_nm=', manifest.total_distance_nm);
@@ -3396,6 +3763,7 @@ window.addEventListener('resize', handleViewportChange);
           btn.classList.add('active');
           scheduleRaceRender();
           updateRerouteBtn();
+          renderCourseProgress();
         } catch (err) {
           logger.error('Race route load failed:', err);
           alert('Could not load race route:\n' + err.message);
@@ -3406,6 +3774,7 @@ window.addEventListener('resize', handleViewportChange);
         state.raceRouteVisible = false;
         raceCanvas.style.display = 'none';
         btn.classList.remove('active');
+        renderCourseProgress();
       }
     }
 
@@ -3647,19 +4016,33 @@ window.addEventListener('resize', handleViewportChange);
           if (!resp.ok) throw new Error(`reroute fetch failed: ${resp.status}`);
           geojson = await resp.json();
         } else if (CONFIG.LAMBDA_REROUTE_URL) {
-          // Production path: POST to Lambda. Cold start ~30s, warm ~25-45s,
-          // so we don't add a client-side timeout shorter than ~75s.
+          // Production path: POST to Lambda. The solve dominates: ~218 s
+          // measured (10 GB function), and it's CPU/time-bound, not memory-
+          // bound, so it doesn't speed up much with more memory.
+          // depart_utc = now() is intentional: a live-race reroute must use the
+          // freshest SSCOFS current cycle + wind, which the Lambda resolves at
+          // request time from now(). (For a PAST race this loads today's data
+          // for an old course — a testing artifact, not the live path.)
+          // Send the breadcrumb trail; the server replays it through the course
+          // automaton to decide which marks are rounded. Only attach an explicit
+          // next_waypoint_index when the user has manually corrected the chip —
+          // that overrides the server's trail replay (backstop for spotty GPS).
           const body = {
             race_slug:   CONFIG.RACE_SLUG,
             start:       { lat: state.userLocation.lat, lon: state.userLocation.lng },
             depart_utc:  new Date().toISOString(),
-            next_waypoint_index: 1,
+            track:       trailForUpload(),
           };
-          logger.info('POST reroute:', CONFIG.LAMBDA_REROUTE_URL, body);
+          if (state.markManualOverride) {
+            body.next_waypoint_index = courseNextWaypointIndex();
+          }
+          logger.info('POST reroute:', CONFIG.LAMBDA_REROUTE_URL,
+                      { ...body, track: `${body.track.length} pts` });
           const ctrl = new AbortController();
-          // Cold start (handler import + numba JIT + SSCOFS byte-range fetch
-          // + solve) can land at ~2 min. Warm path is ~30-60 s. 4 min ceiling.
-          const t = setTimeout(() => ctrl.abort(), 240000);
+          // Abort at 300 s = the Lambda's own timeout. A typical solve lands
+          // ~218 s; this ceiling matches the server so we never abort a request
+          // the Lambda would still have completed.
+          const t = setTimeout(() => ctrl.abort(), 300000);
           let resp;
           try {
             resp = await fetch(CONFIG.LAMBDA_REROUTE_URL, {
@@ -3680,6 +4063,12 @@ window.addEventListener('resize', handleViewportChange);
           geojson = respBody.geojson;
           if (!geojson) throw new Error('reroute response missing .geojson');
           logger.info('Reroute summary:', respBody.summary);
+          // Snap the chip to what the server actually used (unless the user is
+          // holding a manual override), so it reflects the real rounding.
+          const sum = respBody.summary || {};
+          if (!state.markManualOverride && Number.isFinite(sum.next_waypoint_index)) {
+            setNextFromServerIndex(sum.next_waypoint_index, sum.next_mark_name);
+          }
         } else {
           // No Lambda URL configured yet. Stub.
           alert('Reroute endpoint not yet deployed.\n'
@@ -3700,6 +4089,14 @@ window.addEventListener('resize', handleViewportChange);
         btn.classList.remove('loading');
         btn.textContent = origLabel;
       }
+    });
+
+    // Manual course-progress correction (‹ back / › forward one mark).
+    document.getElementById('cp-fwd').addEventListener('click', (e) => {
+      e.stopPropagation(); advanceMark(+1);
+    });
+    document.getElementById('cp-back').addEventListener('click', (e) => {
+      e.stopPropagation(); advanceMark(-1);
     });
 
     // Surface fresher precomputes on app foreground / initial load, but
@@ -3728,6 +4125,8 @@ window.addEventListener('resize', handleViewportChange);
       if (state.userLocation && state.userLocation.faked) {
         updateUserLocationMarker();
       }
+      // Dry-run: inject a synthetic breadcrumb trail and show it.
+      if (SIM) runSim(SIM);
     });
     // Keep the faked GPS marker glued to the map during pan/zoom.
     map.on('move', () => {
