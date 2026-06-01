@@ -999,9 +999,14 @@
     const TEST_REROUTE  = URL_PARAMS.get('test_reroute') === '1';
     const REROUTE_URL_OVERRIDE = URL_PARAMS.get('reroute_url');
     // ?sim=<scenario> injects a synthetic breadcrumb trail derived from the
-    // route legs (no real GPS) for offline dry-run testing + screenshots.
-    // Scenarios: clean | leg1 | blake | westpoint | late | dropout | jitter | sparse
+    // route legs (no real GPS) for dry-run testing + screenshots.
+    //   named:   clean | leg1 | blake | westpoint | late | dropout | jitter | sparse
+    //   numeric: 0..1  → drop the boat that fraction along the course (by
+    //                    distance) with a coherent trail to there.
+    // ?sim_start_ago=<hours> moves the race start into the past so the T-30m
+    // window gate opens naturally (race-day-faithful; no force_reroute needed).
     const SIM = URL_PARAMS.get('sim');
+    const SIM_START_AGO = parseFloat(URL_PARAMS.get('sim_start_ago'));
     // ?force_reroute=1 bypasses the T-30m race-window gate so the GO
     // button can be tested before race day. Doesn't bypass the
     // "GPS required" gate.
@@ -3589,9 +3594,45 @@ window.addEventListener('resize', handleViewportChange);
       };
     }
 
+    // Trail from the start to `frac` of the way along the course (by distance),
+    // interpolating the final point. The last point is the boat's current
+    // position; the trail before it is how it got there, so the server's
+    // rounding detection is correct for that position. Used by the numeric
+    // ?sim=<0..1> URLs to drop the boat at arbitrary points along the course.
+    function buildSimTrackAtProgress(frac) {
+      const flat = _legLatLng().flat();
+      if (flat.length < 2) return [];
+      frac = Math.max(0, Math.min(1, frac));
+      const cum = [0];
+      for (let i = 1; i < flat.length; i++) {
+        cum.push(cum[i - 1] + metersBetween(flat[i - 1].lat, flat[i - 1].lng, flat[i].lat, flat[i].lng));
+      }
+      const target = frac * cum[cum.length - 1];
+      const pts = [];
+      for (let i = 0; i < flat.length; i++) {
+        if (cum[i] <= target) {
+          pts.push({ lat: flat[i].lat, lng: flat[i].lng });
+        } else {
+          const prev = flat[i - 1], seg = cum[i] - cum[i - 1];
+          const r = seg > 0 ? (target - cum[i - 1]) / seg : 0;
+          pts.push({ lat: prev.lat + (flat[i].lat - prev.lat) * r,
+                     lng: prev.lng + (flat[i].lng - prev.lng) * r });
+          break;
+        }
+      }
+      return pts;
+    }
+
     function buildSimTrack(scenario) {
       const legs = _legLatLng();
       if (legs.length === 0) return [];
+      // Numeric ?sim=<0..1> → progress fraction along the course.
+      const frac = parseFloat(scenario);
+      if (Number.isFinite(frac) && String(scenario).trim() !== '' && frac >= 0 && frac <= 1) {
+        const p = buildSimTrackAtProgress(frac);
+        const now = Date.now();
+        return p.map((q, i) => ({ lat: q.lat, lng: q.lng, t: now - (p.length - 1 - i) * 10000, acc: 8 }));
+      }
       const flat = (sel) => sel.flat();
       let pts;
       switch (scenario) {
@@ -3626,6 +3667,16 @@ window.addEventListener('resize', handleViewportChange);
     async function runSim(scenario) {
       // Make sure the route + marks are loaded and the layer is visible.
       try { await fetchRaceRoute('load-route'); } catch (e) { logger.error('sim route load failed', e); }
+      // ?sim_start_ago=<hours> moves the race start into the past so the T-30m
+      // window gate opens NATURALLY (as on race day) — more faithful than
+      // force_reroute, which bypasses the gate. depart_utc stays now(), i.e.
+      // "reroute from where I am, this many hours into the race".
+      if (Number.isFinite(SIM_START_AGO) && state.raceLastManifest) {
+        const startMs = Date.now() - SIM_START_AGO * 3600 * 1000;
+        state.raceLastManifest = { ...state.raceLastManifest,
+          event_start_utc: new Date(startMs).toISOString() };
+        logger.info('SIM start set to', SIM_START_AGO, 'h ago →', state.raceLastManifest.event_start_utc);
+      }
       raceCanvas.style.display = 'block';
       resizeRaceCanvas();
       state.raceRouteVisible = true;
