@@ -1026,7 +1026,7 @@
     const isLowPowerDevice = isMobileDevice && window.innerWidth < 768;
     
     const CONFIG = {
-      APP_VERSION: 'v3.0.4', // Race picker duration display
+      APP_VERSION: 'v3.0.5', // Default to soonest upcoming race on load
       NOAA_TIDES_API: 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter',
       CENTER: [-122.3321, 47.6062], // Seattle
       ZOOM: 10,
@@ -3852,6 +3852,28 @@ window.addEventListener('resize', handleViewportChange);
       }
     }
 
+    // Pick the default race on first load: the soonest race that hasn't
+    // finished yet (start + total_time_hr >= now) — i.e. in-progress or
+    // upcoming — so the app opens on the *next* race, not whichever past one is
+    // hard-coded. Falls back to the most recently started race when nothing is
+    // upcoming (e.g. between seasons), and to null when the index is unusable.
+    function pickDefaultRaceSlug(races) {
+      if (!Array.isArray(races) || races.length === 0) return null;
+      const now = Date.now();
+      const dated = races.filter((r) => r && r.event_start_utc &&
+                                        !isNaN(Date.parse(r.event_start_utc)));
+      if (dated.length === 0) return races[0].slug || null;
+      const endMs = (r) => Date.parse(r.event_start_utc) +
+                           (Number(r.total_time_hr) || 0) * 3600000;
+      const live = dated
+        .filter((r) => endMs(r) >= now)
+        .sort((a, b) => Date.parse(a.event_start_utc) - Date.parse(b.event_start_utc));
+      if (live.length) return live[0].slug;
+      const recent = dated.slice()
+        .sort((a, b) => Date.parse(b.event_start_utc) - Date.parse(a.event_start_utc));
+      return recent[0].slug;
+    }
+
     function populateRacePicker() {
       const panel = document.getElementById('race-picker');
       panel.innerHTML = '';
@@ -4014,9 +4036,10 @@ window.addEventListener('resize', handleViewportChange);
       });
     })();
 
-    // Kick off an index fetch in the background; the picker will show
-    // whatever it gets (or an error message if it fails).
-    fetchRaceIndex();
+    // Kick off an index fetch in the background; the picker shows whatever it
+    // gets, and on first load we use it to default to the soonest upcoming race
+    // (see map 'load' handler) instead of a hard-coded slug.
+    const raceIndexReady = fetchRaceIndex();
 
     // REROUTE button. Three-way toggle:
     //   - reroute currently visible      -> tap clears the overlay (no fetch)
@@ -4167,6 +4190,18 @@ window.addEventListener('resize', handleViewportChange);
     // Initialize when map loads
     map.on('load', async () => {
       resizeRaceCanvas();
+      // Default to the soonest upcoming race (unless ?race= pinned one). Past
+      // races stay browsable via the picker; this only sets the initial slug.
+      if (!RACE_OVERRIDE) {
+        try {
+          await raceIndexReady;
+          const def = pickDefaultRaceSlug(raceIndex && raceIndex.races);
+          if (def && def !== CONFIG.RACE_SLUG) {
+            logger.info('Default race →', def);
+            CONFIG.RACE_SLUG = def;
+          }
+        } catch (e) { logger.warn('default-race resolve failed:', e); }
+      }
       await initialize();
       // One manifest check on load so the badge appears if a fresher
       // precompute has landed since last session. Never mutates the
